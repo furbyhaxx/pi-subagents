@@ -1567,6 +1567,25 @@ export class AgentManager {
     return this.agents.get(id);
   }
 
+  restoreCompleted(record: AgentRecord): AgentRecord {
+    const existing = this.agents.get(record.id);
+    if (existing) return existing;
+    const restored: AgentRecord = {
+      ...record,
+      handle: undefined,
+      alias: undefined,
+      abortController: undefined,
+      promise: undefined,
+      status: record.status === "running" || record.status === "queued" ? "completed" : record.status,
+      completedAt: record.completedAt ?? Date.now(),
+      resultConsumed: true,
+      isBackground: true,
+      restoredSession: true,
+    };
+    this.agents.set(restored.id, restored);
+    return restored;
+  }
+
   /** Handles already in use, so a fresh spawn can pick an unclaimed one. */
   private takenHandles(): Set<string> {
     const taken = new Set<string>();
@@ -1711,7 +1730,7 @@ export class AgentManager {
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") continue;
+      if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued" || record.restoredSession) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }

@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type SessionEntry, type SessionInfo, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
@@ -82,9 +82,102 @@ import { escapeXml } from "./xml.js";
 
 /** Tool execute return value for a text response. */
 type ScopedAgentDetails = AgentDetails & Pick<AgentRecord, "worktree" | "branch" | "effectiveCwd">;
+type TaskEntryData = { prompt?: unknown };
+type WorkspaceEntryData = { worktree?: AgentRecord["worktree"] };
+type ArtifactEntryData = { artifactRoot?: unknown; originCwd?: unknown; rootSessionId?: unknown };
 
 function textResult(msg: string, details?: ScopedAgentDetails) {
   return { content: [{ type: "text" as const, text: msg }], details };
+}
+
+function entryTimestamp(entry: SessionEntry | undefined, fallback: number): number {
+  const value = entry ? Date.parse(entry.timestamp) : Number.NaN;
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function entryText(entry: SessionEntry | undefined): string | undefined {
+  if (entry?.type !== "message" || entry.message.role !== "user") return undefined;
+  const content = entry.message.content;
+  if (typeof content === "string") return content.trim() || undefined;
+  return content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+    .map(part => part.text)
+    .join("\n")
+    .trim() || undefined;
+}
+
+function restoredType(info: SessionInfo): SubagentType {
+  const prefix = info.name?.split("#", 1)[0]?.trim();
+  return (prefix || "general-purpose") as SubagentType;
+}
+
+function makeRestoredSession(sessionManager: SessionManager): AgentSession {
+  const messages = sessionManager.buildSessionContext().messages as AgentSession["messages"];
+  return {
+    messages,
+    sessionManager,
+    subscribe: () => () => {},
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0, total: 0 } }),
+  } as unknown as AgentSession;
+}
+
+function findLastEntry(entries: readonly SessionEntry[], predicate: (entry: SessionEntry) => boolean): SessionEntry | undefined {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry && predicate(entry)) return entry;
+  }
+  return undefined;
+}
+
+export function restoredRecordFromSession(info: SessionInfo, parentSessionId: string): AgentRecord | undefined {
+  let sessionManager: SessionManager;
+  try {
+    sessionManager = SessionManager.open(info.path);
+  } catch {
+    return undefined;
+  }
+  const entries = sessionManager.getEntries();
+  const taskEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:task");
+  const taskData = taskEntry?.type === "custom" ? taskEntry.data as TaskEntryData | undefined : undefined;
+  const prompt = typeof taskData?.prompt === "string" && taskData.prompt.trim()
+    ? taskData.prompt.trim()
+    : entryText(entries.find(entry => entry.type === "message" && entry.message.role === "user"));
+  const workspaceEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:workspace");
+  const workspaceData = workspaceEntry?.type === "custom" ? workspaceEntry.data as WorkspaceEntryData | undefined : undefined;
+  const artifactEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:artifacts");
+  const artifactData = artifactEntry?.type === "custom" ? artifactEntry.data as ArtifactEntryData | undefined : undefined;
+  const model = findLastEntry(entries, entry => entry.type === "model_change");
+  const thinking = findLastEntry(entries, entry => entry.type === "thinking_level_change");
+  const last = entries.at(-1);
+  const type = restoredType(info);
+  const status = entries.some(entry => entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error") ? "error" : "completed";
+  return {
+    id: `restored-${info.id}`,
+    type,
+    description: prompt?.split("\n").find(line => line.trim())?.trim().slice(0, 120) || info.name || type,
+    taskPrompt: prompt,
+    status,
+    toolUses: entries.reduce((count, entry) => count + (entry.type === "message" && entry.message.role === "toolResult" ? 1 : 0), 0),
+    startedAt: info.created.getTime(),
+    completedAt: entryTimestamp(last, info.modified.getTime()),
+    session: makeRestoredSession(sessionManager),
+    worktree: workspaceData?.worktree,
+    effectiveCwd: sessionManager.getCwd() || info.cwd,
+    originCwd: typeof artifactData?.originCwd === "string" ? artifactData.originCwd : undefined,
+    artifactRoot: typeof artifactData?.artifactRoot === "string" ? artifactData.artifactRoot : undefined,
+    rootSessionId: typeof artifactData?.rootSessionId === "string" ? artifactData.rootSessionId : parentSessionId,
+    sessionFile: info.path,
+    lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+    compactionCount: entries.filter(entry => entry.type === "compaction").length,
+    isBackground: true,
+    resultConsumed: true,
+    restoredSession: true,
+    invocation: model?.type === "model_change" ? {
+      modelId: `${model.provider}/${model.modelId}`,
+      thinking: thinking?.type === "thinking_level_change" ? thinking.thinkingLevel as AgentInvocation["thinking"] : undefined,
+    } : undefined,
+    depth: 1,
+  };
 }
 
 export function renderRunningAgentStatus(
@@ -875,6 +968,19 @@ export default function (pi: ExtensionAPI) {
     }
     sessionArtifacts({ ...ctx, cwd: origin });
     manager.clearCompleted(true);
+    const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
+    if (parentSessionFile) {
+      try {
+        const sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager?.getSessionDir?.());
+        for (const info of sessions) {
+          if (info.parentSessionPath !== parentSessionFile) continue;
+          const record = restoredRecordFromSession(info, ctx.sessionManager?.getSessionId?.() ?? "standalone");
+          if (record) manager.restoreCompleted(record);
+        }
+      } catch (error) {
+        console.warn("[pi-subagents] Failed to restore persisted subagent sessions:", error);
+      }
+    }
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {

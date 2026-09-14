@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Preloaded skill discovery now follows symlinks like Pi.** Symlinked roots, flat skill files, skill directories, and inner `SKILL.md` files are discoverable, with canonical-directory tracking preventing cycles. Skill-name path-traversal validation is unchanged.
 
 ### Fixed
+- **Persisted subagent sessions are restored into `/agents` after a Pi restart.** The session files already survived and pointed at their parent, but the extension rebuilt only its in-memory agent map, so completed runs vanished from `/agents` until a new process spawned them again. Startup now hydrates completed top-level child sessions for the resumed parent so their transcripts can be opened from the conversation viewer.
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 
 ## [0.19.0] - 2026-08-25
