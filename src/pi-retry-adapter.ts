@@ -4,10 +4,7 @@ import {
   type Model,
   type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import {
-  type AgentSession,
-  VERSION as PI_VERSION,
-} from "@earendil-works/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 export interface RetryModelCandidate {
   input: string;
@@ -55,15 +52,6 @@ interface InstalledAdapter {
 }
 
 const adapters = new WeakMap<AgentSession, InstalledAdapter>();
-const VERIFIED_PI_VERSIONS = new Set(["0.84.2"]);
-
-function requireVerifiedPiInternals(): void {
-  if (!VERIFIED_PI_VERSIONS.has(PI_VERSION)) {
-    throw new Error(
-      `Model fallback requires verified pi retry internals; installed ${PI_VERSION}, supported: ${[...VERIFIED_PI_VERSIONS].join(", ")}.`,
-    );
-  }
-}
 
 function sameModel(left: Model<Api> | undefined, right: Model<Api>): boolean {
   return left?.provider === right.provider && left.id === right.id;
@@ -196,7 +184,6 @@ export function beginModelFallbackInvocation(
 ): () => void {
   if (options.candidates.length === 0) throw new Error("Model fallback requires at least one candidate.");
   if (options.candidates.length === 1 && options.maxWraparounds === 0) return () => {};
-  requireVerifiedPiInternals();
   const adapter = installAdapter(session);
   const currentIndex = options.currentIndex
     ?? options.candidates.findIndex(candidate => sameModel(session.model, candidate.model));
@@ -265,7 +252,6 @@ export async function replaceSessionModelCandidates(
   signal?: AbortSignal,
   onTransition?: (transition: ModelTransition) => void,
 ): Promise<void> {
-  requireVerifiedPiInternals();
   const adapter = installAdapter(session);
   const transition = await switchModel(session, adapter.privateSession, candidates[0], "override", signal);
   if (!transition) throw new Error(`Model unavailable: "${candidates[0].input}".`);

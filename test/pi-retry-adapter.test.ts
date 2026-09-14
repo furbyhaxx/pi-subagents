@@ -1,4 +1,4 @@
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
   beginModelFallbackInvocation,
@@ -6,6 +6,12 @@ import {
   recordReopenedModelSelection,
   replaceSessionModelCandidates,
 } from "../src/pi-retry-adapter.js";
+
+// A new package version alone must not disable fallback or live resume overrides.
+vi.mock("@earendil-works/pi-coding-agent", async importOriginal => {
+  const original = await importOriginal<typeof PiCodingAgent>();
+  return { ...original, VERSION: "999.0.0" };
+});
 
 function model(provider: string, id: string) {
   return {
@@ -53,7 +59,7 @@ function fakeSession(initialModel = model("one", "a")) {
     }),
   };
   return {
-    session: raw as unknown as AgentSession,
+    session: raw as unknown as PiCodingAgent.AgentSession,
     raw,
     failure,
     appendModelChange,
@@ -63,7 +69,7 @@ function fakeSession(initialModel = model("one", "a")) {
 }
 
 describe("Pi retry adapter", () => {
-  it("switches only after Pi leaves an exhausted retryable failure terminal", async () => {
+  it("switches after Pi exhausts a retryable failure even on a future Pi version", async () => {
     const { session, raw, appendModelChange } = fakeSession();
     const next = model("two", "b");
     const cleanup = beginModelFallbackInvocation(session, {
@@ -82,7 +88,7 @@ describe("Pi retry adapter", () => {
     cleanup();
   });
 
-  it("replaces a live resume selection without writing Pi defaults", async () => {
+  it("replaces a live resume selection on a future Pi version without writing Pi defaults", async () => {
     const { session, raw, appendModelChange } = fakeSession();
     const next = model("two", "b");
 
@@ -91,6 +97,32 @@ describe("Pi retry adapter", () => {
     expect(raw.agent.state.model).toMatchObject({ provider: "two", id: "b" });
     expect(appendModelChange).toHaveBeenCalledWith("two", "b");
     expect(getSessionModelCandidates(session)).toMatchObject({ currentIndex: 0 });
+  });
+
+  it.each(["_handlePostAgentRun", "_isRetryableError", "_emitModelSelect"] as const)(
+    "rejects incompatible sessions missing %s rather than disabling fallback",
+    async method => {
+      const { session, raw } = fakeSession();
+      Reflect.deleteProperty(raw, method);
+      const candidates = [
+        { input: "one/a", model: raw.agent.state.model },
+        { input: "two/b", model: model("two", "b") },
+      ];
+      const message = "Model fallback is incompatible with this pi AgentSession implementation.";
+
+      expect(() => beginModelFallbackInvocation(session, { candidates, maxWraparounds: 0 })).toThrow(message);
+      await expect(replaceSessionModelCandidates(session, candidates)).rejects.toThrow(message);
+    },
+  );
+
+  it("propagates failures from Pi's model-selection API", async () => {
+    const { session, raw } = fakeSession();
+    const error = new Error("incompatible model-selection API");
+    raw._emitModelSelect.mockRejectedValueOnce(error);
+
+    await expect(replaceSessionModelCandidates(session, [
+      { input: "two/b", model: model("two", "b") },
+    ])).rejects.toBe(error);
   });
 
   it("records effective model and thinking entries when reopening persisted history", () => {
