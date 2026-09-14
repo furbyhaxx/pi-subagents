@@ -135,14 +135,14 @@ describe("the workflow host reports a child's effective configuration", () => {
   });
 
   // Why the workflow path never discloses a model override at all: unlike the
-  // Agent tool (`agentConfig?.model ?? params.model`), this path resolves
-  // `request.model ?? config?.model`, so the script outranks the agent file and
+  // Agent tool and workflow host both let an explicit caller model replace the
+  // configured model list, so the script outranks the agent file and
   // therefore always got the model it asked for. Seeding a `requestedModel` here
   // would describe a precedence that does not exist.
   it("lets the script's model outrank the agent file's, so there is nothing to disclose", async () => {
     const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
     const opus = { provider: "anthropic", id: "claude-opus-4-6", name: "Opus 4.6" };
-    registerAgents(new Map([["pinned", { name: "pinned", model: "anthropic/claude-opus-4-6" } as any]]));
+    registerAgents(new Map([["pinned", { name: "pinned", models: ["anthropic/claude-opus-4-6"] } as any]]));
     childSessionReports({ model: haiku });
     const host = createWorkflowHost({
       pi,

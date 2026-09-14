@@ -6,7 +6,8 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
-import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
+import { parseCanonicalModelId } from "./model-resolver.js";
+import type { AgentConfig, IsolationMode, MemoryScope, ModelThinkingLevel } from "./types.js";
 
 /**
  * The one thing a declared `name:` may not contain, matching Claude Code
@@ -78,6 +79,16 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       continue;
     }
     const { frontmatter: fm, body } = parsed;
+    let models: string[] | undefined;
+    try {
+      models = parseModels(fm.model, fm.models);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (strict) throw new Error(`${path}: ${reason}`);
+      warnIfNew(`Skipping agent file ${path}: ${reason}`);
+      warnSkippedOverride(filenameType, agents);
+      continue;
+    }
 
     // Claude Code's rule: `name:` IS the agent type, and the filename need not
     // match. Absent, the filename stands in — Claude Code requires the field,
@@ -118,8 +129,8 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
       excludeExtensions: csvListOptional(fm.exclude_extensions),
       skills: inheritField(fm.skills ?? fm.inherit_skills),
-      model: str(fm.model),
-      thinking: str(fm.thinking) as ThinkingLevel | undefined,
+      models,
+      thinking: str(fm.thinking) as ModelThinkingLevel | undefined,
       maxTurns: nonNegativeInt(fm.max_turns),
       persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
       outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
@@ -211,6 +222,25 @@ function warnIfNew(message: string): void {
 
 // ---- Field parsers ----
 // All follow the same convention: omitted → default, "none"/empty → nothing, value → exact.
+
+function parseModels(model: unknown, models: unknown): string[] | undefined {
+  if (model !== undefined && models !== undefined) {
+    throw new Error("frontmatter cannot contain both model and models");
+  }
+  if (model === undefined && models === undefined) return undefined;
+  const values = model !== undefined ? [model] : models;
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error("models must be a non-empty YAML array of canonical provider/model IDs");
+  }
+  const parsed = values.map((value) => {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error("model candidates must be non-empty strings");
+    }
+    parseCanonicalModelId(value);
+    return value;
+  });
+  return parsed;
+}
 
 /** Extract a string or undefined. */
 function str(val: unknown): string | undefined {

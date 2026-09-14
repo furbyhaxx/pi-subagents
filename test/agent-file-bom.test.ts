@@ -65,7 +65,7 @@ describe("BOM-prefixed agent files", () => {
     const agent = loadCustomAgents(tmpDir).get("审查员");
 
     expect(agent?.description).toBe("代码审查员");
-    expect(agent?.model).toBe("anthropic/claude-haiku-4-5");
+    expect(agent?.models).toEqual(["anthropic/claude-haiku-4-5"]);
     expect(agent?.systemPrompt).toBe("你是一位资深的代码审查员。请仔细检查代码。");
     // The YAML must not survive into the prompt — the symptom of the fence miss.
     expect(agent?.systemPrompt).not.toContain("---");

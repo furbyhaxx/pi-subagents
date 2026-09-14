@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
@@ -23,7 +23,17 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { type ResolvedModelCandidate, resolveModelCandidates } from "./model-resolver.js";
+import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import {
+  beginModelFallbackInvocation,
+  getSessionModelCandidates,
+  type ModelTransition,
+  type RetryModelCandidate,
+  recordReopenedModelSelection,
+  replaceSessionModelCandidates,
+} from "./pi-retry-adapter.js";
 import { buildAgentPrompt, buildWorktreeScope, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -350,6 +360,22 @@ export function getRememberAgents(): boolean { return rememberAgents; }
 /** Set whether subagent sessions are persisted by default. */
 export function setRememberAgents(b: boolean): void { rememberAgents = b; }
 
+const MAX_MODEL_RECOVERY_BUDGET = 100;
+
+/** Pi-owned retries allowed after the initial request for one model. */
+let maxRetries = 3;
+export function getMaxRetries(): number { return maxRetries; }
+export function setMaxRetries(n: number): void {
+  maxRetries = Math.min(MAX_MODEL_RECOVERY_BUDGET, Math.max(0, Math.floor(n)));
+}
+
+/** Additional complete passes through an ordered model list. */
+let maxModelWraparounds = 0;
+export function getMaxModelWraparounds(): number { return maxModelWraparounds; }
+export function setMaxModelWraparounds(n: number): void {
+  maxModelWraparounds = Math.min(MAX_MODEL_RECOVERY_BUDGET, Math.max(0, Math.floor(n)));
+}
+
 /** Additional turns allowed after the soft limit steer message. */
 let graceTurns = 5;
 
@@ -357,37 +383,6 @@ let graceTurns = 5;
 export function getGraceTurns(): number { return graceTurns; }
 /** Set the grace turns value (minimum 1). */
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
-
-/**
- * Try to find the right model for an agent type.
- * Priority: explicit option > config.model > parent model.
- */
-export function resolveDefaultModel(
-  parentModel: Model<any> | undefined,
-  registry: { find(provider: string, modelId: string): Model<any> | undefined; getAvailable?(): Model<any>[] },
-  configModel?: string,
-): Model<any> | undefined {
-  if (configModel) {
-    const slashIdx = configModel.indexOf("/");
-    if (slashIdx !== -1) {
-      const provider = configModel.slice(0, slashIdx);
-      const modelId = configModel.slice(slashIdx + 1);
-
-      // Build a set of available model keys for fast lookup
-      const available = registry.getAvailable?.();
-      const availableKeys = available
-        ? new Set(available.map((m: any) => `${m.provider}/${m.id}`))
-        : undefined;
-      const isAvailable = (p: string, id: string) =>
-        !availableKeys || availableKeys.has(`${p}/${id}`);
-
-      const found = registry.find(provider, modelId);
-      if (found && isAvailable(provider, modelId)) return found;
-    }
-  }
-
-  return parentModel;
-}
 
 /** Info about a tool event in the subagent. */
 export interface ToolActivity {
@@ -401,11 +396,16 @@ export interface RunOptions {
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
   model?: Model<any>;
+  /** Raw effective inputs. Caller input is a singleton; frontmatter may be ordered. */
+  modelInputs?: string[];
+  modelFromParams?: boolean;
+  maxRetries?: number;
+  maxModelWraparounds?: number;
   maxTurns?: number;
   signal?: AbortSignal;
   isolated?: boolean;
   inheritContext?: boolean;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel?: ModelThinkingLevel;
   /**
    * Reopen this pi session file rather than starting an empty conversation.
    * `createAgentSession` seeds itself from whatever its SessionManager holds,
@@ -460,6 +460,7 @@ export interface RunOptions {
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
+  onModelTransition?: (transition: ModelTransition) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /**
@@ -592,6 +593,19 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
   return undefined;
 }
 
+function withModelAttempts(
+  failure: string | undefined,
+  attempted: string[],
+  retryBudget: number,
+  wraparoundBudget: number,
+): string | undefined {
+  if (!failure || attempted.length <= 1) return failure;
+  const shown = attempted.slice(0, 20);
+  const suffix = attempted.length > shown.length ? `, … ${attempted.length - shown.length} more` : "";
+  return `${failure}\nModels attempted: ${shown.join(" → ")}${suffix}`
+    + `\nRecovery budget: ${retryBudget} retries per candidate, ${wraparoundBudget} wraparounds.`;
+}
+
 /**
  * Wire an AbortSignal to abort a session.
  * Returns a cleanup function to remove the listener.
@@ -608,6 +622,95 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   if (sessionDir === "~" || sessionDir.startsWith("~/")) return resolve(homedir(), sessionDir.slice(2));
   if (isAbsolute(sessionDir)) return sessionDir;
   return resolve(cwd, sessionDir);
+}
+
+function toRetryCandidate(
+  candidate: ResolvedModelCandidate,
+  fallbackThinking?: ModelThinkingLevel,
+): RetryModelCandidate {
+  return {
+    input: candidate.input,
+    model: candidate.model as Model<Api>,
+    thinking: candidate.thinking ?? fallbackThinking,
+  };
+}
+
+function resolveRunModelCandidates(
+  ctx: ExtensionContext,
+  agentConfig: ReturnType<typeof getAgentConfig>,
+  options: RunOptions,
+  configCwd: string,
+): RetryModelCandidate[] {
+  const fallbackThinking = options.thinkingLevel ?? agentConfig?.thinking;
+  if (options.modelFromParams && options.modelInputs?.[0]) {
+    const resolution = resolveModelCandidates(options.modelInputs, ctx.modelRegistry, true);
+    const resolved = resolution.candidates[0];
+    if (!resolved) throw new Error(resolution.errors.join("\n"));
+    const verdict = checkModelScope({
+      model: resolved.model,
+      cwd: configCwd,
+      modelRegistry: ctx.modelRegistry,
+      callerSupplied: true,
+      agentLabel: agentConfig?.displayName ?? agentConfig?.name ?? "agent",
+      modelInput: resolved.input,
+    });
+    if (verdict.kind === "error") throw new Error(verdict.message);
+    return [toRetryCandidate(resolved, fallbackThinking)];
+  }
+  if (options.model && options.modelInputs === undefined) {
+    const input = `${options.model.provider}/${options.model.id}`;
+    const verdict = checkModelScope({
+      model: options.model,
+      cwd: configCwd,
+      modelRegistry: ctx.modelRegistry,
+      callerSupplied: true,
+      agentLabel: agentConfig?.displayName ?? agentConfig?.name ?? "agent",
+      modelInput: input,
+    });
+    if (verdict.kind === "error") throw new Error(verdict.message);
+    return [{ input, model: options.model, thinking: fallbackThinking }];
+  }
+
+  const configuredInputs = options.modelInputs ?? agentConfig?.models;
+  if (configuredInputs?.length) {
+    const resolution = resolveModelCandidates(configuredInputs, ctx.modelRegistry, false);
+    if (resolution.candidates.length === 0) {
+      throw new Error(`No configured model is available.\n${resolution.errors.join("\n")}`);
+    }
+    if (!options.nested && !options.workflow) {
+      for (const error of resolution.errors) ctx.ui.notify(error, "warning");
+      const warnings = new Set<string>();
+      for (const candidate of resolution.candidates) {
+        const verdict = checkModelScope({
+          model: candidate.model,
+          cwd: configCwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: false,
+          agentLabel: agentConfig?.displayName ?? agentConfig?.name ?? "agent",
+          modelInput: candidate.input,
+        });
+        if (verdict.kind === "warn") warnings.add(verdict.message);
+      }
+      for (const warning of warnings) ctx.ui.notify(warning, "warning");
+    }
+    return resolution.candidates.map(candidate => toRetryCandidate(candidate, fallbackThinking));
+  }
+
+  const inherited = options.model ?? ctx.model;
+  if (!inherited) return [];
+  const input = `${inherited.provider}/${inherited.id}`;
+  if (!options.nested && !options.workflow) {
+    const verdict = checkModelScope({
+      model: inherited,
+      cwd: configCwd,
+      modelRegistry: ctx.modelRegistry,
+      callerSupplied: false,
+      agentLabel: agentConfig?.displayName ?? agentConfig?.name ?? "agent",
+      modelInput: input,
+    });
+    if (verdict.kind === "warn") ctx.ui.notify(verdict.message, "warning");
+  }
+  return [{ input, model: inherited, thinking: fallbackThinking }];
 }
 
 export async function runAgent(
@@ -832,13 +935,10 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
-
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  const modelCandidates = resolveRunModelCandidates(ctx, agentConfig, options, configCwd);
+  const firstCandidate = modelCandidates[0];
+  const model = firstCandidate?.model;
+  const thinkingLevel = firstCandidate?.thinking ?? options.thinkingLevel ?? agentConfig?.thinking;
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -957,6 +1057,12 @@ export async function runAgent(
   }
 
   const settingsManager = SettingsManager.create(configCwd, agentDir);
+  const retrySettings = settingsManager.getRetrySettings?.();
+  if (retrySettings && settingsManager.applyOverrides) {
+    settingsManager.applyOverrides({
+      retry: { ...retrySettings, maxRetries: options.maxRetries ?? maxRetries },
+    });
+  }
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,
@@ -1006,10 +1112,13 @@ export async function runAgent(
     sessionOpts.excludeTools = sessionExcludeTools;
   }
   if (thinkingLevel) {
-    sessionOpts.thinkingLevel = thinkingLevel;
+    sessionOpts.thinkingLevel = thinkingLevel as ThinkingLevel;
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  if (options.resumeSessionFile && firstCandidate) {
+    recordReopenedModelSelection(session, firstCandidate);
+  }
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1046,13 +1155,26 @@ export async function runAgent(
     });
   }
 
-  options.onSessionCreated?.(session);
-
-  // Track turns for graceful max_turns enforcement
+  // Track turns for graceful max_turns enforcement.
   let turnCount = 0;
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
   let softLimitReached = false;
   let aborted = false;
+
+  const attemptedModels = firstCandidate ? [firstCandidate.input] : [];
+  const endModelFallback = modelCandidates.length > 0
+    ? beginModelFallbackInvocation(session, {
+        candidates: modelCandidates,
+        maxWraparounds: options.maxModelWraparounds ?? maxModelWraparounds,
+        signal: options.signal,
+        canFallback: () => !aborted,
+        onTransition: (transition) => {
+          attemptedModels.push(transition.candidate.input);
+          options.onModelTransition?.(transition);
+        },
+      })
+    : () => {};
+  options.onSessionCreated?.(session);
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
@@ -1132,6 +1254,7 @@ export async function runAgent(
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
+    endModelFallback();
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
@@ -1151,7 +1274,12 @@ export async function runAgent(
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    failure: withModelAttempts(
+      finalTurnError(session, startLen),
+      attemptedModels,
+      options.maxRetries ?? maxRetries,
+      options.maxModelWraparounds ?? maxModelWraparounds,
+    ) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };
@@ -1170,15 +1298,55 @@ export async function resumeAgent(
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    modelCandidates?: RetryModelCandidate[];
+    maxRetries?: number;
+    maxModelWraparounds?: number;
+    onModelTransition?: (transition: ModelTransition) => void;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
+  const retrySettings = session.settingsManager?.getRetrySettings?.();
+  if (retrySettings && session.settingsManager.applyOverrides) {
+    session.settingsManager.applyOverrides({
+      retry: { ...retrySettings, maxRetries: options.maxRetries ?? maxRetries },
+    });
+  }
+  if (options.modelCandidates) {
+    await replaceSessionModelCandidates(
+      session,
+      options.modelCandidates,
+      options.signal,
+      options.onModelTransition,
+    );
+  }
+  const retained = getSessionModelCandidates(session);
+  const currentModel = session.model;
+  const candidates = retained?.candidates ?? (currentModel ? [{
+    input: `${currentModel.provider}/${currentModel.id}`,
+    model: currentModel,
+    thinking: session.thinkingLevel as ModelThinkingLevel,
+  }] : []);
+  const attemptedModels = candidates[retained?.currentIndex ?? 0]
+    ? [candidates[retained?.currentIndex ?? 0].input]
+    : [];
+  const endModelFallback = candidates.length > 0
+    ? beginModelFallbackInvocation(session, {
+        candidates,
+        currentIndex: retained?.currentIndex,
+        maxWraparounds: options.maxModelWraparounds ?? maxModelWraparounds,
+        signal: options.signal,
+        onTransition: (transition) => {
+          attemptedModels.push(transition.candidate.input);
+          options.onModelTransition?.(transition);
+        },
+      })
+    : () => {};
+
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
-
   const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
@@ -1206,6 +1374,7 @@ export async function resumeAgent(
       : prompt;
     await session.prompt(scopedPrompt);
   } finally {
+    endModelFallback();
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
@@ -1213,7 +1382,12 @@ export async function resumeAgent(
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    failure: withModelAttempts(
+      finalTurnError(session, startLen),
+      attemptedModels,
+      options.maxRetries ?? maxRetries,
+      options.maxModelWraparounds ?? maxModelWraparounds,
+    ),
   };
 }
 

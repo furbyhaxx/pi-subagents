@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { describeModel, type ModelRegistry, resolveModel } from "../src/model-resolver.js";
+import {
+  describeModel,
+  type ModelRegistry,
+  parseCanonicalModelId,
+  resolveCanonicalModel,
+  resolveModel,
+  resolveModelCandidate,
+} from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -21,6 +28,33 @@ function makeRegistry(models = MODELS, available?: typeof MODELS): ModelRegistry
     getAvailable: available ? () => available : undefined,
   };
 }
+
+describe("canonical model candidates", () => {
+  it("parses a thinking suffix while preserving slashes in the model id", () => {
+    expect(parseCanonicalModelId("gateway/org/model:high")).toEqual({
+      input: "gateway/org/model:high",
+      provider: "gateway",
+      modelId: "org/model",
+      thinking: "high",
+    });
+  });
+
+  it("resolves configured candidates exactly without fuzzy provider fallback", () => {
+    expect(resolveCanonicalModel("anthropic/haiku", makeRegistry())).toBe('Model not found: "anthropic/haiku".');
+  });
+
+  it("retains an explicit suffix on a caller override", () => {
+    const result = resolveModelCandidate("anthropic/claude-opus-4-6:max", makeRegistry());
+    expect(result).toMatchObject({ input: "anthropic/claude-opus-4-6:max", thinking: "max", model: MODELS[0] });
+  });
+
+  it("prefers a literal colon-bearing model id over suffix parsing", () => {
+    const literal = { ...MODELS[0], id: "claude-opus-4-6:high" };
+    const resolved = resolveCanonicalModel("anthropic/claude-opus-4-6:high", makeRegistry([literal]));
+    expect(resolved).toMatchObject({ model: literal });
+    expect(resolved).not.toHaveProperty("thinking");
+  });
+});
 
 describe("resolveModel", () => {
   describe("exact match (provider/modelId)", () => {

@@ -26,13 +26,29 @@ import { resolveBranch } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { getWorktreeDirectory, sessionArtifactRoot } from "./output-file.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { ModelTransition, RetryModelCandidate } from "./pi-retry-adapter.js";
+import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, ModelThinkingLevel, SubagentType } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, releaseWorktreeLease, resumeWorktree, type WorktreeInfo } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
+
+function applyModelTransition(record: AgentRecord, transition: ModelTransition): void {
+  record.invocation ??= {};
+  Object.assign(record.invocation, describeModel(transition.candidate.model));
+  record.invocation.thinking = transition.thinking;
+  if (transition.reason === "override" || record.invocation.modelCandidates === undefined) {
+    record.invocation.modelCandidates = transition.selection ?? [transition.candidate.input];
+  }
+  const requested = transition.candidate.thinking;
+  if (requested && requested !== transition.thinking) {
+    record.invocation.requestedThinking = requested;
+  } else {
+    delete record.invocation.requestedThinking;
+  }
+}
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
 /**
  * Fired once per assistant `message_end`, for EVERY agent this manager owns —
@@ -207,10 +223,14 @@ interface SpawnOptions {
    */
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
+  modelInputs?: string[];
+  modelFromParams?: boolean;
+  maxRetries?: number;
+  maxModelWraparounds?: number;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel?: ModelThinkingLevel;
   isBackground?: boolean;
   /**
    * Skip whichever pool's queue check applies to this spawn — start immediately
@@ -308,6 +328,7 @@ interface SpawnOptions {
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  onModelTransition?: (transition: ModelTransition) => void;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
   /** Parent agent ID for ownership-scoped nested controls. */
@@ -335,6 +356,8 @@ interface ResumeOptions {
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  modelCandidates?: RetryModelCandidate[];
+  onModelTransition?: (transition: ModelTransition) => void;
   /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
@@ -846,6 +869,10 @@ export class AgentManager {
       pi,
       agentId: id,
       model: options.model,
+      modelInputs: options.modelInputs,
+      modelFromParams: options.modelFromParams,
+      maxRetries: options.maxRetries,
+      maxModelWraparounds: options.maxModelWraparounds,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
@@ -881,6 +908,10 @@ export class AgentManager {
         record.compactionCount++;
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
+      },
+      onModelTransition: (transition) => {
+        applyModelTransition(record, transition);
+        options.onModelTransition?.(transition);
       },
       nestedRuntime: {
         manager: this,
@@ -1322,6 +1353,11 @@ export class AgentManager {
             this.onCompact?.(record, info);
             options?.onCompaction?.(info);
           },
+          modelCandidates: options?.modelCandidates,
+          onModelTransition: (transition) => {
+            applyModelTransition(record, transition);
+            options?.onModelTransition?.(transition);
+          },
           signal: abortController.signal,
         });
         // Same contract as spawn: a failed final turn is an error, while its
@@ -1447,6 +1483,11 @@ export class AgentManager {
           record.compactionCount++;
           this.onCompact?.(record, info);
           options.onCompaction?.(info);
+        },
+        modelCandidates: options.modelCandidates,
+        onModelTransition: (transition) => {
+          applyModelTransition(record, transition);
+          options.onModelTransition?.(transition);
         },
         signal: abortController.signal,
       });

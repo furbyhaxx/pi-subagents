@@ -470,6 +470,14 @@ describe("settings persistence", () => {
       });
     });
 
+    it("accepts zero retry and wraparound budgets and caps them at 100", () => {
+      writeProject({ maxRetries: 0, maxModelWraparounds: 100 });
+      expect(loadSettings(projectDir)).toMatchObject({ maxRetries: 0, maxModelWraparounds: 100 });
+
+      writeProject({ maxRetries: 101, maxModelWraparounds: -1 });
+      expect(loadSettings(projectDir)).toEqual({});
+    });
+
     it("drops values above the ceiling", () => {
       writeProject({ maxConcurrent: 1025 });
       expect(loadSettings(projectDir).maxConcurrent).toBeUndefined();
@@ -535,6 +543,8 @@ describe("settings persistence", () => {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
+        setMaxRetries: vi.fn(),
+        setMaxModelWraparounds: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
         setBackgroundByDefault: vi.fn(),
@@ -611,8 +621,16 @@ describe("settings persistence", () => {
     });
 
     it("applies only the fields that are present", () => {
-      applySettings({ maxConcurrent: 4, graceTurns: 3, maxSubagentDepth: 1 }, appliers);
+      applySettings({
+        maxConcurrent: 4,
+        maxRetries: 2,
+        maxModelWraparounds: 1,
+        graceTurns: 3,
+        maxSubagentDepth: 1,
+      }, appliers);
       expect(appliers.setMaxConcurrent).toHaveBeenCalledWith(4);
+      expect(appliers.setMaxRetries).toHaveBeenCalledWith(2);
+      expect(appliers.setMaxModelWraparounds).toHaveBeenCalledWith(1);
       expect(appliers.setGraceTurns).toHaveBeenCalledWith(3);
       expect(appliers.setMaxSubagentDepth).toHaveBeenCalledWith(1);
       expect(appliers.setDefaultMaxTurns).not.toHaveBeenCalled();
@@ -786,6 +804,8 @@ describe("settings persistence", () => {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
+        setMaxRetries: vi.fn(),
+        setMaxModelWraparounds: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
         setBackgroundByDefault: vi.fn(),

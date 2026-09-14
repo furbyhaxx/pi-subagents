@@ -313,7 +313,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     model = faux.getModel();
     // Structural faux registry + runtime (see faux-model-backend.ts): the parent
     // session uses `model` directly; subagents inherit it via ctx.model since
-    // resolveDefaultModel falls back to the parent model when no model is pinned.
+    // Agent runs inherit ctx.model when no model list is configured.
     ({ modelRegistry, modelRuntime } = fauxModelBackend(model));
 
     // Pad the response queue: one context-branching responder per expected model

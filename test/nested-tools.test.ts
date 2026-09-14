@@ -30,7 +30,8 @@ function ctx(executionCwd = cwd) {
     cwd: executionCwd,
     model: undefined,
     modelRegistry: {
-      find: (provider: string, id: string) => ({ provider, id }),
+      find: (provider: string, id: string) =>
+        MODELS.find(model => model.provider === provider && model.id === id),
       getAvailable: () => MODELS,
       getAll: () => MODELS,
     },
@@ -284,6 +285,29 @@ describe("child-safe nested Agent tools", () => {
       prompt: "Continue",
     })).isError).toBe(true);
     expect(manager.resume).not.toHaveBeenCalled();
+  });
+
+  it("applies and scope-checks an explicit model on nested resume", async () => {
+    const [agent] = tools(["scout"]);
+    const record = { id: "child-1", type: "scout", status: "completed", parentAgentId: "parent-1" };
+    records.set(record.id, record);
+    vi.mocked(manager.resume).mockResolvedValue(record as never);
+
+    const result = await execute(agent, {
+      resume: record.id,
+      subagent_type: "scout",
+      description: "resume child",
+      prompt: "Continue",
+      model: "anthropic/allowed:low",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(manager.resume).toHaveBeenCalledWith(
+      record.id,
+      "Continue",
+      undefined,
+      { modelCandidates: [expect.objectContaining({ input: "anthropic/allowed:low", thinking: "low" })] },
+    );
   });
 
   it("reports a background child that fails to start as a tool error", async () => {

@@ -13,8 +13,9 @@
  * completion-notification race, and what protocol version 2 does not promise.
  */
 
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { isTopLevelAgent } from "./agent-manager.js";
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { type ModelRegistry, resolveModelCandidate } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
 
@@ -90,6 +91,20 @@ function handleRpc<P extends { requestId: string }>(
   });
 }
 
+const PRIVATE_SPAWN_OPTIONS = [
+  "modelInputs",
+  "modelFromParams",
+  "maxRetries",
+  "maxModelWraparounds",
+] as const;
+
+function sanitizeRpcSpawnOptions(options: unknown): Record<string, unknown> {
+  if (!options || typeof options !== "object" || Array.isArray(options)) return {};
+  const sanitized = { ...(options as Record<string, unknown>) };
+  for (const key of PRIVATE_SPAWN_OPTIONS) delete sanitized[key];
+  return sanitized;
+}
+
 /**
  * Register ping, spawn, stop, and consume RPC handlers on the event bus.
  * Returns unsub functions for cleanup.
@@ -101,7 +116,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     return { version: PROTOCOL_VERSION };
   });
 
-  const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
+  const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: unknown }>(
     events, "subagents:rpc:spawn", async ({ type, prompt, options }) => {
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
@@ -112,30 +127,49 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // — same pattern the scheduler path already uses — so the spawned
       // agent's auth lookup doesn't crash with "No API key found for
       // undefined".
-      let normalizedOptions = options ?? {};
+      let normalizedOptions = sanitizeRpcSpawnOptions(options);
       // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.
       const override = normalizedOptions.model;
       if (override != null) {
         const { modelRegistry, cwd } = ctx as { modelRegistry?: ModelRegistry; cwd?: string };
-        // Names the override the same way in both messages below; an object
-        // override would otherwise interpolate as "[object Object]".
-        const label = typeof override === "string" ? override : `${override.provider}/${override.id}`;
+        let label: string;
+        if (typeof override === "string") {
+          label = override;
+        } else {
+          if (
+            typeof override !== "object"
+            || typeof (override as { provider?: unknown }).provider !== "string"
+            || typeof (override as { id?: unknown }).id !== "string"
+          ) {
+            throw new Error("RPC model must be a Model object or model string");
+          }
+          const value = override as { provider: string; id: string };
+          label = `${value.provider}/${value.id}`;
+        }
         if (!modelRegistry) {
           throw new Error(`Model override "${label}" provided but ctx.modelRegistry is unavailable`);
         }
-        let model = override;
+        let model: Model<Api>;
         if (typeof override === "string") {
-          const resolved = resolveModel(override, modelRegistry);
-          if (typeof resolved === "string") {
-            // resolveModel returns a human-readable error string when the
-            // input doesn't match any available model. Surface it instead of
-            // silently falling back so the caller sees the auth/typo issue.
-            throw new Error(resolved);
-          }
-          model = resolved;
-          normalizedOptions = { ...normalizedOptions, model: resolved };
+          const resolved = resolveModelCandidate(override, modelRegistry);
+          if (typeof resolved === "string") throw new Error(resolved);
+          model = resolved.model;
+          normalizedOptions = {
+            ...normalizedOptions,
+            model: resolved.model,
+            modelInputs: [override],
+            modelFromParams: true,
+          };
+        } else {
+          model = override as Model<Api>;
+          normalizedOptions = {
+            ...normalizedOptions,
+            model,
+            modelInputs: [label],
+            modelFromParams: true,
+          };
         }
 
         // A model on the RPC payload is an orchestrator-level choice, exactly

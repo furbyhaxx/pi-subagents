@@ -2,15 +2,18 @@
  * types.ts — Type definitions for the subagent system.
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
 import type { WorktreeCleanupResult, WorktreeInfo } from "./worktree.js";
 
-export type { ThinkingLevel };
+export type { ModelThinkingLevel, ThinkingLevel };
 
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
+
+/** Canonical provider/model[:thinking] spelling validated at configuration boundaries. */
+export type CanonicalModelId = string;
 
 /** Names of the three embedded default agents. */
 export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as const;
@@ -52,8 +55,9 @@ export interface AgentConfig {
   excludeExtensions?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
-  model?: string;
-  thinking?: ThinkingLevel;
+  /** Ordered canonical provider/model[:thinking] fallback candidates. */
+  models?: CanonicalModelId[];
+  thinking?: ModelThinkingLevel;
   maxTurns?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
   persistSession?: boolean;
@@ -300,6 +304,8 @@ export interface AgentInvocation {
   modelName?: string;
   /** Canonical `provider/id`, for surfaces with room to disambiguate providers. */
   modelId?: string;
+  /** Ordered configured candidates, including optional thinking suffixes. */
+  modelCandidates?: string[];
   /** The level actually in effect, once a session exists to report one. */
   thinking?: EffectiveThinkingLevel;
   /**
@@ -373,7 +379,7 @@ export interface ScheduledSubagent {
   subagent_type: SubagentType;
   prompt: string;
   model?: string;
-  thinking?: ThinkingLevel;
+  thinking?: ModelThinkingLevel;
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;

@@ -392,7 +392,7 @@ describe("buildNewAgentFile", () => {
     // it's the shape most likely to be typed into the custom-model prompt, and
     // quoting must not mangle it.
     const content = buildNewAgentFile({ ...base, model: "anthropic/claude-sonnet-4-6:high" });
-    expect(parse(content).model).toBe("anthropic/claude-sonnet-4-6:high");
+    expect(parse(content).models).toEqual(["anthropic/claude-sonnet-4-6:high"]);
   });
 
   it("survives a custom model containing a colon-space or a #", () => {
@@ -401,16 +401,16 @@ describe("buildNewAgentFile", () => {
     for (const model of ["anthropic/foo: bar", "anthropic/x #c"]) {
       const content = buildNewAgentFile({ ...base, model });
       expect(() => parse(content), model).not.toThrow();
-      expect(parse(content).model, model).toBe(model);
+      expect(parse(content).models, model).toEqual([model]);
     }
   });
 
   it("emits the fields the wizard collects, and omits the ones left on inherit", () => {
     const full = parse(buildNewAgentFile({ ...base, model: "anthropic/x", thinking: "high" }));
-    expect(full).toMatchObject({ tools: "read, grep", model: "anthropic/x", thinking: "high", prompt_mode: "replace" });
+    expect(full).toMatchObject({ tools: "read, grep", models: ["anthropic/x"], thinking: "high", prompt_mode: "replace" });
 
     const minimal = parse(buildNewAgentFile(base));
-    expect(minimal.model).toBeUndefined();
+    expect(minimal.models).toBeUndefined();
     expect(minimal.thinking).toBeUndefined();
   });
 

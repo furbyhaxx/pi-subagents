@@ -2,6 +2,24 @@
  * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
  */
 
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { CanonicalModelId } from "./types.js";
+
+export const MODEL_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+export interface ParsedCanonicalModelId {
+  input: CanonicalModelId;
+  provider: string;
+  modelId: string;
+  thinking?: ModelThinkingLevel;
+}
+
+export interface ResolvedModelCandidate {
+  input: string;
+  model: Model<Api>;
+  thinking?: ModelThinkingLevel;
+}
+
 export interface ModelEntry {
   id: string;
   name: string;
@@ -12,6 +30,85 @@ export interface ModelRegistry {
   find(provider: string, modelId: string): any;
   getAll(): any[];
   getAvailable?(): any[];
+}
+
+/** Validate and split a canonical provider/model[:thinking] identifier. */
+export function parseCanonicalModelId(input: string): ParsedCanonicalModelId {
+  if (input.trim() !== input || /\s/.test(input)) {
+    throw new Error(`Invalid canonical model ID "${input}": whitespace is not allowed.`);
+  }
+  const slash = input.indexOf("/");
+  if (slash <= 0 || slash === input.length - 1) {
+    throw new Error(`Invalid canonical model ID "${input}": expected provider/model.`);
+  }
+  const provider = input.slice(0, slash);
+  const rawModelId = input.slice(slash + 1);
+  const colon = rawModelId.lastIndexOf(":");
+  const suffix = colon === -1 ? undefined : rawModelId.slice(colon + 1);
+  const thinking = MODEL_THINKING_LEVELS.find(level => level === suffix);
+  return {
+    input,
+    provider,
+    modelId: thinking ? rawModelId.slice(0, colon) : rawModelId,
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+/**
+ * Resolve a frontmatter candidate exactly. A literal colon-bearing model ID wins
+ * over interpreting its tail as a thinking suffix.
+ */
+export function resolveCanonicalModel(
+  input: string,
+  registry: ModelRegistry,
+): ResolvedModelCandidate | string {
+  let parsed: ParsedCanonicalModelId;
+  try {
+    parsed = parseCanonicalModelId(input);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  const slash = input.indexOf("/");
+  const literalId = input.slice(slash + 1);
+  const literal = registry.find(parsed.provider, literalId) as ModelEntry | undefined;
+  const available = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+  const availableKeys = new Set(available.map(model => `${model.provider}/${model.id}`));
+  if (literal) {
+    return availableKeys.has(`${literal.provider}/${literal.id}`)
+      ? { input, model: literal as Model<Api> }
+      : `Model unavailable: "${input}".`;
+  }
+
+  const resolved = registry.find(parsed.provider, parsed.modelId) as ModelEntry | undefined;
+  if (!resolved) return `Model not found: "${input}".`;
+  if (!availableKeys.has(`${resolved.provider}/${resolved.id}`)) {
+    return `Model unavailable: "${input}".`;
+  }
+  return { input, model: resolved as Model<Api>, ...(parsed.thinking ? { thinking: parsed.thinking } : {}) };
+}
+
+export interface ModelCandidateResolution {
+  candidates: ResolvedModelCandidate[];
+  errors: string[];
+}
+
+/** Resolve one caller override fuzzily, or an ordered configured list exactly. */
+export function resolveModelCandidates(
+  inputs: readonly string[],
+  registry: ModelRegistry,
+  callerSupplied: boolean,
+): ModelCandidateResolution {
+  const candidates: ResolvedModelCandidate[] = [];
+  const errors: string[] = [];
+  for (const input of inputs) {
+    const resolved = callerSupplied
+      ? resolveModelCandidate(input, registry)
+      : resolveCanonicalModel(input, registry);
+    if (typeof resolved === "string") errors.push(resolved);
+    else candidates.push(resolved);
+  }
+  return { candidates, errors };
 }
 
 /**
@@ -30,6 +127,34 @@ export function describeModel(
     modelName: (model.name ?? model.id).replace(/^Claude\s+/i, "").toLowerCase(),
     modelId: `${model.provider}/${model.id}`,
   };
+}
+
+/** Resolve a caller input, retaining an optional explicit thinking suffix. */
+export function resolveModelCandidate(
+  input: string,
+  registry: ModelRegistry,
+): ResolvedModelCandidate | string {
+  if (input.includes("/")) {
+    const slash = input.indexOf("/");
+    const literalExists = slash > 0 && registry.find(input.slice(0, slash), input.slice(slash + 1)) !== undefined;
+    const canonical = resolveCanonicalModel(input, registry);
+    if (typeof canonical !== "string" || literalExists) return canonical;
+    let parsed: ParsedCanonicalModelId;
+    try {
+      parsed = parseCanonicalModelId(input);
+    } catch {
+      const resolved = resolveModel(input, registry);
+      return typeof resolved === "string" ? resolved : { input, model: resolved as Model<Api> };
+    }
+    if (parsed.thinking) {
+      const resolved = resolveModel(`${parsed.provider}/${parsed.modelId}`, registry);
+      return typeof resolved === "string"
+        ? resolved
+        : { input, model: resolved as Model<Api>, thinking: parsed.thinking };
+    }
+  }
+  const resolved = resolveModel(input, registry);
+  return typeof resolved === "string" ? resolved : { input, model: resolved as Model<Api> };
 }
 
 /**

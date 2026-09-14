@@ -484,9 +484,9 @@ async function agentIn(scope, prompt, opts) {
   }
 
   // resume revives a child that already exists, so anything describing how to
-  // *start* one is not a thing this call gets to decide — the revived child
-  // keeps the agent, model and tool contract it was started with. Rejecting is
-  // the point: silently ignoring these opts would look like they applied.
+  // *start* one is not a thing this call gets to decide — except model, the
+  // explicit recovery override. Rejecting the rest prevents options from
+  // looking effective when they were ignored.
   if (resume !== undefined) {
     if (branch !== undefined) {
       throw new Error("agent() opts.resume and opts.branch are mutually exclusive: a resumed agent keeps its recorded workspace.");
@@ -494,11 +494,6 @@ async function agentIn(scope, prompt, opts) {
     if (agentType !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.agentType are mutually exclusive: a resumed agent keeps the agent type it was started with."
-      );
-    }
-    if (model !== undefined) {
-      throw new Error(
-        "agent() opts.resume and opts.model are mutually exclusive: a resumed agent keeps the model it was started with."
       );
     }
     if (isolation !== undefined) {

@@ -127,7 +127,7 @@ You are a security auditor.`);
     expect(agent.name).toBe("auditor");
     expect(agent.description).toBe("Security Auditor");
     expect(agent.builtinToolNames).toEqual(["read", "grep", "find"]);
-    expect(agent.model).toBe("anthropic/claude-opus-4-6");
+    expect(agent.models).toEqual(["anthropic/claude-opus-4-6"]);
     expect(agent.thinking).toBe("high");
     expect(agent.maxTurns).toBe(30);
     expect(agent.persistSession).toBe(true);
@@ -139,6 +139,51 @@ You are a security auditor.`);
     expect(agent.runInBackground).toBe(true);
     expect(agent.isolated).toBe(true);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
+  });
+
+  it("loads an ordered models list and preserves thinking suffixes", () => {
+    writeAgent("fallback", `---
+models:
+  - anthropic/claude-opus-4-6:high
+  - openai/gpt-4o
+---
+
+Fallback.`);
+
+    expect(loadCustomAgents(tmpDir).get("fallback")?.models).toEqual([
+      "anthropic/claude-opus-4-6:high",
+      "openai/gpt-4o",
+    ]);
+  });
+
+  it("rejects conflicting model and models fields", () => {
+    writeAgent("conflict", `---
+model: anthropic/claude-opus-4-6
+models:
+  - openai/gpt-4o
+---
+
+Conflict.`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(loadCustomAgents(tmpDir).has("conflict")).toBe(false);
+      expect(() => loadCustomAgents(tmpDir, true)).toThrow("cannot contain both model and models");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("rejects empty and non-canonical model lists", () => {
+    writeAgent("empty-models", "---\nmodels: []\n---\n\nEmpty.");
+    writeAgent("fuzzy-models", "---\nmodels:\n  - sonnet\n---\n\nFuzzy.");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const agents = loadCustomAgents(tmpDir);
+      expect(agents.has("empty-models")).toBe(false);
+      expect(agents.has("fuzzy-models")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("uses sensible defaults when frontmatter is empty", () => {
@@ -157,7 +202,7 @@ Just a prompt.`);
     expect(agent.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES); // all tools
     expect(agent.extensions).toBe(true); // inherit all
     expect(agent.skills).toBe(true); // inherit all
-    expect(agent.model).toBeUndefined();
+    expect(agent.models).toBeUndefined();
     expect(agent.thinking).toBeUndefined();
     expect(agent.maxTurns).toBeUndefined();
     expect(agent.persistSession).toBeUndefined();
@@ -1089,7 +1134,7 @@ Good body.`);
     it("preserves the scalar and list fields it writes", () => {
       const loaded = roundTrip({
         displayName: "RT",
-        model: "anthropic/claude-haiku-4-5",
+        models: ["anthropic/claude-haiku-4-5"],
         thinking: "low",
         maxTurns: 7,
         allowedSubagents: ["Explore"],
@@ -1103,7 +1148,7 @@ Good body.`);
         isolation: "worktree",
       });
       expect(loaded.displayName).toBe("RT");
-      expect(loaded.model).toBe("anthropic/claude-haiku-4-5");
+      expect(loaded.models).toEqual(["anthropic/claude-haiku-4-5"]);
       expect(loaded.thinking).toBe("low");
       expect(loaded.maxTurns).toBe(7);
       expect(loaded.allowedSubagents).toEqual(["Explore"]);

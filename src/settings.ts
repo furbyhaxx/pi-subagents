@@ -43,6 +43,10 @@ export interface SubagentsSettings {
    * `/agents` → Settings input prompt explicitly says "0 = unlimited".
    */
   defaultMaxTurns?: number;
+  /** Pi session retries after the initial request for each selected model. Default 3. */
+  maxRetries?: number;
+  /** Additional complete traversals of an agent's ordered model list. Default 0. */
+  maxModelWraparounds?: number;
   graceTurns?: number;
   defaultJoinMode?: JoinMode;
   /**
@@ -79,11 +83,10 @@ export interface SubagentsSettings {
    *
    * scopeModels guards against runtime LLM choices, not user-level config.
    * Out-of-scope handling reflects this:
-   *   - Caller-supplied via `Agent({ model: "..." })` (only when frontmatter
-   *     has no `model:`, since frontmatter is authoritative): hard error
-   *     returned to the orchestrator, listing the allowed models. The LLM
-   *     made an explicit out-of-scope choice and gets explicit feedback.
-   *   - Frontmatter-pinned: warning toast + the pinned model runs. The
+   *   - Caller-supplied via `Agent({ model: "..." })`: hard error returned to
+   *     the orchestrator, listing the allowed models. An explicit caller model
+   *     replaces any configured fallback list.
+   *   - Frontmatter-configured: warning toast + the configured model runs. The
    *     agent's author/installer chose this; trust it.
    *   - Parent-inherited (neither caller nor frontmatter sets a model):
    *     warning toast + parent's model runs. The user chose the parent's
@@ -318,6 +321,8 @@ export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
   setMaxConcurrentForeground: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
+  setMaxRetries: (n: number) => void;
+  setMaxModelWraparounds: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
@@ -355,6 +360,8 @@ const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>
 // that any realistic power-user setting passes through.
 const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
+const RETRY_CEILING = 100;
+const WRAPAROUND_CEILING = 100;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
 
@@ -395,6 +402,20 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.defaultMaxTurns as number) <= MAX_TURNS_CEILING
   ) {
     out.defaultMaxTurns = r.defaultMaxTurns as number;
+  }
+  if (
+    Number.isInteger(r.maxRetries)
+    && (r.maxRetries as number) >= 0
+    && (r.maxRetries as number) <= RETRY_CEILING
+  ) {
+    out.maxRetries = r.maxRetries as number;
+  }
+  if (
+    Number.isInteger(r.maxModelWraparounds)
+    && (r.maxModelWraparounds as number) >= 0
+    && (r.maxModelWraparounds as number) <= WRAPAROUND_CEILING
+  ) {
+    out.maxModelWraparounds = r.maxModelWraparounds as number;
   }
   if (
     Number.isInteger(r.graceTurns) &&
@@ -535,6 +556,10 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
     appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
   }
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
+  if (typeof s.maxRetries === "number") appliers.setMaxRetries(s.maxRetries);
+  if (typeof s.maxModelWraparounds === "number") {
+    appliers.setMaxModelWraparounds(s.maxModelWraparounds);
+  }
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);

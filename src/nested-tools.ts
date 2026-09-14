@@ -17,7 +17,7 @@ import {
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { type ResolvedModelCandidate, resolveModelCandidates } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
   createOutputFilePath,
@@ -25,13 +25,14 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import type { RetryModelCandidate } from "./pi-retry-adapter.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
   AgentInvocation,
   AgentRecord,
   IsolationMode,
-  ThinkingLevel,
+  ModelThinkingLevel,
 } from "./types.js";
 import { addUsage } from "./usage.js";
 import { isWorktreeIsolationEnabled } from "./worktree.js";
@@ -52,10 +53,12 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
+  modelInputs?: string[];
+  modelFromParams?: boolean;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel?: ModelThinkingLevel;
   isBackground?: boolean;
   isolation?: IsolationMode;
   branch?: string;
@@ -92,7 +95,12 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(
+    id: string,
+    prompt: string,
+    signal?: AbortSignal,
+    options?: { modelCandidates?: RetryModelCandidate[] },
+  ): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -174,7 +182,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
-      model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
+      model: Type.Optional(Type.String({
+        description: "Optional provider/model[:thinking] override. Replaces the configured fallback list; omit unless recovering from an unavailable configured selection.",
+      })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
@@ -194,7 +204,31 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        let modelCandidates: RetryModelCandidate[] | undefined;
+        if (params.model !== undefined) {
+          const resolution = resolveModelCandidates([params.model], ctx.modelRegistry, true);
+          const candidate = resolution.candidates[0];
+          if (!candidate) return textResult(resolution.errors.join("\n"), true);
+          const verdict = checkModelScope({
+            model: candidate.model,
+            cwd: context.configCwd,
+            modelRegistry: ctx.modelRegistry,
+            callerSupplied: true,
+            agentLabel: existing.type,
+            modelInput: candidate.input,
+          });
+          if (verdict.kind === "error") return textResult(verdict.message, true);
+          const registry = loadRegistry();
+          const config = getAgentConfigIn(registry, existing.type);
+          modelCandidates = [{
+            input: candidate.input,
+            model: candidate.model,
+            thinking: candidate.thinking ?? config?.thinking,
+          }];
+        }
+        const resumed = modelCandidates
+          ? await context.manager.resume(params.resume, params.prompt, signal, { modelCandidates })
+          : await context.manager.resume(params.resume, params.prompt, signal);
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error", resumed)
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);
@@ -237,27 +271,36 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         defaultRunInBackground: false,
       });
       let model = ctx.model;
-      if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
-        } else {
-          model = resolvedModel;
+      let resolvedCandidates: ResolvedModelCandidate[] = [];
+      if (invocation.modelInputs?.length) {
+        const resolution = resolveModelCandidates(
+          invocation.modelInputs,
+          ctx.modelRegistry,
+          invocation.modelFromParams,
+        );
+        resolvedCandidates = resolution.candidates;
+        if (resolvedCandidates.length === 0) {
+          return textResult(
+            invocation.modelFromParams ? resolution.errors.join("\n") : "No configured model is available.",
+            true,
+          );
         }
       }
+      if (resolvedCandidates[0]) model = resolvedCandidates[0].model;
 
-      // Same scopeModels policy as the top-level Agent tool — a nested spawn
-      // must not escape the allowlist. A "warn" verdict proceeds silently:
-      // child sessions have no UI surface to toast to.
-      const scopeVerdict = checkModelScope({
-        model,
-        cwd: context.configCwd,
-        modelRegistry: ctx.modelRegistry,
-        callerSupplied: invocation.modelFromParams,
-        agentLabel: config?.displayName ?? resolvedType,
-        modelInput: invocation.modelInput,
-      });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message, true);
+      for (const candidate of resolvedCandidates.length > 0
+        ? resolvedCandidates
+        : model ? [{ input: `${model.provider}/${model.id}`, model }] : []) {
+        const scopeVerdict = checkModelScope({
+          model: candidate.model,
+          cwd: context.configCwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: invocation.modelFromParams,
+          agentLabel: config?.displayName ?? resolvedType,
+          modelInput: candidate.input,
+        });
+        if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message, true);
+      }
 
       // The whole branch shares the root session's transcript directory; read it
       // off the owning parent rather than this child session's own id.
@@ -266,7 +309,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const childDepth = context.depth + 1;
       const options: NestedSpawnOptions = {
         description: params.description,
-        model,
+        model: invocation.modelInputs ? model : undefined,
+        modelInputs: invocation.modelInputs,
+        modelFromParams: invocation.modelFromParams,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
@@ -276,6 +321,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         artifactRoot: parent?.artifactRoot,
         originCwd: parent?.originCwd,
         invocation: {
+          modelCandidates: invocation.modelInputs,
           thinking: invocation.thinking,
           maxTurns: invocation.maxTurns,
           isolated: invocation.isolated,

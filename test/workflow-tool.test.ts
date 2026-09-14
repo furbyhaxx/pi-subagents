@@ -361,7 +361,7 @@ describe("createWorkflowHost — scopeModels", () => {
       description: "an agent whose file pins a model",
       extensions: false,
       skills: false,
-      model: "anthropic/blocked-model",
+      models: ["anthropic/blocked-model"],
       systemPrompt: "pinned",
       promptMode: "replace",
     } as any]]));
@@ -423,7 +423,9 @@ describe("createWorkflowHost — scopeModels", () => {
     const result = await host.spawnAgent(request());
 
     expect(result.ok).toBe(true);
-    expect(stub.spawnAndWait.mock.calls[0][4].model).toBe(BLOCKED);
+    // Omitted so agent-runner retains inherited provenance rather than treating
+    // the parent model as an explicit override.
+    expect(stub.spawnAndWait.mock.calls[0][4].model).toBeUndefined();
     expect(notify).toHaveBeenCalledWith(
       expect.stringContaining("anthropic/blocked-model"),
       "warning",

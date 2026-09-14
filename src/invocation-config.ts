@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import type { AgentConfig, IsolationMode, JoinMode, ModelThinkingLevel } from "./types.js";
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -121,9 +121,12 @@ export function resolveAgentInvocationConfig(
   params: AgentInvocationParams,
   opts?: ResolveOptions,
 ): {
+  /** First effective model input, retained for existing display/error paths. */
   modelInput?: string;
+  /** Ordered configured inputs; explicit caller model replaces this with one item. */
+  modelInputs?: string[];
   modelFromParams: boolean;
-  thinking?: ThinkingLevel;
+  thinking?: ModelThinkingLevel;
   maxTurns?: number;
   inheritContext: boolean;
   runInBackground: boolean;
@@ -139,7 +142,7 @@ export function resolveAgentInvocationConfig(
    * `max_turns` is deliberately absent: no surface renders a requested-vs-
    * effective turn limit, so recording one would be dead data.
    */
-  overridden?: { thinking?: ThinkingLevel; model?: string };
+  overridden?: { thinking?: ModelThinkingLevel; model?: string };
 } {
   // Precedence first, collapse second — reversing these loses the veto, since
   // an agent file's "off" only outranks a caller's "worktree" while it is still
@@ -151,17 +154,17 @@ export function resolveAgentInvocationConfig(
 
   const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
     && agentConfig.thinking !== params.thinking
-    ? params.thinking as ThinkingLevel
+    ? params.thinking as ModelThinkingLevel
     : undefined;
-  const overriddenModel = agentConfig?.model != null && params.model != null
-    && agentConfig.model !== params.model
-    ? params.model
-    : undefined;
+  const modelInputs = params.model !== undefined
+    ? [params.model]
+    : agentConfig?.models;
 
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
-    thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
+    modelInput: modelInputs?.[0],
+    modelInputs,
+    modelFromParams: params.model != null,
+    thinking: (agentConfig?.thinking ?? params.thinking) as ModelThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
@@ -171,8 +174,8 @@ export function resolveAgentInvocationConfig(
     // Undefined rather than an empty object when nothing was overridden: callers
     // spread this into the invocation snapshot, and an always-present key would
     // put `requestedThinking: undefined` on every record.
-    overridden: overriddenThinking || overriddenModel
-      ? { thinking: overriddenThinking, model: overriddenModel }
+    overridden: overriddenThinking
+      ? { thinking: overriddenThinking }
       : undefined,
   };
 }

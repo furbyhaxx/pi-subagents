@@ -37,8 +37,9 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
-import { resolveModel } from "../model-resolver.js";
+import { type ResolvedModelCandidate, resolveModelCandidates } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
+import type { RetryModelCandidate } from "../pi-retry-adapter.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
@@ -201,44 +202,52 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
-      // Same precedence as the Agent tool: the caller's model wins, the agent
-      // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
-      const modelInput = request.model ?? config?.model;
-      if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
-        } else {
-          model = resolved;
+      const modelInputs = request.model !== undefined ? [request.model] : config?.models;
+      let resolvedCandidates: ResolvedModelCandidate[] = [];
+      if (modelInputs?.length) {
+        const resolution = resolveModelCandidates(
+          modelInputs,
+          ctx.modelRegistry,
+          request.model !== undefined,
+        );
+        resolvedCandidates = resolution.candidates;
+        if (request.model === undefined) {
+          for (const error of resolution.errors) {
+            if (!warnedScopeMessages.has(error)) {
+              warnedScopeMessages.add(error);
+              ctx.ui.notify(error, "warning");
+            }
+          }
+        }
+        if (resolvedCandidates.length === 0) {
+          return {
+            ok: false,
+            error: request.model !== undefined
+              ? resolution.errors.join("\n")
+              : "No configured model is available.",
+          };
         }
       }
+      if (resolvedCandidates[0]) model = resolvedCandidates[0].model;
 
-      // Same scopeModels policy as the Agent tool and the nested delegation
-      // tools: a script's `agent({ model })` is a runtime LLM choice, and the
-      // script is written by the model, so it must not reach a model the user's
-      // enabledModels list excludes. `callerSupplied` keys off `request.model`
-      // and NOT `modelInput` — the latter has already absorbed the agent file's
-      // own `model:`, which is user-authored config and so earns the
-      // warn-and-proceed branch rather than a refusal.
-      const scopeVerdict = checkModelScope({
-        model,
-        cwd: ctx.cwd,
-        modelRegistry: ctx.modelRegistry,
-        callerSupplied: request.model !== undefined,
-        agentLabel: config?.displayName ?? dispatch.type,
-        modelInput,
-      });
-      // This agent's failure, not the run's — the same shape a bad agent type
-      // takes above. The script sees `null` and its siblings carry on, which is
-      // the difference between one refused model and a discarded fan-out.
-      if (scopeVerdict.kind === "error") return { ok: false, error: scopeVerdict.message };
-      if (scopeVerdict.kind === "warn" && !warnedScopeMessages.has(scopeVerdict.message)) {
-        warnedScopeMessages.add(scopeVerdict.message);
-        ctx.ui.notify(scopeVerdict.message, "warning");
+      for (const candidate of resolvedCandidates.length > 0
+        ? resolvedCandidates
+        : model ? [{ input: `${model.provider}/${model.id}`, model }] : []) {
+        const scopeVerdict = checkModelScope({
+          model: candidate.model,
+          cwd: ctx.cwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: request.model !== undefined,
+          agentLabel: config?.displayName ?? dispatch.type,
+          modelInput: candidate.input,
+        });
+        if (scopeVerdict.kind === "error") return { ok: false, error: scopeVerdict.message };
+        if (scopeVerdict.kind === "warn" && !warnedScopeMessages.has(scopeVerdict.message)) {
+          warnedScopeMessages.add(scopeVerdict.message);
+          ctx.ui.notify(scopeVerdict.message, "warning");
+        }
       }
 
       /**
@@ -315,7 +324,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // doing. No `bypassQueue` needed: an agent outside the pool is
             // never queued behind it.
             ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
-            ...(model !== undefined ? { model } : {}),
+            ...(model !== undefined && modelInputs !== undefined ? { model } : {}),
+            ...(modelInputs !== undefined ? { modelInputs } : {}),
+            modelFromParams: request.model !== undefined,
             // Validated worker-side against the same list pi accepts, so the
             // cast asserts what the boundary has already checked. Left unset,
             // the agent definition's `thinking` (then the parent's) still wins —
@@ -326,17 +337,16 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // nothing for it to compare against, so a level pi clamped would be
             // indistinguishable from one that was honoured.
             //
-            // Only the level. #182's other half — a caller parameter an agent
-            // file outranked — cannot arise here: this path resolves
-            // `request.model ?? config?.model`, so the script always wins and
-            // therefore always got what it asked for. Seeding a `requestedModel`
-            // would describe a precedence this path does not have.
+            // Caller model overrides the configured list; no requested/effective
+            // mismatch exists for that field.
             invocation: {
+              ...(modelInputs !== undefined ? { modelCandidates: modelInputs } : {}),
               ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
             },
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
+            onModelTransition: () => reportResolved(),
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
             ...(request.branch !== undefined ? { branch: request.branch } : {}),
@@ -374,12 +384,36 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id !== undefined) manager.abort(id);
     },
 
-    async resumeAgent(agentId, prompt, onResolved) {
+    async resumeAgent(agentId, prompt, onResolved, modelInput) {
       const id = records.get(agentId);
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      const record = await manager.resume(id, prompt, deps.signal);
+      let modelCandidates: RetryModelCandidate[] | undefined;
+      if (modelInput !== undefined) {
+        const resolution = resolveModelCandidates([modelInput], ctx.modelRegistry, true);
+        const resolved = resolution.candidates[0];
+        if (!resolved) return { ok: false, error: resolution.errors.join("\n") };
+        const verdict = checkModelScope({
+          model: resolved.model,
+          cwd: ctx.cwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: true,
+          agentLabel: agentId,
+          modelInput,
+        });
+        if (verdict.kind === "error") return { ok: false, error: verdict.message };
+        const existing = manager.getRecord(id);
+        const config = existing ? getAgentConfig(existing.type) : undefined;
+        modelCandidates = [{
+          input: modelInput,
+          model: resolved.model,
+          thinking: resolved.thinking ?? config?.thinking,
+        }];
+      }
+      const record = modelCandidates
+        ? await manager.resume(id, prompt, deps.signal, { modelCandidates })
+        : await manager.resume(id, prompt, deps.signal);
       if (record === undefined) {
         return {
           ok: false,

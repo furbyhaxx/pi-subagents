@@ -13,6 +13,8 @@ const {
   sessionManagerOpen,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
+  settingsManagerApplyOverrides,
+  settingsManagerGetRetrySettings,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   defaultResourceLoaderCtor: vi.fn(),
@@ -28,7 +30,14 @@ const {
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   sessionManagerOpen: vi.fn(() => ({ kind: "reopened-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  settingsManagerApplyOverrides: vi.fn(),
+  settingsManagerGetRetrySettings: vi.fn(() => ({ enabled: true, maxRetries: 3, baseDelayMs: 2000 })),
+  settingsManagerCreate: vi.fn(() => ({
+    kind: "settings-manager",
+    getSessionDir: settingsManagerGetSessionDir,
+    getRetrySettings: settingsManagerGetRetrySettings,
+    applyOverrides: settingsManagerApplyOverrides,
+  })),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
@@ -129,13 +138,13 @@ import {
   getGraceTurns,
   parseExtensionsSpec,
   parseExtSelectors,
-  resolveDefaultModel,
   resolveEffectiveMaxTurns,
   resumeAgent,
   runAgent,
   SUBAGENT_TOOL_NAMES,
   setDefaultMaxTurns,
   setGraceTurns,
+  setMaxRetries,
   setRememberAgents,
 } from "../src/agent-runner.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
@@ -212,6 +221,9 @@ beforeEach(() => {
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
+  settingsManagerApplyOverrides.mockClear();
+  settingsManagerGetRetrySettings.mockClear();
+  setMaxRetries(3);
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
@@ -241,6 +253,18 @@ describe("agent-runner final output capture", () => {
     const bindOrder = session.bindExtensions.mock.invocationCallOrder[0];
     const promptOrder = session.prompt.mock.invocationCallOrder[0];
     expect(bindOrder).toBeLessThan(promptOrder);
+  });
+
+  it("applies the configured retry budget through Pi's settings manager", async () => {
+    setMaxRetries(2);
+    const { session } = createSession("RETRIED");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(settingsManagerApplyOverrides).toHaveBeenCalledWith({
+      retry: { enabled: true, maxRetries: 2, baseDelayMs: 2000 },
+    });
   });
 
   it("passes effective cwd and agentDir to the loader and settings manager", async () => {
@@ -2670,67 +2694,5 @@ describe("agent-runner abort signal forwarding", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     expect(session.abort).not.toHaveBeenCalled();
-  });
-});
-
-// resolveDefaultModel picks the model a subagent runs on. Every failure here is
-// SILENT BY DESIGN: an unresolvable or unavailable `model:` deliberately falls
-// back to the parent's model rather than erroring, because a user's frontmatter
-// pin shouldn't hard-fail a spawn. That makes the availability filter untestable
-// through observed behavior — a broken check just means every model-pinned agent
-// quietly runs on the parent's model, costing whatever the parent costs.
-//
-// Exported for this (the file already exports normalizeMaxTurns/setGraceTurns
-// purely for test/agent-runner-settings.test.ts).
-describe("resolveDefaultModel", () => {
-  const parent = { provider: "anthropic", id: "parent-model" } as any;
-  const haiku = { provider: "anthropic", id: "claude-haiku-4-5" } as any;
-
-  /** Registry whose `find` always succeeds; `getAvailable` is what varies. */
-  function registry(available?: any[]) {
-    return {
-      find: vi.fn((provider: string, id: string) => ({ provider, id }) as any),
-      getAvailable: available ? () => available : undefined,
-    };
-  }
-
-  it("returns the configured model when the registry has it available", () => {
-    const r = registry([haiku]);
-    expect(resolveDefaultModel(parent, r, "anthropic/claude-haiku-4-5"))
-      .toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
-  });
-
-  it("falls back to the parent when the model is NOT in the available set", () => {
-    // The branch with teeth: without this filter the subagent is handed a model
-    // the user has no credentials for, and the failure surfaces as a runtime
-    // auth error from deep inside createAgentSession instead of a clean fallback.
-    const r = registry([haiku]);
-    expect(resolveDefaultModel(parent, r, "openai/gpt-5")).toBe(parent);
-  });
-
-  it("trusts `find` when the registry cannot enumerate availability", () => {
-    // getAvailable absent → no filtering possible, so a found model is used.
-    const r = registry(undefined);
-    expect(resolveDefaultModel(parent, r, "anthropic/claude-haiku-4-5"))
-      .toEqual({ provider: "anthropic", id: "claude-haiku-4-5" });
-  });
-
-  it("falls back to the parent when the registry cannot find the model", () => {
-    const r = { find: vi.fn(() => undefined), getAvailable: undefined };
-    expect(resolveDefaultModel(parent, r as any, "anthropic/nope")).toBe(parent);
-  });
-
-  it("falls back to the parent for a model string with no provider prefix", () => {
-    const r = registry([haiku]);
-    expect(resolveDefaultModel(parent, r, "haiku")).toBe(parent);
-    expect(r.find).not.toHaveBeenCalled();
-  });
-
-  it("returns the parent model when no model is configured", () => {
-    expect(resolveDefaultModel(parent, registry([haiku]), undefined)).toBe(parent);
-  });
-
-  it("returns undefined when neither a config model nor a parent model exists", () => {
-    expect(resolveDefaultModel(undefined, registry([haiku]), undefined)).toBeUndefined();
   });
 });

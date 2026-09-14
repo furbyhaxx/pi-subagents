@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **⚠️ Breaking — agent-file model selection is now canonical and explicit call models win.** Existing fuzzy `model:` pins must be changed to exact `provider/modelId` values; a caller-supplied `model` now replaces configured frontmatter rather than being ignored.
+
+### Added
+- **Ordered model fallback within one agent session.** Agent frontmatter accepts `models: [provider/model[:thinking], …]`, with scalar `model` as a one-item alias; Pi exhausts its built-in retry budget before the extension advances without replaying the prompt or completed tools. `maxRetries` (default `3`) and `maxModelWraparounds` (default `0`) are configurable in `subagents.json` and `/agents`, explicit model overrides also work for resumes, and automatic switching fails closed outside the verified Pi `0.84.2` retry internals.
+
 ### Fixed
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 

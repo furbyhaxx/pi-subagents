@@ -22,9 +22,9 @@ import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { getAgentConfig, resolveSpawnType } from "./agent-types.js";
 import { resolveBranch } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolveModelCandidate } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
-import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import type { IsolationMode, ModelThinkingLevel, ScheduledSubagent, SubagentType } from "./types.js";
 import { isWorktreeIsolationEnabled } from "./worktree.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
@@ -43,7 +43,7 @@ export interface NewJobInput {
   subagent_type: SubagentType;
   prompt: string;
   model?: string;
-  thinking?: ThinkingLevel;
+  thinking?: ModelThinkingLevel;
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
@@ -244,12 +244,12 @@ export class SubagentScheduler {
     store.update(id, { lastStatus: "running" });
 
     // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
+    // job was created. Keep the raw input too: an unavailable explicit override
+    // fails at execution rather than silently activating the agent definition.
     let resolvedModel: any | undefined;
     if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
+      const resolved = resolveModelCandidate(job.model, ctx.modelRegistry);
+      if (typeof resolved !== "string") resolvedModel = resolved.model;
     }
 
     let agentId: string;
@@ -268,6 +268,8 @@ export class SubagentScheduler {
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,
+        modelInputs: job.model ? [job.model] : undefined,
+        modelFromParams: job.model !== undefined,
         maxTurns: job.max_turns,
         isolated: job.isolated,
         thinkingLevel: job.thinking,

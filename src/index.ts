@@ -20,7 +20,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getMaxModelWraparounds, getMaxRetries, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setMaxModelWraparounds, setMaxRetries, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -29,10 +29,11 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, parseCanonicalModelId, type ResolvedModelCandidate, resolveCanonicalModel, resolveModel, resolveModelCandidates } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, getSessionArtifactDirectory, getWorktreeDirectory, sessionArtifactRoot, sessionTaskDir, setOutputTranscriptDefault, setSessionArtifactDirectory, setWorktreeDirectory, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import type { RetryModelCandidate } from "./pi-retry-adapter.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -1357,7 +1358,12 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: {
+      outputTranscript: boolean;
+      maxTurns?: number;
+      toolCallId?: string;
+      modelCandidates?: RetryModelCandidate[];
+    },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1392,6 +1398,7 @@ export default function (pi: ExtensionAPI) {
       isBackground: true,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
+      modelCandidates: opts.modelCandidates,
       // Fires when the run actually starts — immediately, or on queue
       // drain. Wiring it here (rather than after resume() returns) means a
       // resume stopped while still queued never started streaming, so
@@ -1451,7 +1458,9 @@ export default function (pi: ExtensionAPI) {
 
     return available.map((name) => {
       const cfg = getAgentConfig(name);
-      const modelSuffix = cfg?.model ? ` (${getModelLabelFromConfig(cfg.model)})` : "";
+      const modelSuffix = cfg?.models?.length
+        ? ` (${cfg.models.map(getModelLabelFromConfig).join(" → ")})`
+        : "";
       const toolsSuffix = ` (Tools: ${formatToolsSuffix(cfg)})`;
       return `- ${name}: ${cfg?.description ?? name}${modelSuffix}${toolsSuffix}`;
     }).join("\n");
@@ -1467,7 +1476,10 @@ export default function (pi: ExtensionAPI) {
   const buildCompactTypeListText = () =>
     getAvailableTypes().map((name) => {
       const cfg = getAgentConfig(name);
-      return `- ${name}: ${firstSentence(cfg?.description ?? name)} (Tools: ${formatToolsSuffix(cfg)})`;
+      const modelSuffix = cfg?.models?.length
+        ? ` (Models: ${cfg.models.map(getModelLabelFromConfig).join(" → ")})`
+        : "";
+      return `- ${name}: ${firstSentence(cfg?.description ?? name)}${modelSuffix} (Tools: ${formatToolsSuffix(cfg)})`;
     }).join("\n");
 
   /** Derive a short model label from a model string. */
@@ -1488,6 +1500,8 @@ export default function (pi: ExtensionAPI) {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
       setDefaultMaxTurns,
+      setMaxRetries,
+      setMaxModelWraparounds,
       setGraceTurns,
       setDefaultJoinMode,
       setBackgroundByDefault,
@@ -1595,7 +1609,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
+- Omit model to use the agent's configured fallback list. For an agent with configured models, override it only to recover or resume when that selection is unavailable; an explicit "provider/modelId[:thinking]" or fuzzy name replaces the list.
 - Use thinking to control extended thinking level.
 - Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
@@ -1693,7 +1707,7 @@ Terse command-style prompts produce shallow, generic work.
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional model override. Accepts "provider/modelId[:thinking]" or a fuzzy name. An explicit value replaces the agent type\'s configured fallback list. For an agent with configured models, use this only to recover or resume it when that selection is unavailable; otherwise omit it.',
         }),
       ),
       thinking: Type.Optional(
@@ -1890,43 +1904,51 @@ Terse command-style prompts produce shallow, generic work.
         ? `Note: Unknown agent type "${dispatch.fellBackFrom}" — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
         : "";
 
-      const displayName = getDisplayName(subagentType);
+      const resumeTarget = params.resume ? manager.getRecord(params.resume) : undefined;
+      const effectiveType = resumeTarget?.type ?? subagentType;
+      const displayName = getDisplayName(effectiveType);
 
-      // Get agent config (if any)
-      const customConfig = getAgentConfig(subagentType);
+      // A resume keeps the stored agent type even though subagent_type remains a
+      // required schema field.
+      const customConfig = getAgentConfig(effectiveType);
 
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params, {
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: getBackgroundByDefault(),
       });
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
       let model = ctx.model;
-      if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
-        } else {
-          model = resolved;
+      let resolvedCandidates: ResolvedModelCandidate[] = [];
+      if (resolvedConfig.modelInputs?.length) {
+        const resolution = resolveModelCandidates(
+          resolvedConfig.modelInputs,
+          ctx.modelRegistry,
+          resolvedConfig.modelFromParams,
+        );
+        resolvedCandidates = resolution.candidates;
+        if (resolvedCandidates.length === 0) {
+          const heading = resolvedConfig.modelFromParams ? "" : "No configured model is available.\n";
+          return textResult(`${heading}${resolution.errors.join("\n")}`);
         }
+        model = resolvedCandidates[0].model;
       }
 
-      // Scope validation: the effective resolved model is checked against the
-      // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
-      // in model-scope.ts so the nested delegation tools apply the same rule.
-      const scopeVerdict = checkModelScope({
-        model,
-        cwd: ctx.cwd,
-        modelRegistry: ctx.modelRegistry,
-        callerSupplied: resolvedConfig.modelFromParams,
-        agentLabel: customConfig?.displayName ?? subagentType,
-        modelInput: resolvedConfig.modelInput,
-      });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
-      if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
+      const scopeCandidates = resolvedCandidates.length > 0
+        ? resolvedCandidates
+        : model ? [{ input: `${model.provider}/${model.id}`, model }] : [];
+      for (const candidate of scopeCandidates) {
+        const scopeVerdict = checkModelScope({
+          model: candidate.model,
+          cwd: ctx.cwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: resolvedConfig.modelFromParams,
+          agentLabel: customConfig?.displayName ?? subagentType,
+          modelInput: candidate.input,
+        });
+        if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
+      }
 
-      const thinking = resolvedConfig.thinking;
+      const thinking = resolvedCandidates[0]?.thinking ?? resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
@@ -1964,6 +1986,7 @@ Terse command-style prompts produce shallow, generic work.
       const agentInvocation: AgentInvocation = {
         modelName,
         modelId,
+        modelCandidates: resolvedConfig.modelInputs,
         thinking,
         // Only set where the agent file outranked the caller, so the surfaces can
         // disclose a parameter that was accepted but could not take effect (#182).
@@ -2071,13 +2094,21 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
-        const existing = manager.getRecord(params.resume);
+        const existing = resumeTarget;
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+
+        const resumeModelCandidates = resolvedConfig.modelFromParams
+          ? resolvedCandidates.map(candidate => ({
+              input: candidate.input,
+              model: candidate.model,
+              thinking: candidate.thinking ?? thinking,
+            }))
+          : undefined;
 
         // Background resume: detached run that notifies on completion, mirroring
         // a background spawn. Previously run_in_background was silently ignored
@@ -2101,6 +2132,7 @@ Terse command-style prompts produce shallow, generic work.
             outputTranscript,
             maxTurns: effectiveMaxTurns,
             toolCallId,
+            modelCandidates: resumeModelCandidates,
           });
           if (!record) {
             return textResult(`Failed to resume agent "${params.resume}".`);
@@ -2119,7 +2151,9 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          modelCandidates: resumeModelCandidates,
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2157,7 +2191,9 @@ Terse command-style prompts produce shallow, generic work.
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
           name: params.name as string | undefined,
-          model,
+          model: resolvedConfig.modelInputs ? model : undefined,
+          modelInputs: resolvedConfig.modelInputs,
+          modelFromParams: resolvedConfig.modelFromParams,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2314,7 +2350,9 @@ Terse command-style prompts produce shallow, generic work.
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
           description: params.description,
           name: params.name as string | undefined,
-          model,
+          model: resolvedConfig.modelInputs ? model : undefined,
+          modelInputs: resolvedConfig.modelInputs,
+          modelFromParams: resolvedConfig.modelFromParams,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2988,20 +3026,14 @@ Terse command-style prompts produce shallow, generic work.
 
   function getModelLabel(type: string, registry?: ModelRegistry): string {
     const cfg = getAgentConfig(type);
-    if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
-    const label = getModelLabelFromConfig(cfg.model);
-    if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
-    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
-    // Surface what it actually resolved to when that differs from the config —
-    // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
-    // differences are normalized away so an effectively-identical match stays quiet.
-    const resolvedFull = `${resolved.provider}/${resolved.id}`;
-    const norm = (s: string) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
-    if (norm(cfg.model) === norm(resolvedFull)) return label;
-    return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
+    if (!cfg?.models?.length) return "inherit";
+    return cfg.models.map((input) => {
+      const label = getModelLabelFromConfig(input);
+      if (!registry) return label;
+      return typeof resolveCanonicalModel(input, registry) === "string"
+        ? `${label} (unavailable)`
+        : label;
+    }).join(" → ");
   }
 
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
@@ -3397,7 +3429,7 @@ The file format is a markdown file with YAML frontmatter and a system prompt bod
 description: <one-line description shown in UI>
 color: <optional agent name badge color: red, blue, green, yellow, purple, orange, pink, cyan, an Agency Agents alias, or quoted "#RRGGBB">
 tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
+models: <optional ordered YAML list of canonical "provider/model[:thinking]" candidates. Omit to inherit parent model>
 thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
 max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
 prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
@@ -3501,7 +3533,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
     else if (modelChoice === "sonnet") model = "anthropic/claude-sonnet-4-6";
     else if (modelChoice === "opus") model = "anthropic/claude-opus-4-6";
     else if (modelChoice === "custom...") {
-      model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
+      model = (await ctx.ui.input("Model (provider/modelId[:thinking])")) || undefined;
+      if (model) {
+        try {
+          parseCanonicalModelId(model);
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+          return;
+        }
+      }
     }
 
     // 5. Thinking
@@ -3552,6 +3592,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
+      maxRetries: getMaxRetries(),
+      maxModelWraparounds: getMaxModelWraparounds(),
       graceTurns: getGraceTurns(),
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
@@ -3601,7 +3643,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set([
-    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
+    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "maxRetries", "maxModelWraparounds", "graceTurns", "maxSubagentDepth",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3622,6 +3664,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       const mc = manager.getMaxConcurrent();
       const mcf = manager.getMaxConcurrentForeground();
       const dmt = getDefaultMaxTurns() ?? 0;
+      const retries = getMaxRetries();
+      const wraps = getMaxModelWraparounds();
       const gt = getGraceTurns();
       const msd = getMaxSubagentDepth();
       // Label what unset actually does — it targets general-purpose even when
@@ -3653,6 +3697,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Default max turns before wrap-up (0 = unlimited, Enter to type)",
           currentValue: String(dmt),
           values: [String(dmt)],
+        },
+        {
+          id: "maxRetries",
+          label: "Model retries",
+          description: "Pi retries after the initial request for each model (0 = none, Enter to type)",
+          currentValue: String(retries),
+          values: [String(retries)],
+        },
+        {
+          id: "maxModelWraparounds",
+          label: "Model wraparounds",
+          description: "Additional complete passes through an agent model list (0 = none, Enter to type)",
+          currentValue: String(wraps),
+          values: [String(wraps)],
         },
         {
           id: "graceTurns",
@@ -3849,6 +3907,18 @@ Write the file using the write tool. Only write the file, nothing else.`;
         } else if (n >= 1) {
           setDefaultMaxTurns(n);
           notifyApplied(ctx, `Default max turns set to ${n}`);
+        }
+      } else if (id === "maxRetries") {
+        const n = parseInt(value, 10);
+        if (n >= 0 && n <= 100) {
+          setMaxRetries(n);
+          notifyApplied(ctx, `Model retries set to ${n}`);
+        }
+      } else if (id === "maxModelWraparounds") {
+        const n = parseInt(value, 10);
+        if (n >= 0 && n <= 100) {
+          setMaxModelWraparounds(n);
+          notifyApplied(ctx, `Model wraparounds set to ${n}`);
         }
       } else if (id === "graceTurns") {
         const n = parseInt(value, 10);
@@ -4071,7 +4141,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ? String(manager.getMaxConcurrentForeground())
           : result === "defaultMaxTurns"
             ? String(getDefaultMaxTurns() ?? 0)
-            : result === "maxSubagentDepth"
+            : result === "maxRetries"
+              ? String(getMaxRetries())
+              : result === "maxModelWraparounds"
+                ? String(getMaxModelWraparounds())
+                : result === "maxSubagentDepth"
               ? String(getMaxSubagentDepth())
               : String(getGraceTurns());
 
@@ -4081,7 +4155,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ? "Max foreground concurrency (0 = unlimited)"
           : result === "defaultMaxTurns"
             ? "Default max turns (0 = unlimited)"
-            : result === "maxSubagentDepth"
+            : result === "maxRetries"
+              ? "Model retries (0–100)"
+              : result === "maxModelWraparounds"
+                ? "Model wraparounds (0–100)"
+                : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
               : "Grace turns (1+)";
 

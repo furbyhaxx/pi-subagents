@@ -235,12 +235,14 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 
 **Returns `null` if the agent failed terminally *or* if you skipped it from the inspector**, indistinguishably. Filter with `.filter(Boolean)` when a `null` would break a later stage, and be careful with in-script retry loops: retrying on `null` will re-run something you deliberately skipped.
 
+An agent definition may provide ordered `models` fallback candidates. Pi exhausts its configured same-model retries before the session advances; workflow progress updates to the model actually active. The extension never respawns the child or replays its prompt. See the README's Model fallback and `maxRetries` / `maxModelWraparounds` settings.
+
 | Option | Type | Notes |
 |---|---|---|
 | `label` | string | Display name in the progress tree. Also the handle `resume` addresses |
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
-| `model` | string | `provider/modelId`, or fuzzy like `haiku` |
+| `model` | string | `provider/modelId[:thinking]`, or fuzzy like `haiku`. Replaces the agent definition's fallback list; omit normally, and use on resume only when recovering from an unavailable configured selection |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Without `branch`, a disposable detached copy; changes are preserved on a reported `pi-agent-*` branch before removal |
 | `branch` | string | Exact local branch, e.g. `feat/x`. Implies worktree isolation; creates or reuses a retained linked worktree. No automatic commit or removal |
@@ -250,7 +252,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `branch`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+Combination rules: `resume` may be combined with `model` to continue the same conversation on a replacement model. It cannot be combined with `agentType`, `effort`, `isolation`, `branch`, `gate` or `schema` — the child keeps its agent type and tree, and its session predates the `StructuredOutput` tool.
 
 ### Retained branch workspaces
 

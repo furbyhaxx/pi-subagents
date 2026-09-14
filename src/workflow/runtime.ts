@@ -195,8 +195,8 @@ export interface WorkflowHost {
    * Continue a child that already ran in this run, keeping its context.
    *
    * `agentId` is one previously handed out in a {@link WorkflowSpawnRequest};
-   * the child keeps the agent type, model and tool contract it started with, so
-   * only the follow-up prompt crosses.
+   * the child keeps its agent type and tool contract. An optional model replaces
+   * its configured model selection for recovery.
    *
    * Optional: a host without it rejects `resume` rather than quietly starting a
    * fresh child that has none of the context the script is counting on.
@@ -211,6 +211,7 @@ export interface WorkflowHost {
      * the row above it shows the one that ran.
      */
     onResolved?: WorkflowSpawnRequest["onResolved"],
+    model?: string,
   ): Promise<WorkflowSpawnResult>;
   /**
    * Run a `gate` command and report whether it passed.
@@ -474,9 +475,9 @@ function derivedLabel(prompt: string): string {
 /**
  * A child `resume` can revive, remembered under its label.
  *
- * The spawn options travel with it because `resume` deliberately takes none: the
- * revived child keeps the agent type, model and isolation it was started with,
- * and the progress entry has to show the same thing the first entry showed.
+ * The spawn options travel with it because a resume keeps the agent type and
+ * isolation it started with. Model also stays unless the resume carries the
+ * explicit recovery override, and progress must show whichever is effective.
  */
 interface CompletedChild {
   agentId: string;
@@ -859,7 +860,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       const agentId = resumed?.agentId ?? `wf-agent-${index}`;
       const label = payload.label ?? resumed?.label ?? derivedLabel(payload.prompt);
       const agentType = resumed?.agentType ?? payload.agentType ?? "general-purpose";
-      const model = resumed !== undefined ? resumed.model : payload.model;
+      const model = payload.model ?? resumed?.model;
       const isolation = resumed !== undefined ? resumed.isolation : payload.isolation;
       const branch = resumed !== undefined ? resumed.branch : payload.branch;
       openLaunches.set(callId, label);
@@ -1025,7 +1026,9 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           try {
             result =
               resumed !== undefined && resumeAgent !== undefined
-                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved)
+                ? payload.model !== undefined
+                  ? await resumeAgent(resumed.agentId, payload.prompt, onResolved, payload.model)
+                  : await resumeAgent(resumed.agentId, payload.prompt, onResolved)
                 : await host.spawnAgent({
                     agentId,
                     index,

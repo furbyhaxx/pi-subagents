@@ -211,7 +211,7 @@ export interface NewAgentInput {
  * `tools` is a CSV that must stay a bare scalar for the loader's parser.
  */
 export function buildNewAgentFile(input: NewAgentInput): string {
-  const modelLine = input.model ? `\nmodel: ${JSON.stringify(input.model)}` : "";
+  const modelLine = input.model ? `\nmodels:\n  - ${JSON.stringify(input.model)}` : "";
   const thinkingLine = input.thinking ? `\nthinking: ${input.thinking}` : "";
   return `---
 description: ${JSON.stringify(input.description)}
@@ -240,7 +240,9 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   // `all` for both would hand a deliberately tool-less agent the whole toolbox
   // the first time it is ejected.
   fmFields.push(`tools: ${formatToolsField(cfg.builtinToolNames)}`);
-  if (cfg.model) fmFields.push(`model: ${cfg.model}`);
+  if (cfg.models?.length) {
+    fmFields.push(`models:\n${cfg.models.map(model => `  - ${JSON.stringify(model)}`).join("\n")}`);
+  }
   if (cfg.thinking) fmFields.push(`thinking: ${cfg.thinking}`);
   if (cfg.maxTurns) fmFields.push(`max_turns: ${cfg.maxTurns}`);
   if (cfg.allowedSubagents !== undefined) {

@@ -232,7 +232,7 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.tags).toContain("thinking: low (asked max)");
   });
 
-  it("discloses a model an agent file pinned over the caller's (#182)", async () => {
+  it("lets an explicit caller model replace an agent file selection", async () => {
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
@@ -251,7 +251,7 @@ describe("Agent tool result — effective model", () => {
       ctx(),
     );
 
-    expect(result.details.modelName).toBe("haiku 4.5 (asked anthropic/claude-opus-4-6)");
+    expect(result.details.modelName).toBe("opus 4.6");
   });
 
   it("stays quiet when the caller's spelling names the model that won", async () => {
@@ -273,7 +273,7 @@ describe("Agent tool result — effective model", () => {
     expect(result.details.modelName).toBe("haiku 4.5");
   });
 
-  it("discloses a spelling that names no available model at all", async () => {
+  it("rejects an explicit spelling that names no available model", async () => {
     pinnedAgent("model: anthropic/claude-haiku-4-5\n");
     const tool = agentTool();
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
@@ -286,7 +286,7 @@ describe("Agent tool result — effective model", () => {
       ctx(),
     );
 
-    expect(result.details.modelName).toBe("haiku 4.5 (asked gpt-9)");
+    expect(result.content[0].text).toContain("Model not found");
   });
 
   it("says nothing about a request that was honored", async () => {
@@ -311,16 +311,21 @@ describe("Agent tool result — effective model", () => {
 });
 
 describe("Agent tool result — resume", () => {
-  it("renders the reopened session's settings, not the resume call's", async () => {
-    // resumeAgent only prompts the existing session: model and thinking on a
-    // resume call cannot take effect, so rendering them advertises a
-    // configuration the run never had.
+  it("renders an explicit model override applied to the resumed session", async () => {
     const s = session("anthropic", "claude-haiku-4-5", "low");
     vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
       options.onSessionCreated?.(s);
       return { responseText: "first", session: s, aborted: false, steered: false } as never;
     });
-    vi.mocked(resumeAgent).mockResolvedValue({ text: "second" } as never);
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, options) => {
+      options.onModelTransition?.({
+        candidate: { input: "anthropic/claude-opus-4-6", model: MODELS[0] as never, thinking: "max" },
+        previous: MODELS[1] as never,
+        thinking: "max",
+        reason: "override",
+      });
+      return { text: "second" } as never;
+    });
     const tool = agentTool();
     const context = ctx();
 
@@ -348,8 +353,9 @@ describe("Agent tool result — resume", () => {
       context,
     );
 
-    expect(resumed.details.modelName).toBe("haiku 4.5");
-    expect(resumed.details.tags).toContain("thinking: low");
-    expect(render(tool, resumed)).not.toContain("opus 4.6");
+    expect(vi.mocked(resumeAgent).mock.lastCall?.[2]?.modelCandidates?.[0]?.input)
+      .toBe("anthropic/claude-opus-4-6");
+    expect(resumed.details.modelName).toBe("opus 4.6");
+    expect(resumed.details.tags).toContain("thinking: max");
   });
 });

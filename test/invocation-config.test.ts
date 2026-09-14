@@ -19,10 +19,10 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 
 describe("resolveAgentInvocationConfig", () => {
-  it("prefers agent config over tool-call params for locked fields", () => {
+  it("lets an explicit model replace config while other locked fields stay authoritative", () => {
     const resolved = resolveAgentInvocationConfig(
       makeConfig({
-        model: "provider/config-model",
+        models: ["provider/config-model"],
         thinking: "high",
         maxTurns: 42,
         inheritContext: false,
@@ -41,8 +41,9 @@ describe("resolveAgentInvocationConfig", () => {
       },
     );
 
-    expect(resolved.modelInput).toBe("provider/config-model");
-    expect(resolved.modelFromParams).toBe(false);
+    expect(resolved.modelInput).toBe("provider/param-model");
+    expect(resolved.modelInputs).toEqual(["provider/param-model"]);
+    expect(resolved.modelFromParams).toBe(true);
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
@@ -162,13 +163,13 @@ describe("resolveJoinMode", () => {
 });
 
 describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
-  it("records the caller's values when the agent file outranks them", () => {
+  it("records only the caller thinking when the agent file outranks it", () => {
     const resolved = resolveAgentInvocationConfig(
-      makeConfig({ model: "provider/config-model", thinking: "low" }),
+      makeConfig({ models: ["provider/config-model"], thinking: "low" }),
       { model: "provider/param-model", thinking: "max" },
     );
 
-    expect(resolved.overridden).toEqual({ thinking: "max", model: "provider/param-model" });
+    expect(resolved.overridden).toEqual({ thinking: "max" });
   });
 
   it("records nothing when the caller got what they asked for", () => {
@@ -184,7 +185,7 @@ describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
     // Config-only is the agent's own default, not an override; param-only won
     // outright. Neither is a request that went unhonored.
     expect(resolveAgentInvocationConfig(
-      makeConfig({ model: "provider/config-model", thinking: "low" }),
+      makeConfig({ models: ["provider/config-model"], thinking: "low" }),
       {},
     ).overridden).toBeUndefined();
 

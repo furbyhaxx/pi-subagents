@@ -30,6 +30,7 @@ interface GateCall {
 interface ResumeCall {
   agentId: string;
   prompt: string;
+  model?: string;
 }
 
 interface Stub {
@@ -71,10 +72,11 @@ function stubHost(options?: {
         gateCalls.push({ command, agentId: gateOptions.agentId, cwd: gateOptions.cwd });
         return options?.gate ? await options.gate(command) : { ok: true, output: "" };
       },
-      async resumeAgent(agentId, prompt) {
-        resumeCalls.push({ agentId, prompt });
+      async resumeAgent(agentId, prompt, _onResolved, model) {
+        const call = { agentId, prompt, ...(model !== undefined ? { model } : {}) };
+        resumeCalls.push(call);
         return options?.resume
-          ? await options.resume({ agentId, prompt })
+          ? await options.resume(call)
           : { ok: true, text: `resumed:${prompt}` };
       },
     },
@@ -412,11 +414,6 @@ describe("resume", () => {
         "agent() opts.resume and opts.agentType are mutually exclusive",
       ],
       [
-        "model",
-        'await agent("b", { resume: "impl", model: "haiku" });',
-        "agent() opts.resume and opts.model are mutually exclusive",
-      ],
-      [
         "isolation",
         'await agent("b", { resume: "impl", isolation: "worktree" });',
         "agent() opts.resume and opts.isolation are mutually exclusive",
@@ -437,6 +434,18 @@ describe("resume", () => {
         expect(resumeCalls).toEqual([]);
       });
     }
+
+    it("passes an explicit recovery model to the resumed child", async () => {
+      const { host, resumeCalls } = stubHost();
+      const result = await run([
+        'await agent("a", { label: "impl" });',
+        'await agent("b", { resume: "impl", model: "haiku" });',
+        "return null;",
+      ].join("\n"), { host });
+
+      expect(result.status).toBe("completed");
+      expect(resumeCalls).toEqual([{ agentId: "wf-agent-0", prompt: "b", model: "haiku" }]);
+    });
 
     it("rejects an empty resume label", async () => {
       const { host } = stubHost();

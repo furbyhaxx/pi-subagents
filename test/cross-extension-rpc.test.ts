@@ -385,7 +385,7 @@ describe("cross-extension RPC", () => {
       expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
+        { model: fakeModel, modelInputs: ["openai-codex/gpt-5.5"], modelFromParams: true },
       );
     });
 
@@ -401,7 +401,7 @@ describe("cross-extension RPC", () => {
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
+        { model: fakeModel, modelInputs: ["openai-codex/gpt-5.5"], modelFromParams: true },
       );
     });
 
@@ -437,6 +437,33 @@ describe("cross-extension RPC", () => {
       expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x", { model: null },
+      );
+    });
+
+    it("strips extension-private fallback and retry fields from callers", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-private", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-private",
+        type: "general-purpose",
+        prompt: "x",
+        options: {
+          description: "allowed",
+          modelInputs: ["openai-codex/gpt-5.5"],
+          modelFromParams: false,
+          maxRetries: 100,
+          maxModelWraparounds: 100,
+        },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(manager.spawn).toHaveBeenCalledWith(
+        deps.pi,
+        ctx,
+        "general-purpose",
+        "x",
+        { description: "allowed" },
       );
     });
 
@@ -538,7 +565,11 @@ describe("cross-extension RPC", () => {
       const call = await spawn("req-sc3", "openai-codex/gpt-5.5");
       expect(call).toEqual({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x", { model: ALLOWED },
+        deps.pi, ctx, "general-purpose", "x", {
+          model: ALLOWED,
+          modelInputs: ["openai-codex/gpt-5.5"],
+          modelFromParams: true,
+        },
       );
     });
 
@@ -547,7 +578,11 @@ describe("cross-extension RPC", () => {
       const call = await spawn("req-sc4", "sonnet");
       expect(call).toEqual({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x", { model: BLOCKED },
+        deps.pi, ctx, "general-purpose", "x", {
+          model: BLOCKED,
+          modelInputs: ["sonnet"],
+          modelFromParams: true,
+        },
       );
     });
   });
