@@ -15,15 +15,16 @@
  * Recursion skips dotfile entries and node_modules. A directory that itself contains
  * SKILL.md is a skill — we don't descend into it (Pi: skills don't nest).
  *
- * Symlinks are rejected for security (deviation from Pi, which follows them).
+ * Symlinked roots, files, and directories are followed like Pi. Traversal tracks
+ * canonical directories so a symlink cycle cannot loop forever.
  */
 
 import type { Dirent } from "node:fs";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { isSymlink, isUnsafeName, safeReadFile } from "./memory.js";
+import { isUnsafeName } from "./memory.js";
 
 export interface PreloadedSkill {
   name: string;
@@ -52,9 +53,17 @@ function loadSkillContent(name: string, cwd: string): string {
   return `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)`;
 }
 
+function readSkillFile(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    return readFileSync(path, "utf-8").trim();
+  } catch {
+    return undefined;
+  }
+}
+
 function findInRoot(root: string, name: string): string | undefined {
-  if (isSymlink(root)) return undefined; // reject symlinked roots entirely
-  const flat = safeReadFile(join(root, `${name}.md`))?.trim();
+  const flat = readSkillFile(join(root, `${name}.md`));
   if (flat !== undefined) return flat;
   return findSkillDirectory(root, name);
 }
@@ -63,10 +72,18 @@ function findInRoot(root: string, name: string): string | undefined {
 function findSkillDirectory(root: string, name: string): string | undefined {
   if (!existsSync(root)) return undefined;
   const queue: string[] = [root];
+  const visited = new Set<string>();
 
   while (queue.length > 0) {
     const current = queue.shift();
     if (current === undefined) continue;
+    try {
+      const canonical = realpathSync(current);
+      if (visited.has(canonical)) continue;
+      visited.add(canonical);
+    } catch {
+      continue;
+    }
 
     let entries: Dirent<string>[];
     try {
@@ -79,17 +96,25 @@ function findSkillDirectory(root: string, name: string): string | undefined {
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
       if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
 
-      // Symlinked dirs already filtered by entry.isDirectory() — Dirent uses lstat semantics.
       const path = join(current, entry.name);
+      let isDirectory = entry.isDirectory();
+      if (entry.isSymbolicLink()) {
+        try {
+          isDirectory = statSync(path).isDirectory();
+        } catch {
+          continue;
+        }
+      }
+      if (!isDirectory) continue;
+
       const skillMd = join(path, "SKILL.md");
       const isSkillDir = existsSync(skillMd);
 
       if (isSkillDir) {
         if (entry.name === name) {
-          const content = safeReadFile(skillMd)?.trim();
+          const content = readSkillFile(skillMd);
           if (content !== undefined) return content;
         }
         continue; // Pi rule: skills don't nest — don't descend into a skill dir

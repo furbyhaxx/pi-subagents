@@ -963,7 +963,7 @@ skills: api-conventions, error-handling
 
 Recursion skips dotfile directories and `node_modules`. A directory that itself contains a `SKILL.md` is treated as a single skill — we don't descend into it. Traversal is byte-order sorted for deterministic resolution across filesystems.
 
-**Security:** symlinks are rejected at every layer (root, flat file, skill directory, `SKILL.md` inside a skill directory) — intentional deviation from Pi, which follows symlinks. Skill names with path-traversal characters (`..`, `/`, `\`, spaces, leading dot, >128 chars) are rejected.
+**Path handling:** skill roots, flat files, skill directories, and `SKILL.md` files follow symlinks, matching Pi; canonical-directory tracking prevents traversal loops. Skill names with path-traversal characters (`..`, `/`, `\`, spaces, leading dot, >128 chars) remain rejected.
 
 ## Tool Denylist
 

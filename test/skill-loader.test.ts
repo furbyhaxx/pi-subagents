@@ -184,54 +184,45 @@ describe("preloadSkills", () => {
     expect(result[1].content).toBe("Good content");
   });
 
-  it("rejects symlinked flat .md files", () => {
+  it("follows symlinked flat .md skills like Pi", () => {
     mkdirSync(projectRoot(), { recursive: true });
-    const secret = join(tmpDir, "secret.md");
-    writeFileSync(secret, "TOP SECRET");
-    symlinkSync(secret, join(projectRoot(), "evil.md"));
-    const result = preloadSkills(["evil"], tmpDir);
-    expect(result[0].content).toContain("not found");
-    expect(result[0].content).not.toContain("TOP SECRET");
+    const target = join(tmpDir, "shared.md");
+    writeFileSync(target, "SHARED FLAT SKILL");
+    symlinkSync(target, join(projectRoot(), "linked.md"));
+
+    expect(preloadSkills(["linked"], tmpDir)[0].content).toBe("SHARED FLAT SKILL");
   });
 
-  it("rejects symlinked skill directories", () => {
+  it("follows symlinked skill directories like Pi", () => {
     mkdirSync(projectRoot(), { recursive: true });
     const realDir = join(tmpDir, "real-skill");
     mkdirSync(realDir, { recursive: true });
-    writeFileSync(join(realDir, "SKILL.md"), "TOP SECRET");
-    symlinkSync(realDir, join(projectRoot(), "evil-dir"));
-    const result = preloadSkills(["evil-dir"], tmpDir);
-    expect(result[0].content).toContain("not found");
-    expect(result[0].content).not.toContain("TOP SECRET");
+    writeFileSync(join(realDir, "SKILL.md"), "SHARED DIRECTORY SKILL");
+    symlinkSync(realDir, join(projectRoot(), "linked-dir"));
+
+    expect(preloadSkills(["linked-dir"], tmpDir)[0].content).toBe("SHARED DIRECTORY SKILL");
   });
 
-  it("rejects symlinked skill root", () => {
-    // <cwd>/.pi/skills → symlink to a directory that holds real-looking skills.
+  it("follows a symlinked skill root like Pi", () => {
     const realRoot = join(tmpDir, "elsewhere");
     mkdirSync(realRoot, { recursive: true });
-    writeFileSync(join(realRoot, "leaked-flat.md"), "TOP SECRET FLAT");
-    mkdirSync(join(realRoot, "leaked-dir"), { recursive: true });
-    writeFileSync(join(realRoot, "leaked-dir", "SKILL.md"), "TOP SECRET DIR");
+    writeFileSync(join(realRoot, "linked-flat.md"), "ROOT FLAT SKILL");
+    mkdirSync(join(realRoot, "linked-dir"), { recursive: true });
+    writeFileSync(join(realRoot, "linked-dir", "SKILL.md"), "ROOT DIRECTORY SKILL");
     mkdirSync(join(tmpDir, ".pi"), { recursive: true });
     symlinkSync(realRoot, projectRoot());
 
-    const flatResult = preloadSkills(["leaked-flat"], tmpDir)[0].content;
-    expect(flatResult).toContain("not found");
-    expect(flatResult).not.toContain("TOP SECRET");
-
-    const dirResult = preloadSkills(["leaked-dir"], tmpDir)[0].content;
-    expect(dirResult).toContain("not found");
-    expect(dirResult).not.toContain("TOP SECRET");
+    expect(preloadSkills(["linked-flat"], tmpDir)[0].content).toBe("ROOT FLAT SKILL");
+    expect(preloadSkills(["linked-dir"], tmpDir)[0].content).toBe("ROOT DIRECTORY SKILL");
   });
 
-  it("rejects symlinked SKILL.md inside a real skill directory", () => {
-    const skillDir = join(projectRoot(), "evil-inner");
+  it("follows a symlinked SKILL.md inside a real skill directory like Pi", () => {
+    const skillDir = join(projectRoot(), "linked-inner");
     mkdirSync(skillDir, { recursive: true });
-    const secret = join(tmpDir, "secret.md");
-    writeFileSync(secret, "TOP SECRET");
-    symlinkSync(secret, join(skillDir, "SKILL.md"));
-    const result = preloadSkills(["evil-inner"], tmpDir);
-    expect(result[0].content).toContain("not found");
-    expect(result[0].content).not.toContain("TOP SECRET");
+    const target = join(tmpDir, "shared-skill.md");
+    writeFileSync(target, "SHARED INNER SKILL");
+    symlinkSync(target, join(skillDir, "SKILL.md"));
+
+    expect(preloadSkills(["linked-inner"], tmpDir)[0].content).toBe("SHARED INNER SKILL");
   });
 });
