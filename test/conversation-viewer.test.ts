@@ -56,9 +56,12 @@ function mockTui(rows = 40, columns = 80) {
 }
 
 function mockSession(messages: any[] = []) {
+  let listener: ((event: any) => void) | undefined;
   return {
     messages,
-    subscribe: vi.fn(() => vi.fn()),
+    subscribe: vi.fn((next: (event: any) => void) => { listener = next; return () => { listener = undefined; }; }),
+    emit: (event: any) => listener?.(event),
+    sessionManager: { getBranch: () => [] },
     dispose: vi.fn(),
     getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 } }),
   } as any;
@@ -375,6 +378,11 @@ describe("ConversationViewer", () => {
     /** ANSI stripped, so an assertion is about the text and not the styling. */
     const strip = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
+    /**
+     * A viewer on the raw view: Markdown, the result cap and the wrap fallback
+     * are all properties of the verbatim dump, which is what `raw` renders.
+     * The steps view has its own block below.
+     */
     function viewerFor(
       messages: any[],
       mode?: "off" | "assistant" | "all",
@@ -385,7 +393,7 @@ describe("ConversationViewer", () => {
       return new ConversationViewer(
         mockTui(rows, 80), mockSession(messages), mockRecord({ status: "completed" }), undefined,
         ansiTheme(), vi.fn(), undefined, undefined, undefined, false,
-        mode ? () => mode : undefined, onMode,
+        mode ? () => mode : undefined, onMode, () => "raw",
       );
     }
 
@@ -441,21 +449,23 @@ describe("ConversationViewer", () => {
       expect(out).not.toContain("4. beta");
     });
 
-    it("`m` cycles the mode, persists it, and shows it in the footer", () => {
+    it("`m` cycles and persists the mode while Help documents it", () => {
       const onMode = vi.fn();
       const viewer = viewerFor(assistant("# Heading"), "assistant", onMode);
 
-      expect(strip(viewer.render(80).join("\n"))).toContain("m md");
+      viewer.handleInput("?");
+      const help = strip(viewer.render(80).join("\n"));
+      expect(help).toContain("m cycles raw, assistant Markdown,");
+      expect(help).toContain("all Markdown.");
+      viewer.handleInput("?");
 
       viewer.handleInput("m");
       expect(onMode).toHaveBeenLastCalledWith("all");
-      expect(strip(viewer.render(80).join("\n"))).toContain("m md+");
 
       viewer.handleInput("m");
       expect(onMode).toHaveBeenLastCalledWith("off");
       const off = strip(viewer.render(80).join("\n"));
-      expect(off).toContain("m raw");
-      // The override, not just the label, is what took effect.
+      // The override, not just the persisted callback, took effect.
       expect(off).toContain("# Heading");
 
       viewer.handleInput("m");
@@ -487,14 +497,14 @@ describe("ConversationViewer", () => {
     it("keeps the footer's navigation hints intact at 80 columns", () => {
       const viewer = new ConversationViewer(
         mockTui(200, 80), mockSession(assistant("hi")), mockRecord({ status: "running" }), undefined,
-        ansiTheme(), vi.fn(), vi.fn(), undefined, vi.fn(),
+        ansiTheme(), vi.fn(), vi.fn(), undefined, vi.fn(), false, undefined, undefined, () => "raw",
       );
       const lines = viewer.render(80);
       const footer = strip(lines[lines.length - 2]);
 
+      expect(footer).toContain("Tab steps");
       expect(footer).toContain("Enter steer");
       expect(footer).toContain("x stop");
-      expect(footer).toContain("m md");
       expect(footer).toContain("Esc close");
     });
 
@@ -559,17 +569,17 @@ describe("ConversationViewer", () => {
       // An append-only delta keeps the unsafe prefix, so it must stay literal
       // without retrying the recursive parser on every streamed update.
       messages[0].content[0].text += "\nmore";
-      expect(strip(viewer.render(80).join("\n"))).toContain("more");
+      expect(strip((viewer as any).buildContentLines(76).join("\n"))).toContain("more");
       expect(markdownRenderCalls).toBe(1);
 
       markdownThrows = false;
-      expect(strip(viewer.render(80).join("\n"))).toContain("# heading");
+      expect(strip((viewer as any).buildContentLines(76).join("\n"))).toContain("# heading");
       expect(markdownRenderCalls).toBe(1);
 
       // Replacing the failed content can remove the unsafe prefix, so it gets
       // one fresh Markdown attempt instead of staying literal forever.
       messages[0].content[0].text = "## safe";
-      const replaced = strip(viewer.render(80).join("\n"));
+      const replaced = strip((viewer as any).buildContentLines(76).join("\n"));
       expect(markdownRenderCalls).toBe(2);
       expect(replaced).toContain("safe");
       expect(replaced).not.toContain("## safe");
@@ -614,22 +624,22 @@ describe("ConversationViewer", () => {
       expect(out).toMatch(/\.\.\. \(truncated, [\d.]+[kM]? more characters\)/);
     });
 
-    it("keeps tool results dim even when rendering them as Markdown", () => {
-      // Reads the content line directly: every bordered row carries the theme's
-      // escape on its `│`, so asserting on rendered output would pass either way.
+    it("keeps tool-result content at normal foreground in Markdown mode", () => {
       const viewer = viewerFor(result("plain result text"), "all");
       const line = (viewer as any).buildContentLines(76)
         .find((l: string) => strip(l).includes("plain result text"));
 
-      expect(line).toContain("\x1b[38;5;240m");
+      expect(strip(line)).toContain("plain result text");
+      expect(line).not.toContain("\x1b[38;5;240m");
     });
 
-    it("keeps tool results dim on the literal path too", () => {
+    it("keeps literal tool-result content at normal foreground too", () => {
       const viewer = viewerFor(result("plain result text"));
       const line = (viewer as any).buildContentLines(76)
         .find((l: string) => strip(l).includes("plain result text"));
 
-      expect(line).toContain("\x1b[38;5;240m");
+      expect(strip(line)).toContain("plain result text");
+      expect(line).not.toContain("\x1b[38;5;240m");
     });
 
     it("reuses one Markdown per message across renders", () => {
@@ -643,12 +653,18 @@ describe("ConversationViewer", () => {
       expect(markdownConstructions).toBe(afterFirst);
     });
 
-    it("re-renders a message whose text is still streaming", () => {
+    it("re-renders a same-length live message replacement from its lifecycle event", () => {
       const messages = assistant("# One");
-      const viewer = viewerFor(messages);
+      const session = mockSession(messages);
+      const viewer = new ConversationViewer(
+        mockTui(200, 80), session, mockRecord({ status: "completed" }), undefined,
+        ansiTheme(), vi.fn(), undefined, undefined, undefined, false,
+        () => "assistant", undefined, () => "raw",
+      );
       expect(strip(viewer.render(80).join("\n"))).toContain("One");
 
       messages[0].content[0].text = "# Two";
+      session.emit({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "text_delta", delta: "" } });
       const out = strip(viewer.render(80).join("\n"));
 
       expect(out).toContain("Two");

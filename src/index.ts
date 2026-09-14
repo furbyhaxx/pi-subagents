@@ -38,7 +38,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type ViewerViewMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -464,6 +464,15 @@ export default function (pi: ExtensionAPI) {
   function chooseViewerMarkdown(mode: ViewerMarkdownMode, ctx?: ExtensionCommandContext): void {
     setViewerMarkdown(mode);
     persistSettings(ctx, `Viewer markdown set to ${mode}`);
+  }
+  /** Which view the conversation viewer opens in. Read through a getter, as above. */
+  let viewerMode: ViewerViewMode = "steps";
+  function getViewerMode(): ViewerViewMode { return viewerMode; }
+  function setViewerMode(mode: ViewerViewMode): void { viewerMode = mode; }
+  /** The viewer's `Tab` key, from either entry point — see `chooseViewerMarkdown`. */
+  function chooseViewerMode(mode: ViewerViewMode, ctx?: ExtensionCommandContext): void {
+    setViewerMode(mode);
+    persistSettings(ctx, `Viewer opens in ${mode} view`);
   }
   const pendingUsage = new PendingUsagePool();
 
@@ -1215,7 +1224,9 @@ export default function (pi: ExtensionAPI) {
   // The last two arguments keep a conversation overlay opened here identical to
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
+    getViewerMode,
+    (mode) => chooseViewerMode(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1525,6 +1536,7 @@ export default function (pi: ExtensionAPI) {
       setShowCost,
       setShowModel,
       setViewerMarkdown,
+      setViewerMode,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -3212,7 +3224,19 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx), getViewerMode, (mode) => chooseViewerMode(mode, ctx), {
+          resolveChildren: (parent, step) => manager.listAgents()
+            .filter(child => child.parentAgentId === parent.id && child.session && (
+              step.childAgentIds?.includes(child.id) || child.toolCallId === step.toolCallId
+            ))
+            .map(child => ({
+              record: child,
+              session: child.session!,
+              activity: agentActivity.get(child.id),
+              onStop: () => { manager.abort(child.id); },
+              onSteer: (message: string) => { manager.steer(child.id, message); },
+            })),
+        });
       },
       {
         overlay: true,
@@ -3628,6 +3652,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
+      viewerMode: getViewerMode(),
     } satisfies SubagentsSettings;
   }
 
@@ -3846,6 +3871,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["off", "assistant", "all"],
         },
         {
+          id: "viewerMode",
+          label: "Viewer view",
+          description:
+            "Which view the conversation viewer opens in. steps = a condensed timeline, one row per step, with the task pinned above it and each step expandable (default); raw = the verbatim message dump. `Tab` in the viewer switches between them and sets this.",
+          currentValue: getViewerMode(),
+          values: ["steps", "raw"],
+        },
+        {
           id: "fleetView",
           label: "Fleet view",
           description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
@@ -4031,6 +4064,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "viewerMarkdown") {
         setViewerMarkdown(value as ViewerMarkdownMode);
         notifyApplied(ctx, `Viewer markdown set to ${value}`);
+      } else if (id === "viewerMode") {
+        setViewerMode(value as ViewerViewMode);
+        notifyApplied(ctx, `Viewer opens in ${value} view`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);

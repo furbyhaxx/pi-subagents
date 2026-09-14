@@ -122,6 +122,18 @@ export type WidgetMode = 'all' | 'background' | 'off';
 export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
 
 /**
+ * Which view the conversation viewer opens in.
+ * - `steps`: a derived timeline, one row per step (tool call + its result,
+ *   assistant decisions, compactions, nested spawns), expandable. The default:
+ *   a long run's transcript is tens of thousands of lines, and the questions a
+ *   reader actually has — what was asked, what changed, what failed, what is it
+ *   doing now — are not answerable by scrolling it.
+ * - `raw`: the verbatim message dump, as the viewer always rendered it. Still
+ *   the only view that shows every byte, and `Tab` switches at any time.
+ */
+export type ViewerViewMode = 'steps' | 'raw';
+
+/**
  * How `@handle message` starts an agent that is not already running.
  * - `model`: inject Claude Code's `agent_mention` reminder and let the main
  *   model spawn it with the `Agent` tool, which is what Claude Code does.
@@ -182,6 +194,12 @@ export interface AgentRecord {
    */
   alias?: string;
   description: string;
+  /**
+   * Exact original caller assignment before inherited context or worktree scope
+   * is added. Fresh sessions persist it; resumed sessions hydrate it from their
+   * active branch. Undefined for older sessions with no task metadata.
+   */
+  taskPrompt?: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
   result?: string;
   error?: string;
@@ -225,7 +243,10 @@ export interface AgentRecord {
   artifactRoot?: string;
   /** Worktree cleanup result after agent completion. */
   worktreeResult?: WorktreeCleanupResult;
-  /** The tool_use_id from the original Agent tool call. */
+  /**
+   * The tool_use_id from the original Agent call, including a nested child's
+   * invoking Agent call so transcript viewers can resolve that child.
+   */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
   outputFile?: string;

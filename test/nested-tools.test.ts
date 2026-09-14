@@ -100,6 +100,7 @@ describe("child-safe nested Agent tools", () => {
     });
 
     expect(result.isError).toBe(false);
+    expect(result.details.agentId).toBe("child-1");
     expect(spawnAndWait).toHaveBeenCalledWith(
       expect.anything(), expect.anything(), "reviewer", "Review it",
       expect.objectContaining({
@@ -261,6 +262,8 @@ describe("child-safe nested Agent tools", () => {
       run_in_background: true,
     });
     expect(launched.content[0].text).toContain("child-1");
+    expect(launched.details.agentId).toBe("child-1");
+    expect(records.get("child-1").toolCallId).toBe("call-1");
     expect(spawn).toHaveBeenCalledWith(
       expect.anything(), expect.anything(), "scout", "Find them",
       expect.objectContaining({ isBackground: true, depth: 2, parentAgentId: "parent-1" }),
@@ -308,6 +311,30 @@ describe("child-safe nested Agent tools", () => {
       undefined,
       { modelCandidates: [expect.objectContaining({ input: "anthropic/allowed:low", thinking: "low" })] },
     );
+  });
+
+  it("keeps a resumed child's original tool call link", async () => {
+    const [agent] = tools(["scout"]);
+    const record = {
+      id: "child-1",
+      type: "scout",
+      status: "completed",
+      parentAgentId: "parent-1",
+      toolCallId: "original-call",
+    };
+    records.set(record.id, record);
+    vi.mocked(manager.resume).mockResolvedValue(record as never);
+
+    const result = await execute(agent, {
+      resume: record.id,
+      subagent_type: "scout",
+      description: "resume child",
+      prompt: "Continue",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.details.agentId).toBe(record.id);
+    expect(record.toolCallId).toBe("original-call");
   });
 
   it("reports a background child that fails to start as a tool error", async () => {

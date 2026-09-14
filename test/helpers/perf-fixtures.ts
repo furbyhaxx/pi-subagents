@@ -161,6 +161,7 @@ const TOOL_RESULT = `${PARAGRAPH}\n${PARAGRAPH}\n`;
  */
 export function makeSession(n: number) {
   const messages: any[] = [];
+  let listener: ((event: any) => void) | undefined;
   for (let i = 0; i < n; i++) {
     const slot = i % 3;
     if (slot === 0) {
@@ -183,7 +184,9 @@ export function makeSession(n: number) {
   }
   return {
     messages,
-    subscribe: () => () => {},
+    subscribe: (next: (event: any) => void) => { listener = next; return () => { listener = undefined; }; },
+    emit: (event: any) => listener?.(event),
+    sessionManager: { getBranch: () => [] },
     dispose: () => {},
     getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 } }),
   } as any;
@@ -258,6 +261,7 @@ export function mountViewer(
   session: any,
   record: unknown = makeRecord(0),
   markdownMode?: () => string,
+  viewMode?: () => string,
 ) {
   const viewer = new Viewer(
     perfTui(120, 40),
@@ -271,6 +275,8 @@ export function mountViewer(
     undefined,
     false,
     markdownMode,
+    undefined,
+    viewMode,
   );
   return viewer;
 }

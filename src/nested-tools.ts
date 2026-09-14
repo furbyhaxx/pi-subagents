@@ -120,7 +120,11 @@ function textResult(text: string, isError = false, record?: AgentRecord) {
   const scope = worktree
     ? `\n\nWorkspace: ${worktree.branch} at ${worktree.path}; cwd: ${record?.effectiveCwd ?? worktree.workPath}; ${worktree.reused ? "reused" : "created"}; ${worktree.lifecycle}.`
     : record?.branch ? `\n\nRequested branch: ${record.branch}; workspace pending.` : "";
-  return { content: [{ type: "text" as const, text: text + scope }], isError, details: { worktree, branch: record?.branch } };
+  return {
+    content: [{ type: "text" as const, text: text + scope }],
+    isError,
+    details: { agentId: record?.id, worktree, branch: record?.branch },
+  };
 }
 
 function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): record is AgentRecord {
@@ -197,7 +201,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       inherit_context: Type.Optional(Type.Boolean()),
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
         if (params.branch !== undefined) return textResult("branch cannot be combined with resume.", true);
         const existing = context.manager.getRecord(params.resume);
@@ -369,9 +373,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       let childId: string | undefined;
       const attachTranscript = (id: string): void => {
         childId = id;
-        if (transcriptSessionId === undefined) return;
         const rec = context.manager.getRecord(id);
         if (!rec) return;
+        // Link the child as soon as it exists, even when no output transcript
+        // is configured: a running parent viewer needs it before this call returns.
+        rec.toolCallId = toolCallId;
+        if (transcriptSessionId === undefined) return;
         rec.outputFile = createOutputFilePath(parent?.originCwd ?? context.configCwd, id, transcriptSessionId, parent?.artifactRoot);
         writeInitialEntry(rec.outputFile, id, params.prompt, ctx.cwd);
       };

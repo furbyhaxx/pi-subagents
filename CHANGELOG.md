@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **⚠️ Breaking — agent-file model selection is now canonical and explicit call models win.** Existing fuzzy `model:` pins must be changed to exact `provider/modelId` values; a caller-supplied `model` now replaces configured frontmatter rather than being ignored.
 
 ### Added
+- **The conversation viewer now opens as a task-pinned Steps timeline.** The default view groups successful read-only calls, keeps failures visible, shows compaction markers and nested agents, and opens full locally retained step details with `o`; `Tab` keeps the raw transcript as an escape hatch, with the `viewerMode` setting persisting the choice. Fresh sessions persist the original subagent task separately from inherited parent context so it remains readable after compaction or steering.
 - **Ordered model fallback within one agent session.** Agent frontmatter accepts `models: [provider/model[:thinking], …]`, with scalar `model` as a one-item alias; Pi exhausts its built-in retry budget before the extension advances without replaying the prompt or completed tools. `maxRetries` (default `3`) and `maxModelWraparounds` (default `0`) are configurable in `subagents.json` and `/agents`, and explicit model overrides also work for resumes. Automatic switching checks required Pi APIs at runtime rather than gating on the package version; incompatible APIs fail normally without disabling fallback.
 
 ### Changed

@@ -561,6 +561,9 @@ export class AgentManager {
         // spawn is reopening, and re-deriving it would lose the numbering.
         : options.reclaim?.handle ?? assignHandle(handleBase(type), this.takenHandles()),
       description: options.description,
+      // A reopened session hydrates this from its active branch below; never
+      // replace the original assignment with the continuation prompt.
+      ...(options.resumeSessionFile ? {} : { taskPrompt: prompt }),
       // Reclaimed here, or filled in below from `name` — in which case it must
       // see the handle this record just took, since both come out of the same
       // namespace.
@@ -930,6 +933,19 @@ export class AgentManager {
         // stubbed session must degrade to "not resumable" rather than throw
         // and take the whole spawn down with it.
         record.sessionFile = session.sessionManager?.getSessionFile?.();
+        if (options.resumeSessionFile) {
+          // getBranch() follows the active root-to-leaf path. The first task
+          // entry is the original assignment, even after later resume prompts.
+          const taskEntry = session.sessionManager?.getBranch?.()
+            .find(entry => entry.type === "custom" && entry.customType === "subagents:task");
+          const task = taskEntry?.type === "custom" ? taskEntry.data : undefined;
+          if (task !== null && typeof task === "object" && "prompt" in task && typeof task.prompt === "string") {
+            record.taskPrompt = task.prompt;
+          }
+        } else if (record.taskPrompt !== undefined) {
+          // Custom entries persist extension metadata without entering LLM context.
+          session.sessionManager?.appendCustomEntry?.("subagents:task", { prompt: record.taskPrompt });
+        }
         if (record.worktree) {
           session.sessionManager?.appendCustomEntry?.("subagents:workspace", {
             worktree: { ...record.worktree },

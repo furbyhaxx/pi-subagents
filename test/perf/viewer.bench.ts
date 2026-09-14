@@ -26,9 +26,9 @@ import { makeSession, mountViewer } from "../helpers/perf-fixtures.js";
 
 const SIZES = [50, 500, 5000];
 
-describe("ConversationViewer.render — markdown: assistant (default)", () => {
+describe("ConversationViewer.render — Steps warm (default)", () => {
   for (const n of SIZES) {
-    const viewer = mountViewer(ConversationViewer, makeSession(n));
+    const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => "assistant", () => "steps");
     viewer.render(120); // prime: first frame parses, the measured ones reuse
     bench(`${n} messages`, () => {
       viewer.render(120);
@@ -36,9 +36,9 @@ describe("ConversationViewer.render — markdown: assistant (default)", () => {
   }
 });
 
-describe("ConversationViewer.render — markdown: off (raw wrap)", () => {
+describe("ConversationViewer.render — Raw warm (literal)", () => {
   for (const n of SIZES) {
-    const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => "off");
+    const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => "off", () => "raw");
     viewer.render(120);
     bench(`${n} messages`, () => {
       viewer.render(120);
@@ -46,7 +46,7 @@ describe("ConversationViewer.render — markdown: off (raw wrap)", () => {
   }
 });
 
-describe("ConversationViewer.render — cold cache (first frame)", () => {
+describe("ConversationViewer.render — Steps cold index (first frame)", () => {
   // What a viewer costs the moment it is opened on an agent that already has
   // history: every sample renders a viewer that has never rendered, so the
   // Markdown cache starts empty and every message is parsed from scratch.
@@ -63,12 +63,12 @@ describe("ConversationViewer.render — cold cache (first frame)", () => {
   // options (`time`, `iterations`) do survive — they go through `new Bench(...)`.
   // A hook-based version of this ran zero samples and reported "NaNx faster".
   const WARMUP = 2;
-  const SAMPLES = { 50: 40, 500: 12 } as Record<number, number>;
+  const SAMPLES = { 50: 40, 500: 12, 5000: 4 } as Record<number, number>;
 
-  for (const n of [50, 500]) {
+  for (const n of SIZES) {
     const iterations = SAMPLES[n];
     const pool = Array.from({ length: iterations + WARMUP }, () =>
-      mountViewer(ConversationViewer, makeSession(n)),
+      mountViewer(ConversationViewer, makeSession(n), undefined, () => "assistant", () => "steps"),
     );
     let next = 0;
     bench(

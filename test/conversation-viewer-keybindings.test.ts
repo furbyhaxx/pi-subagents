@@ -46,7 +46,12 @@ function createViewer(keybindings?: ViewerKeybindings) {
     fg: (_color: string, text: string) => text,
     bold: (text: string) => text,
   } as any;
-  const viewer = new ConversationViewer(tui, session, record, undefined, theme, vi.fn(), undefined, keybindings);
+  // Raw view: these assert line-by-line scrolling, which is what `raw` does.
+  // The steps view moves a step cursor instead — covered separately below.
+  const viewer = new ConversationViewer(
+    tui, session, record, undefined, theme, vi.fn(), undefined, keybindings,
+    undefined, false, undefined, undefined, () => "raw",
+  );
   viewer.render(80); // sets lastInnerW and scrolls to bottom (autoScroll)
   return viewer;
 }
@@ -136,5 +141,28 @@ describe("ConversationViewer custom keybindings", () => {
     expect(scrollOffset(viewer)).toBe(bottom);
     viewer.handleInput(UP);
     expect(scrollOffset(viewer)).toBe(bottom - 1);
+  });
+
+  // The steps view rebinds the same ids to step selection, so a user who moved
+  // scrolling onto ctrl+p/ctrl+n keeps it in both views or in neither.
+  it("moves the step cursor with the same bindings in the steps view", () => {
+    const tui = { terminal: { rows: 20, columns: 80 }, requestRender: vi.fn() } as any;
+    const messages = Array.from({ length: 12 }, (_, i) => ({ role: "user", content: `message ${i}` }));
+    const session = { messages, subscribe: vi.fn(() => vi.fn()) } as any;
+    const record = { id: "t", type: "general-purpose", description: "d", status: "completed", toolUses: 0, startedAt: Date.now() } as AgentRecord;
+    const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as any;
+    const viewer = new ConversationViewer(
+      tui, session, record, undefined, theme, vi.fn(), undefined, createEmacsKeybindings(),
+      undefined, false, undefined, undefined, () => "steps",
+    );
+    viewer.render(80);
+    const cursor = () => (viewer as any).cursor as number;
+    const bottom = cursor();
+    expect(bottom).toBeGreaterThan(0);
+
+    viewer.handleInput(CTRL_P);
+    expect(cursor()).toBe(bottom - 1);
+    viewer.handleInput(CTRL_N);
+    expect(cursor()).toBe(bottom);
   });
 });

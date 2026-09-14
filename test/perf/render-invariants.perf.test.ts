@@ -55,51 +55,50 @@ beforeEach(() => {
   counts.markdownRender = 0;
 });
 
-describe("ConversationViewer — cost stays linear in transcript length", () => {
-  /** Leaf calls one render makes over a transcript of `n` messages. */
-  function wrapsFor(n: number, mode: string): number {
-    const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => mode);
-    viewer.render(120); // prime, so caches are warm and only steady state counts
+describe("ConversationViewer — viewport-bounded transcript work", () => {
+  function warmLeafCalls(n: number, view: "steps" | "raw"): number {
+    const viewer = mountViewer(ConversationViewer, makeSession(n), undefined, () => "assistant", () => view);
+    viewer.render(120);
     counts.wrap = 0;
     counts.markdownRender = 0;
     viewer.render(120);
     return counts.wrap + counts.markdownRender;
   }
 
-  // The viewer rebuilds every line of the transcript on every frame, so the work
-  // is expected to grow with it. What must not happen is growing FASTER than it:
-  // ten times the messages, at most ~ten times the work. A quadratic here is
-  // invisible on a short conversation and locks the TUI on a long one.
-  it("does ~10x the work for 10x the messages (raw wrap path)", () => {
-    const small = wrapsFor(30, "off");
-    const large = wrapsFor(300, "off");
-
-    expect(small).toBeGreaterThan(0);
-    expect(large / small).toBeLessThanOrEqual(11);
+  it("does no transcript wrapping on a warm collapsed Steps frame", () => {
+    expect(warmLeafCalls(50, "steps")).toBe(0);
+    expect(warmLeafCalls(5000, "steps")).toBe(0);
   });
 
-  it("does ~10x the work for 10x the messages (markdown path)", () => {
-    const small = wrapsFor(30, "assistant");
-    const large = wrapsFor(300, "assistant");
-
-    expect(small).toBeGreaterThan(0);
-    expect(large / small).toBeLessThanOrEqual(11);
+  it("reuses cached Raw blocks on an unchanged frame", () => {
+    expect(warmLeafCalls(50, "raw")).toBe(0);
+    expect(warmLeafCalls(500, "raw")).toBe(0);
   });
 
-  // #259's WeakMap is keyed by the message object. If a refactor ever rebuilds
-  // messages, or keys the cache on something that changes per frame, every frame
-  // re-parses the whole transcript as Markdown — a cost this suite measured at
-  // roughly 10x the warm path. Nothing else in the suite would notice.
-  it("re-renders without re-parsing: the markdown cache survives a frame", () => {
-    const viewer = mountViewer(ConversationViewer, makeSession(60), undefined, () => "assistant");
+  it("touches only the changed live block for one Steps delta", () => {
+    const session = makeSession(500);
+    const viewer = mountViewer(ConversationViewer, session, undefined, () => "assistant", () => "steps");
     viewer.render(120);
-    const afterFirst = counts.markdownNew;
-    expect(afterFirst).toBeGreaterThan(0);
+    counts.wrap = 0;
+    counts.markdownRender = 0;
+    const message = session.messages.findLast((candidate: any) => candidate.role === "assistant");
+    message.content[0].text += " live delta";
+    session.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: " live delta" } });
+    viewer.render(120);
+    expect(counts.wrap + counts.markdownRender).toBeLessThanOrEqual(2);
+  });
 
+  it("reformats only the changed cached Raw block for one delta", () => {
+    const session = makeSession(500);
+    const viewer = mountViewer(ConversationViewer, session, undefined, () => "assistant", () => "raw");
     viewer.render(120);
+    counts.wrap = 0;
+    counts.markdownRender = 0;
+    const message = session.messages.findLast((candidate: any) => candidate.role === "assistant");
+    message.content[0].text += " live delta";
+    session.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: " live delta" } });
     viewer.render(120);
-
-    expect(counts.markdownNew).toBe(afterFirst);
+    expect(counts.wrap + counts.markdownRender).toBeLessThanOrEqual(2);
   });
 });
 

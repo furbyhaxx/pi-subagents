@@ -14,7 +14,7 @@
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
+import type { AgentRecord, ViewerMarkdownMode, ViewerViewMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
@@ -144,6 +144,10 @@ export class FleetList {
      * point. Omitted → `m` still cycles, viewer-locally.
      */
     private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
+    /** The user's `viewerMode` setting, read live for the same reason. */
+    private viewerMode?: () => ViewerViewMode,
+    /** Persist a view chosen with `Tab` in that overlay. */
+    private onViewerMode?: (mode: ViewerViewMode) => void,
   ) {}
 
   // ---- Lifecycle ----
@@ -425,6 +429,21 @@ export class FleetList {
           this.showCost(),
           this.viewerMarkdown,
           this.onViewerMarkdown,
+          this.viewerMode,
+          this.onViewerMode,
+          {
+            resolveChildren: (parent, step) => this.manager.listAgents()
+              .filter(child => child.parentAgentId === parent.id && child.session && (
+                step.childAgentIds?.includes(child.id) || child.toolCallId === step.toolCallId
+              ))
+              .map(child => ({
+                record: child,
+                session: child.session!,
+                activity: this.agentActivity.get(child.id),
+                onStop: () => { this.manager.abort(child.id); },
+                onSteer: (message: string) => { this.manager.steer(child.id, message); },
+              })),
+          },
         );
       },
       {
