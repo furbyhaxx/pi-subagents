@@ -23,11 +23,12 @@
  *     (`{ok: false}` → `null`), not as an unhandled rejection that takes the
  *     run down.
  *   - **when a `gate` runs.** For an isolated child it cannot wait until the
- *     spawn resolves: the manager commits the worktree to a branch and deletes
- *     the copy inside the child's own settle, so by then the only tree left to
+ *     spawn resolves: the manager commits an anonymous worktree to a branch and
+ *     deletes the copy inside the child's own settle, so the only tree left to
  *     run `npm test` in is the main one — which would report on code the child
  *     never wrote. So the gate runs from `onBeforeWorktreeCleanup`, inside that
- *     settle, and the verdict travels back on the spawn result. `runGate` still
+ *     settle (before lease release for retained trees), and the verdict travels
+ *     back on the spawn result. `runGate` still
  *     exists for a child that had no worktree; the runtime uses whichever of
  *     the two happened, never both.
  */
@@ -58,6 +59,10 @@ export interface WorkflowHostOptions {
   signal?: AbortSignal;
   /** Groups child transcripts under the parent session. */
   rootSessionId?: string;
+  /** Frozen root-session artifact directory, independent of child cwd. */
+  artifactRoot?: string;
+  /** Initiating project anchor for relative worktree placement. */
+  originCwd?: string;
   /**
    * The run id every child is stamped with.
    *
@@ -75,16 +80,14 @@ export interface WorkflowHostOptions {
  *
  * The guard is not defensive padding. `cleanupWorktree` commits the child's
  * changes to a branch and *removes* the copy before `spawnAndWait` resolves, so
- * an isolated child's worktree is normally already gone by the time a result is
+ * an anonymous child's worktree is normally already gone by the time a result is
  * built. That is exactly why a gate cannot wait until here — it runs from
  * `onBeforeWorktreeCleanup` instead — and why this reports nothing rather than
  * a path that no longer exists: handing a stale path to a command would fail
  * every gated worktree agent with a spawn error instead of a test result.
  */
 function childCwd(record: AgentRecord): string | undefined {
-  // `path`, not `workPath`: a workflow spawn never passes a cwd, so the manager
-  // runs the child at the copied repo's root.
-  const path = record.worktree?.path;
+  const path = record.effectiveCwd ?? record.worktree?.workPath ?? record.worktree?.path;
   return path !== undefined && existsSync(path) ? path : undefined;
 }
 
@@ -124,8 +127,9 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   // and cache reads a fan-out re-sends would over-report it by an order of
   // magnitude and make the documented guards useless.
   const outputTokens = record.lifetimeUsage?.output ?? 0;
-  const cwd = childCwd(record);
+  const cwd = record.effectiveCwd ?? childCwd(record);
   const common = {
+    ...(record.worktree !== undefined ? { workspace: record.worktree } : {}),
     ...(tokens > 0 ? { tokens } : {}),
     ...(outputTokens > 0 ? { outputTokens } : {}),
     ...(record.toolUses > 0 ? { toolCalls: record.toolUses } : {}),
@@ -265,26 +269,32 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         // so the first call finds a half missing and returns, and the second is
         // the one that reports.
         if (!sessionReady || spawnedId === undefined) return;
-        const info = resolvedInfo(manager.getRecord(spawnedId));
-        if (info !== undefined) request.onResolved?.(info);
+        const record = manager.getRecord(spawnedId);
+        const info = resolvedInfo(record);
+        if (info !== undefined || record?.worktree !== undefined) {
+          request.onResolved?.({
+            ...info,
+            ...(record?.worktree !== undefined ? { workspace: record.worktree } : {}),
+            ...(record?.effectiveCwd !== undefined ? { cwd: record.effectiveCwd } : {}),
+          });
+        }
       };
       const command = request.gate;
       /**
        * Verify the child's work while its worktree still exists.
        *
-       * The manager destroys that copy inside the child's own settle, so this
-       * is the last (and only) moment at which `npm test` can mean "the code
-       * this child just wrote" rather than "whatever is in the main tree".
+       * Runs before disposable cleanup or retained-workspace lease release,
+       * in the child's effective cwd (including its monorepo subdirectory).
        */
       const onBeforeWorktreeCleanup =
         command === undefined
           ? undefined
-          : async (worktreePath: string): Promise<void> => {
+          : async (effectiveCwd: string): Promise<void> => {
               // A failed child's gate is never consulted — the runtime reports
               // the child's own failure — so running it would be pure cost.
               if (spawnedId === undefined || !succeeded(manager.getRecord(spawnedId))) return;
               try {
-                gate = await executeGate(command, worktreePath);
+                gate = await executeGate(command, effectiveCwd);
               } catch (error) {
                 gate = { ok: false, output: error instanceof Error ? error.message : String(error) };
               }
@@ -329,8 +339,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
+            ...(request.branch !== undefined ? { branch: request.branch } : {}),
             ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
+            ...(deps.artifactRoot !== undefined ? { artifactRoot: deps.artifactRoot } : {}),
+            ...(deps.originCwd !== undefined ? { originCwd: deps.originCwd } : {}),
             ...(onBeforeWorktreeCleanup !== undefined ? { onBeforeWorktreeCleanup } : {}),
           },
           id => {
@@ -378,7 +391,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // simply read back rather than waited for. The id goes first for the same
       // reason it does on the spawn path: it is knowable even when the rest is
       // not.
-      onResolved?.({ recordId: id });
+      onResolved?.({
+        recordId: id,
+        ...(record.worktree !== undefined ? { workspace: record.worktree } : {}),
+        ...(record.effectiveCwd !== undefined ? { cwd: record.effectiveCwd } : {}),
+      });
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
       return toSpawnResult(record);

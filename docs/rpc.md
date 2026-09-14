@@ -24,7 +24,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
-| `isolation` | `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion |
+| `isolation` | `"off"` \| `"worktree"` | Without `branch`, disposable detached copy; changes preserved on a `pi-agent-*` branch before removal |
+| `branch` | string | Exact local branch. Implies worktree isolation; create or reuse a retained linked worktree, without automatic commit or removal |
 | `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
 | `signal` | AbortSignal | Aborting it stops the subagent |
@@ -38,8 +39,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `workflowId` | A forged value would hide an RPC-spawned agent inside someone else's workflow — and take it out of the concurrency pool with it |
 | `depth`, `maxSubagentDepth` | The nesting cap is inherited, not declared |
 | `configCwd` | Config-discovery root; only nested launches may set it |
-| `rootSessionId` | Names a transcript directory, so a forged value is a path-traversal primitive |
-| `resumeSessionFile` | Worse: it names a file to **open and replay** as a conversation. Dispatcher only, and only from a path this extension itself recorded |
+| `rootSessionId`, `artifactRoot`, `originCwd` | Root-session identity, frozen artifact directory and initiating project anchor are supplied by the extension, not the caller |
+| `resumeSessionFile`, `resumeWorktree` | Reopen a recorded conversation and its workspace scope. Dispatcher only; callers cannot supply a file to replay or forge its scope |
 | `reclaim` | Bypasses handle allocation, so a forged value would duplicate a live agent's name and make `@handle` ambiguous |
 | `blocking` | Every spawn through here is detached. A forged `blocking` would charge it to the foreground pool and defer it behind a queue whose gate nobody is holding |
 
@@ -51,6 +52,20 @@ Four things that are not obvious from the tables:
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
+
+### Branch workspaces and storage
+
+`options.branch: 'feat/x'` has the same contract as the [Agent tool](../README.md#retained-branch-workspaces). A missing local branch starts at the calling checkout's resolved HEAD; an existing branch starts at its tip. Git-registered linked worktrees are reused at their actual path, even outside the configured container, preserving staged, unstaged and untracked changes. No fetch, remote-branch guessing, automatic commit, merge, reset, stash or removal occurs. Main/orchestrating-checkout reuse is refused.
+
+Explicit `isolation: 'off'`, agent-file `isolation: off`, or project-wide worktree disablement fails a branch request rather than silently downgrading it. Invalid exact local names, stale or inaccessible registrations and a busy repository/branch lease also fail. The cross-process lease is held through execution and `onBeforeWorktreeCleanup`; that callback receives the **effective working cwd**, including monorepo scope, before lease release. The legacy callback name also covers retained trees: they are not cleaned up. Cancellation and failure release the lease without deleting retained files. Other human processes are not covered by the lease.
+
+A fresh spawn reuses files, not conversation. Resume keeps recorded scope, reacquires its lease and validates the repository/path/checked-out branch. It cannot retarget to a new `branch` or fall back to the parent checkout. Named execution keeps configuration at the initiating project; the reused branch's `.pi` extensions do not become authoritative. With `cwd`, the equivalent subdirectory must exist in the target tree.
+
+Session artifacts default to `join(getAgentDir(), 'sessions')/<project>/<root-session-id>/tasks/`, with sibling `worktrees/`. `getAgentDir()` respects `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). `sessionArtifactDirectory` overrides the base absolutely or relative to the origin project. The root is recorded and reused on session resume; setting changes affect new sessions only. Storage is persistent, independent of pi's session JSONL location (`session_dir` / `PI_CODING_AGENT_SESSION_DIR`), and unwritable storage is an error, not a silent `/tmp` fallback. No automatic artifact expiration, old-temp migration/deletion, handle reconstruction or interrupted-agent restart is added.
+
+`worktreeDirectory` independently selects `{ mode: 'session' }`, `{ mode: 'project' }` (origin repository's `.worktrees/`), or `{ mode: 'custom', path: '...' }` (absolute or origin-repository-relative). Placement changes apply to future acquisitions and never move registered worktrees. Repository-internal containers must already be ignored; otherwise acquisition reports an actionable error. The extension never edits tracked `.gitignore`. Both settings are available in `/agents → Settings`; see the [storage reference](../README.md#persistent-settings).
+
+Resolved workspace metadata (`worktree`, `branch`, `effectiveCwd`) is carried separately from result prose in lifecycle payloads and records, so truncation cannot hide where edits live. Until acquisition completes, only the requested branch is known; queued results must not be treated as a resolved workspace. RPC spawn returns `{ id, worktree?, cwd?, branch?, workspacePending? }` in the success envelope. `worktree` is the verified `WorktreeInfo` (`path`, `workPath`, `branch`, `baseSha`, `lifecycle`, `sourceRoot`, `commonDir`, `reused`, `initialDirty`); `cwd` is the effective working directory. Before acquisition, `branch` and `workspacePending: true` describe the request, not a resolved path. Non-worktree replies remain `{ id }`. An immediate reply is not a promise that startup succeeded: inspect lifecycle failures and the settled record.
 
 ### Names that look right and are not
 
@@ -92,7 +107,7 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 
 Three things the table cannot show:
 
-- **The failure that is not an error.** With `worktreeIsolation` off project-wide, `isolation: "worktree"` is dropped at `src/agent-manager.ts:712` with no error, no note on the record, and a success envelope on the wire. Your agent runs in the main tree. If you asked for isolation because two agents were going to write the same files, they now collide and nothing told you.
+- **Anonymous downgrade is not an error.** With `worktreeIsolation` off project-wide, anonymous `isolation: "worktree"` requests retain their silent downgrade to the caller's tree. Explicit `branch` requests instead fail; they never silently lose their named workspace.
 - **`data` is omitted** when a handler returns nothing, so a successful stop or consume reply is a bare `{ success: true }` and `reply.data.anything` throws.
 - **`requestId` is not validated.** It is interpolated straight into the reply channel, so a caller that omits it gets its reply on the literal channel `subagents:rpc:spawn:reply:undefined` — where every other caller that omitted it is also listening. Send one, and send a unique one.
 

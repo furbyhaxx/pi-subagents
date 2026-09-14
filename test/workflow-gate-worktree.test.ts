@@ -18,7 +18,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -149,6 +149,41 @@ describe("gate on an isolated child", () => {
     // repo drops both.
     rmSync(repo, { recursive: true, force: true });
     vi.mocked(runAgent).mockReset();
+  });
+
+  it("gates a retained branch in its package cwd while holding its lease", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "pi-gate-artifacts-"));
+    const packageCwd = join(repo, "packages", "api");
+    mkdirSync(packageCwd, { recursive: true });
+    writeFileSync(join(packageCwd, "package.json"), "{}");
+    execFileSync("git", ["add", "packages/api/package.json"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["commit", "-m", "package"], { cwd: repo, stdio: "pipe" });
+    const { pi, gateRuns } = makePi(async () => {
+      const contender = await host.spawnAgent(spawnRequest({ agentId: "contender", branch: "feat/gated" }));
+      expect(contender.ok).toBe(false);
+      expect(contender.error).toMatch(/busy/i);
+      return execFail("gate rejected");
+    });
+    const host = createWorkflowHost({ pi, ctx: ctx({ cwd: packageCwd }), manager, artifactRoot, originCwd: repo });
+    try {
+      const result = await host.spawnAgent(spawnRequest({ branch: "feat/gated", gate: "npm test" }));
+      expect(result.ok).toBe(true);
+      expect(result.gate).toEqual({ ok: false, output: "gate rejected" });
+      expect(result.workspace).toMatchObject({ lifecycle: "retained", branch: "feat/gated", reused: false });
+      expect(result.cwd).toBe(join(result.workspace!.path, "packages", "api"));
+      expect(gateRuns).toEqual([{ command: "npm test", cwd: result.cwd, existed: true, sawChildWork: true }]);
+      expect(result.workspace!.path.startsWith(artifactRoot)).toBe(true);
+      expect(existsSync(result.cwd!)).toBe(true);
+      expect(existsSync(join(packageCwd, CHILD_FILE))).toBe(false);
+      // The failed gate has released its lease, not cleaned or committed the tree.
+      const next = await host.spawnAgent(spawnRequest({ agentId: "next", branch: "feat/gated" }));
+      expect(next.ok).toBe(true);
+      expect(next.workspace).toMatchObject({ path: result.workspace!.path, reused: true, initialDirty: true });
+      expect(manager.listAgents()[0].artifactRoot).toBe(artifactRoot);
+      expect(manager.listAgents()[0].originCwd).toBe(repo);
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
   });
 
   it("runs the gate inside the child's worktree, while it still exists", async () => {

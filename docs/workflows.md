@@ -36,7 +36,7 @@ The tool returns immediately. The run continues in the background and notifies y
 ```text
 Workflow "auth-audit" started in the background.
 Task ID: wf_9f3ab21c04de
-Script: /var/folders/xy/…/pi-subagents-501/Users-me-project/<session>/tasks/wf_9f3ab21c04de.workflow.js
+Script: /home/me/.pi/agent/sessions/<project>/<session>/tasks/wf_9f3ab21c04de.workflow.js
 
 You will be notified when it finishes — do NOT poll or sleep waiting for it.
 To iterate, edit the script file and call SubagentWorkflow again with scriptPath.
@@ -46,7 +46,7 @@ Three things in there matter.
 
 **`Task ID`** is what `resumeFromRunId` takes, and what `/agents → Workflows` lists the run under.
 
-**`Script`** is the file to edit. **It is a scratch file in your system temp directory, not in your project** — it will not survive a reboot or a temp sweep. If the workflow turns out to be worth keeping, copy it somewhere durable; see [Save it](#5-save-it). The path means something slightly different depending on how the run was started: for an inline script it is a copy the tool just wrote, and for a run started from `scriptPath` or `name` it is *your own file*, reported straight back.
+**`Script`** is the file to edit. **Inline scripts use persistent session-artifact storage by default**, not the system temp directory. They survive restart, but interrupted agents do not automatically restart and old run handles are not reconstructed. To give a script a reusable name or share it, see [Save it](#5-save-it). The path means something slightly different depending on how the run was started: for an inline script it is a copy the tool just wrote, and for a run started from `scriptPath` or `name` it is *your own file*, reported straight back.
 
 **The last line is addressed to the model, not to you.** You do not call `SubagentWorkflow` yourself — you tell the model to re-run the workflow at that path.
 
@@ -103,10 +103,11 @@ Re-running normally re-pays for every agent. `resumeFromRunId` avoids that:
 
 Every run journals each settled `agent()` call beside its script as `<run id>.workflow.jsonl`, and the resume replays the **unchanged prefix** of that journal. It is a prefix and not a lookup table on purpose: a later call that still matches came from a run whose earlier stages no longer exist, so its recorded answer was produced downstream of work that has changed.
 
-Four things it will not do:
+Five things it will not do:
 
 - **Cross sessions.** The journal is keyed to the session that wrote it. Restart pi and the run id is dead — you get `No workflow run "<id>" in this session.`
 - **Resume a live run.** Stop it from `/agents → Workflows` first; while it is running you get `Workflow "<id>" is still running.`
+- **Replay a named-branch call.** Replay ends **at** the first `agent(..., { branch })`, and every later call runs live. A branch is mutable external state: matching the branch name and prompt cannot prove the files still match the recorded answer. Continuing a branch child also ends replay.
 - **Replay a failure.** A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. That is the point.
 - **Replay a run that used `agent({ resume })` at all.** A replayed agent is text from a file rather than a live child, so there would be no conversation left for a later `resume` to continue.
 
@@ -114,7 +115,7 @@ Replayed rows are annotated `from resume journal` on the card and in the inspect
 
 ### 5. Save it
 
-A script you will run more than once belongs somewhere durable. Copy it out of the temp directory into one of these, named `<name>.js`:
+A script you want to invoke by name belongs in a saved-workflow directory. Copy it from session-artifact storage into one of these, named `<name>.js`:
 
 | Location | Scope |
 |---|---|
@@ -241,14 +242,36 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku` |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
-| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
-| `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
+| `isolation` | `"worktree"` | Without `branch`, a disposable detached copy; changes are preserved on a reported `pi-agent-*` branch before removal |
+| `branch` | string | Exact local branch, e.g. `feat/x`. Implies worktree isolation; creates or reuses a retained linked worktree. No automatic commit or removal |
+| `gate` | string | Shell command in the child's effective cwd after it finishes, before cleanup or branch lease release; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `branch`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+
+### Retained branch workspaces
+
+Pass `branch` as an option rather than asking a child to switch branches or create worktrees:
+
+```js
+await agent('Implement src/x.ts; run npm test. Do not commit.', {
+  label: 'fix', branch: 'feat/x', gate: 'npm test',
+})
+await agent('Review src/x.ts and report remaining issues. Do not edit.', {
+  branch: 'feat/x',
+})
+```
+
+These sequential calls share files, not conversation; use `resume: 'fix'` for conversation continuity without specifying `branch` again. Resume validates and reacquires the original scope, refusing a missing path or changed branch rather than retargeting. `resume` does not run or inherit a gate, and cannot carry `gate` explicitly. Re-verification needs a fresh gated call on the same branch after resume completes.
+
+A missing local branch starts at the caller's resolved HEAD; an existing local branch starts at its tip. An already registered linked worktree is reused at its actual path, including staged, unstaged and untracked files. No fetch or remote-branch guessing occurs. New copies never include uncommitted files from the caller. Main/orchestrating-checkout reuse is refused. The runtime keeps configuration discovery at the initiating project and preserves monorepo subdirectory scope.
+
+Branch names must be nonempty exact local branch names, not tags or revision shortcuts. `branch` conflicts with `resume` and `isolation: 'off'`, and fails if worktrees are disabled or the agent definition vetoes them. Concurrent writers to one repository/branch fail fast as busy; use a different branch or steer/resume its owner. Gates hold the same lease while verifying. Completion, failure and cancellation release it without auto-committing, resetting, stashing or deleting the retained worktree.
+
+Use repository-relative task paths and state the permitted edits, validation and commit policy. Runtime workspace metadata is separate from the child's schema-validated output and truncated result preview; `agent()` still returns only its text or validated object. Completion XML includes an untruncated `<workspaces>` JSON array of deduplicated `{ worktree, cwd? }` records. `cwd` is the actual effective working directory, not a guess from the worktree root or mapped subdirectory; pending requests have no resolved record. Workspace scope is a directive, not a shell sandbox; explicitly configured memory/artifact destinations keep their semantics.
 
 ### `pipeline()` and `parallel()`
 
@@ -282,11 +305,15 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 
 | What | Where |
 |---|---|
-| An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
+| An inline script, as run | `<agent dir>/sessions/<project>/<session>/tasks/<run id>.workflow.js` by default |
 | The resume journal | the same directory, `<run id>.workflow.jsonl` |
 | Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins |
 
-The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only the third is durable, and copying a script there is a manual step.
+Scripts, journals and transcripts use `sessionArtifactDirectory`: default `join(getAgentDir(), 'sessions')`, where `getAgentDir()` respects `PI_CODING_AGENT_DIR` and otherwise is `~/.pi/agent`. A custom absolute path is used directly; a relative one is anchored to the origin project. The resolved per-session root is saved and reused on session resume; setting changes affect new sessions only. No automatic migration, deletion, expiration, interrupted-agent restart or cross-session workflow replay is added. Existing temporary artifacts are not migrated or deleted. An unwritable root reports an error rather than silently falling back to `/tmp`. Explicitly choosing temporary storage gives up default durability.
+
+Default worktrees live under `<project>/<session>/worktrees/`, sibling to `tasks/`. `worktreeDirectory` independently chooses `{ mode: 'session' }` (default), `{ mode: 'project' }` (`<origin-repository>/.worktrees/`) or `{ mode: 'custom', path: '...' }`. Relative custom paths resolve against the origin repository, never a nested child's worktree. Changes apply to future acquisitions, not existing worktrees; registered branch paths take precedence. A container inside the repository must already be ignored: acquisition fails with an actionable error otherwise, without editing `.gitignore`. Configure both directories in `/agents → Settings`; see [storage settings](../README.md#persistent-settings).
+
+This is extension-artifact storage, independent of pi session JSONL placement (`session_dir` / `PI_CODING_AGENT_SESSION_DIR`). Persistent storage does not change anonymous-worktree cleanup; only named worktrees are retained.
 
 ### Limits and caps
 
@@ -342,7 +369,7 @@ See [`gated-fix.js`](../examples/workflows/gated-fix.js).
 
 > *"if the tests still fail, tell the same agent what broke and let it try again"*
 
-Recognize it by `label: 'fix'` on the first call and `resume: 'fix'` on the second. A gate-rejected child stays resumable, which is what makes "here is what the tests said, fix it" a loop rather than a fresh start.
+Recognize it by `label: 'fix'` on the first call and `resume: 'fix'` on the second. A gate-rejected child stays resumable, but resume does not inherit its gate. Run a fresh gated call for re-verification; explicit `resume + gate` remains invalid.
 
 Also in [`gated-fix.js`](../examples/workflows/gated-fix.js).
 
@@ -371,7 +398,7 @@ The script called `Date.now()`, `new Date()` or `Math.random()`. A script that v
 `meta` is evaluated before the script runs, in an empty context, so it cannot reference anything. Move the dynamic part into the body.
 
 **`agent() opts.<key> is not a recognised option.`**
-A typo, or an option from a different tool. The supported set is `label`, `phase`, `model`, `agentType`, `isolation`, `gate`, `resume`, `effort`, `schema`.
+A typo, or an option from a different tool. The supported set is `label`, `phase`, `model`, `agentType`, `isolation`, `branch`, `gate`, `resume`, `effort`, `schema`.
 
 **An agent ran as the wrong type and nothing said so.**
 An `agentType` that names no known agent falls back to `general-purpose` **silently** — unlike the `Agent` tool, which tells you. Option *keys* are validated; option *values* are not. Check the spelling against `/agents`; matching is case-insensitive, and a disabled agent does not count.
@@ -420,7 +447,7 @@ Different:
 - **`schema` is pressured, not forced** — see the troubleshooting entry above.
 - If both extensions are loaded, this one **stands down** rather than offering the model two orchestrators.
 
-Additions on this side: `gate`, `resume`, `effort`, journal-backed `resumeFromRunId`, and the un-awaited-`agent()` check. All are optional, which is what keeps a Claude Code script portable.
+Additions on this side: `branch`, `gate`, `resume`, `effort`, journal-backed `resumeFromRunId`, and the un-awaited-`agent()` check. All are optional, which is what keeps a Claude Code script portable.
 
 ## Examples
 

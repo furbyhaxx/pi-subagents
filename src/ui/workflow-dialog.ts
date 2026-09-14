@@ -407,6 +407,7 @@ export function subStatusAnnotations(
 ): string[] {
   const parts: string[] = [];
   if (entry.isolation) parts.push(entry.isolation);
+  if (entry.branch) parts.push(`branch: ${entry.branch}`);
   if (entry.cached) parts.push(REPLAYED_ANNOTATION);
   if (entry.lastAttemptReason) {
     parts.push(entry.lastAttemptReason === "user-retry" ? "user retry" : entry.lastAttemptReason);
@@ -795,6 +796,20 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
     if (entry.durationMs) stats.push(formatDuration(entry.durationMs));
     if (stats.length > 0) {
       detailRows.push(clampLine([{ text: ` ${stats.join(" · ")}`, color: "dim" }], rightWidth));
+    }
+
+    if (entry.workspace) {
+      const scope = entry.workspace;
+      detailRows.push(detailHeading("Workspace", [scope.lifecycle, scope.reused ? "reused" : "created"], rightWidth));
+      detailRows.push(detailBody(`${scope.lifecycle === "retained" ? "Branch" : "Preservation branch"}: ${scope.branch}`, rightWidth));
+      for (const text of wrapTextWithAnsi(`Root: ${scope.path}`, Math.max(1, rightWidth - 4))) {
+        detailRows.push(detailBody(text, rightWidth));
+      }
+      if (entry.cwd && entry.cwd !== scope.path) {
+        detailRows.push(detailBody(`Cwd: ${entry.cwd}`, rightWidth));
+      }
+    } else if (entry.branch) {
+      detailRows.push(detailBody(`Branch: ${entry.branch} (workspace pending)`, rightWidth));
     }
 
     const prompt = previewLines(entry.promptPreview);

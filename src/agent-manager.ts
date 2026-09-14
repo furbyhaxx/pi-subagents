@@ -20,12 +20,16 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { buildAgentRegistry, getAgentConfig, getAgentConfigIn } from "./agent-types.js";
+import { loadCustomAgents } from "./custom-agents.js";
+import { resolveBranch } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
+import { getWorktreeDirectory, sessionArtifactRoot } from "./output-file.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, releaseWorktreeLease, resumeWorktree, type WorktreeInfo } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -93,6 +97,13 @@ function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | 
   if (!isDirectory) {
     throw new Error(`SpawnOptions.cwd is not a directory: "${cwd}"`);
   }
+}
+
+/** Nested agent definitions belong to their config root, not the global registry. */
+function agentIsolation(type: string, configCwd?: string, parentAgentId?: string): IsolationMode | undefined {
+  return configCwd !== undefined && parentAgentId !== undefined
+    ? getAgentConfigIn(buildAgentRegistry(loadCustomAgents(configCwd)), type)?.isolation
+    : getAgentConfig(type)?.isolation;
 }
 
 /**
@@ -181,6 +192,8 @@ interface SpawnOptions {
    * the type's CURRENT config.
    */
   resumeSessionFile?: string;
+  /** Trusted scope of an evicted conversation. Never accepted from RPC callers. */
+  resumeWorktree?: WorktreeInfo;
   /**
    * Take an evicted agent's names back verbatim instead of allocating fresh
    * ones, so a resumed conversation keeps the handle the user just typed —
@@ -234,6 +247,10 @@ interface SpawnOptions {
   structuredOutput?: CompiledSchema;
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
+  branch?: string;
+  /** Frozen root-session artifact location and origin project cwd. */
+  artifactRoot?: string;
+  originCwd?: string;
   /**
    * Working directory for the agent (absolute path). Default: parent session
    * cwd. The agent's tools operate here, but .pi config (extensions, skills,
@@ -372,6 +389,9 @@ export class AgentManager {
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
+  private worktreeApis = new Map<string, ExtensionAPI>();
+  /** Includes settlement/gates, even after a record has a terminal display status. */
+  private activeRuns = new Set<string>();
 
   /**
    * Startup phases, keyed by agent id. `spawn()` still returns synchronously,
@@ -497,6 +517,12 @@ export class AgentManager {
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
+    if (options.branch !== undefined) {
+      resolveBranch(options.branch, options.isolation, agentIsolation(type, options.configCwd, options.parentAgentId), isWorktreeIsolationEnabled());
+    }
+    if (options.branch !== undefined && options.resumeSessionFile) {
+      throw new Error("branch cannot be combined with resume.");
+    }
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
@@ -540,7 +566,10 @@ export class AgentManager {
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
-      rootSessionId: options.rootSessionId,
+      rootSessionId: options.rootSessionId ?? ctx.sessionManager?.getSessionId?.(),
+      branch: options.branch ?? options.resumeWorktree?.branch,
+      artifactRoot: options.artifactRoot,
+      originCwd: options.originCwd ?? ctx.cwd,
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -693,12 +722,14 @@ export class AgentManager {
     // never reach `settleRun`, so they hand the slot back themselves.
     const pool = this.poolFor(record);
     const releaseSlot = () => {
+      this.activeRuns.delete(id);
       if (pool === "background") this.runningBackground--;
       else if (pool === "foreground") this.runningForeground--;
     };
     record.status = "running";
     record.startedAt = Date.now();
     record.startGate = undefined;
+    this.activeRuns.add(id);
     if (pool === "background") this.runningBackground++;
     else if (pool === "foreground") this.runningForeground++;
 
@@ -709,14 +740,45 @@ export class AgentManager {
     // because cross-extension RPC forwards its options unvalidated — a schema
     // that omits the field can't stop a caller that never saw the schema.
     let worktreeCwd: string | undefined;
-    if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
-      if (!wt) {
+    let branch: string | undefined;
+    let isolation: IsolationMode | undefined;
+    try {
+      const configured = agentIsolation(type, options.configCwd, options.parentAgentId);
+      isolation = configured ?? options.isolation;
+      if (options.branch !== undefined) {
+        branch = resolveBranch(options.branch, options.isolation, configured, isWorktreeIsolationEnabled());
+      }
+    } catch (error) {
+      releaseSlot();
+      throw error;
+    }
+    if (options.resumeWorktree || branch !== undefined || (isolation === "worktree" && isWorktreeIsolationEnabled())) {
+      let wt: WorktreeInfo | undefined;
+      try {
+        if (options.resumeWorktree) {
+          if (!isWorktreeIsolationEnabled() || agentIsolation(type, options.configCwd, options.parentAgentId) === "off") {
+            throw new Error("Cannot resume a worktree: worktree isolation is disabled.");
+          }
+          wt = { ...options.resumeWorktree };
+          await resumeWorktree(pi, wt, id);
+        } else {
+          record.artifactRoot ??= sessionArtifactRoot(record.originCwd ?? ctx.cwd, record.rootSessionId ?? "standalone");
+          wt = await createWorktree(pi, baseCwd, id, {
+            branch,
+            sessionRoot: record.artifactRoot,
+            originCwd: record.originCwd,
+            directory: getWorktreeDirectory(),
+          });
+        }
+        if (!wt) {
+          throw new Error(
+            'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
+            'Initialize git and commit at least once, or omit `isolation`.',
+          );
+        }
+      } catch (error) {
         releaseSlot();
-        throw new Error(
-          'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
-          'Initialize git and commit at least once, or omit `isolation`.',
-        );
+        throw error;
       }
       record.worktree = wt;
       // workPath preserves subdirectory scoping for caller-supplied cwds: a
@@ -725,7 +787,8 @@ export class AgentManager {
       // behavior (agent at the copy's root) — moving them to workPath would
       // also move .pi config discovery when the parent session sits in a repo
       // subdirectory, silently dropping extensions/skills.
-      worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
+      worktreeCwd = wt.lifecycle === "retained" || customCwd !== undefined ? wt.workPath : wt.path;
+      this.worktreeApis.set(id, pi);
       this.worktreeRepos.add(baseCwd);
 
       // No longer "running" means a stop landed while the copy was being made
@@ -741,7 +804,28 @@ export class AgentManager {
       }
     }
 
-    this.onStart?.(record);
+    if (options.signal?.aborted) {
+      this.abort(id);
+      if (record.worktree) record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+      releaseSlot();
+      this.drainQueue();
+      return;
+    }
+    record.effectiveCwd = worktreeCwd ?? baseCwd;
+    record.configCwd = options.configCwd ?? (customCwd !== undefined || record.worktree?.lifecycle === "retained" ? ctx.cwd : undefined);
+    try {
+      this.onStart?.(record);
+    } catch (error) {
+      try {
+        if (record.worktree) record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+      } finally {
+        if (record.worktree?.lifecycle === "retained") releaseWorktreeLease(record.worktree);
+        releaseSlot();
+      }
+      const retained = record.worktree?.lifecycle === "retained"
+        ? ` Workspace retained on branch ${record.worktree.branch} at ${record.worktree.path}.` : "";
+      throw new Error(`${error instanceof Error ? error.message : String(error)}${retained}`);
+    }
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
     let detachParentSignal: (() => void) | undefined;
@@ -779,7 +863,8 @@ export class AgentManager {
       // Set iff a worktree was created (see above) — names the directory the
       // copy came from, so the prompt can tell the agent not to work there.
       worktreeBase: worktreeCwd ? baseCwd : undefined,
-      configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
+      worktree: record.worktree,
+      configCwd: record.configCwd,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -814,6 +899,16 @@ export class AgentManager {
         // stubbed session must degrade to "not resumable" rather than throw
         // and take the whole spawn down with it.
         record.sessionFile = session.sessionManager?.getSessionFile?.();
+        if (record.worktree) {
+          session.sessionManager?.appendCustomEntry?.("subagents:workspace", {
+            worktree: { ...record.worktree },
+            effectiveCwd: record.effectiveCwd,
+            configCwd: record.configCwd,
+            originCwd: record.originCwd,
+            artifactRoot: record.artifactRoot,
+            rootSessionId: record.rootSessionId,
+          });
+        }
         // Same reason, different field: the model and thinking level are only
         // knowable once pi has resolved its defaults and clamped the level to
         // what the model supports. Writing them back here makes the record
@@ -878,6 +973,10 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
+        // Nested tools may still be writing the same workspace. Stop and join
+        // them before running a gate or releasing the branch's writer lease.
+        if (record.worktree) await this.stopOwnedChildren(id);
+
         // Clean up worktree if used
         if (record.worktree) {
           // The one moment the child's tree still exists and the child is done
@@ -885,12 +984,14 @@ export class AgentManager {
           // not leave the worktree behind.
           if (options.onBeforeWorktreeCleanup) {
             try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
+              await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
             } catch { /* ignore — never block cleanup */ }
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
           record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
+          if (record.worktree.lifecycle === "retained") {
+            record.result = (record.result ?? "") + `\n\nWorkspace retained on branch \`${record.worktree.branch}\` at \`${record.worktree.path}\`. No automatic commit or merge performed.`;
+          } else if (wtResult.hasChanges && wtResult.branch) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -925,10 +1026,12 @@ export class AgentManager {
 
         // Best-effort worktree cleanup on error
         if (record.worktree) {
+          await this.stopOwnedChildren(id);
           try {
             const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
           } catch { /* ignore cleanup errors */ }
+          finally { if (record.worktree.lifecycle === "retained") releaseWorktreeLease(record.worktree); }
         }
 
         this.abortOwnedChildren(id);
@@ -939,12 +1042,15 @@ export class AgentManager {
 
     record.promise = promise;
 
-    // Notify caller that spawn is complete (record is in the map, promise is set).
-    // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
-    // Used by spawnAndWait to let the caller set up output files before streaming
-    // starts. Read off the options, so a spawn that started from a queue drain
-    // still reaches the caller that queued it.
-    options.onSpawned?.(id);
+    // Caller wiring may fail (e.g. an unwritable transcript). Do not orphan an
+    // already-started writer behind a failed startup result.
+    try {
+      options.onSpawned?.(id);
+    } catch (error) {
+      this.abort(id);
+      await promise;
+      throw error;
+    }
   }
 
   /**
@@ -966,6 +1072,7 @@ export class AgentManager {
    *   the release disagree with the acquire.
    */
   private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
+    this.activeRuns.delete(record.id);
     if (!record.isBackground) record.resultConsumed = true;
     if (pool === "background") this.runningBackground--;
     else if (pool === "foreground") this.runningForeground--;
@@ -991,6 +1098,18 @@ export class AgentManager {
    * parent would burn tokens unseen with no way to reach it. Grandchildren are
    * covered transitively — each abort lands in that child's own settle path.
    */
+  private async stopOwnedChildren(parentId: string): Promise<void> {
+    const children = [...this.agents.values()].filter(record => record.parentAgentId === parentId);
+    this.abortOwnedChildren(parentId);
+    await Promise.allSettled(children.map(async child => {
+      await this.awaitStartup(child.id);
+      await child.promise;
+      // A child without its own worktree shares ours; its grandchildren must
+      // also stop before the ancestor's workspace can be released.
+      await this.stopOwnedChildren(child.id);
+    }));
+  }
+
   private abortOwnedChildren(parentId: string): void {
     for (const [id, record] of this.agents) {
       if (record.parentAgentId === parentId) this.abort(id);
@@ -1112,6 +1231,7 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") return undefined;
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1129,8 +1249,6 @@ export class AgentManager {
       // whose settle path would abort the LIVE run's children and report a
       // failure for a run that is still going. Refuse instead, leaving the
       // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
@@ -1167,47 +1285,89 @@ export class AgentManager {
     }
 
     // Foreground resume: run inline and return the settled record.
+    this.activeRuns.add(id);
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
 
-    try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-          options?.onToolActivity?.(activity);
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-          this.onUsage?.(record, usage);
-          options?.onAssistantUsage?.(usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-          options?.onCompaction?.(info);
-        },
-        signal,
-      });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
-      record.result = text;
-      record.completedAt = Date.now();
-    } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
-    }
-
-    // Same contract as the spawn settle paths: children spawned during the
-    // resumed turn must not outlive it — nothing else can see or reach them.
-    this.abortOwnedChildren(id);
-
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    const onAbort = () => this.abort(id);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    const run = async () => {
+      let acquired = false;
+      try {
+        if (record.worktree) {
+          await this.prepareWorktreeResume(record);
+          acquired = true;
+        }
+        if (abortController.signal.aborted) throw new Error("Agent stopped before resume.");
+        const { text, failure } = await resumeAgent(record.session!, prompt, {
+          worktree: record.worktree,
+          cwd: record.effectiveCwd,
+          onToolActivity: (activity) => {
+            if (activity.type === "end") record.toolUses++;
+            options?.onToolActivity?.(activity);
+          },
+          onAssistantUsage: (usage) => {
+            addUsage(record.lifetimeUsage, usage);
+            this.onUsage?.(record, usage);
+            options?.onAssistantUsage?.(usage);
+          },
+          onCompaction: (info) => {
+            record.compactionCount++;
+            this.onCompact?.(record, info);
+            options?.onCompaction?.(info);
+          },
+          signal: abortController.signal,
+        });
+        // Same contract as spawn: a failed final turn is an error, while its
+        // partial text remains available to the caller.
+        if (record.status !== "stopped") record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+        record.result = text;
+        record.completedAt = Date.now();
+      } catch (err) {
+        if (record.status !== "stopped") record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt = Date.now();
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        if (acquired) {
+          await this.stopOwnedChildren(id);
+          await this.finishWorktreeResume(record);
+        } else this.abortOwnedChildren(id);
+        this.activeRuns.delete(id);
+      }
+      return record.result ?? "";
+    };
+    record.promise = run();
+    await record.promise;
     return record;
+  }
+
+  private async finishWorktreeResume(record: AgentRecord): Promise<void> {
+    const worktree = record.worktree!;
+    try {
+      record.worktreeResult = await cleanupWorktree(this.worktreeApis.get(record.id)!, worktree.sourceRoot, worktree, record.description);
+    } catch (error) {
+      record.status = "error";
+      record.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (worktree.lifecycle === "retained") releaseWorktreeLease(worktree);
+    }
+  }
+
+  private async prepareWorktreeResume(record: AgentRecord): Promise<void> {
+    const pi = this.worktreeApis.get(record.id);
+    if (!pi || !record.worktree) throw new Error("Cannot resume: worktree scope is unavailable.");
+    if (!isWorktreeIsolationEnabled() || agentIsolation(record.type, record.configCwd, record.parentAgentId) === "off") {
+      throw new Error("Cannot resume a worktree: worktree isolation is disabled.");
+    }
+    await resumeWorktree(pi, record.worktree, record.id);
   }
 
   /**
@@ -1228,8 +1388,8 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    this.activeRuns.add(id);
     if (occupiesPoolSlot(record)) this.runningBackground++;
-    this.onStart?.(record);
 
     // Fresh abort controller so /agents stop and steering target THIS run rather
     // than the previous one's settled controller.
@@ -1242,15 +1402,13 @@ export class AgentManager {
     let detachParentSignal: (() => void) | undefined;
     if (parentSignal) {
       const onParentAbort = () => this.abort(id);
-      parentSignal.addEventListener("abort", onParentAbort, { once: true });
+      if (parentSignal.aborted) onParentAbort();
+      else parentSignal.addEventListener("abort", onParentAbort, { once: true });
       detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
     }
 
-    // Per-run side effects (output streaming) — see ResumeOptions.onStarted.
-    // After the record is in its running shape, before the run is kicked off.
-    try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
-
-    const settle = () => {
+    let acquired = false;
+    const settle = async () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
       // Final flush of streaming output file
@@ -1258,31 +1416,50 @@ export class AgentManager {
         try { record.outputCleanup(); } catch { /* ignore */ }
         record.outputCleanup = undefined;
       }
-      // Children spawned during the resumed turn must not outlive it.
-      this.abortOwnedChildren(id);
+      // Release only after every nested writer has settled.
+      if (acquired) {
+        await this.stopOwnedChildren(id);
+        await this.finishWorktreeResume(record);
+      } else this.abortOwnedChildren(id);
+      this.activeRuns.delete(id);
       if (occupiesPoolSlot(record)) this.runningBackground--;
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
     };
 
-    const promise = resumeAgent(record.session, prompt, {
-      onToolActivity: (activity) => {
-        if (activity.type === "end") record.toolUses++;
-        options.onToolActivity?.(activity);
-      },
-      onAssistantUsage: (usage) => {
-        addUsage(record.lifetimeUsage, usage);
-        this.onUsage?.(record, usage);
-        options.onAssistantUsage?.(usage);
-      },
-      onCompaction: (info) => {
-        record.compactionCount++;
-        this.onCompact?.(record, info);
-        options.onCompaction?.(info);
-      },
-      signal: abortController.signal,
-    })
-      .then(({ text, failure }) => {
+    const run = async () => {
+      if (abortController.signal.aborted) throw new Error("Agent stopped before resume.");
+      this.onStart?.(record);
+      try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
+      return resumeAgent(record.session!, prompt, {
+        worktree: record.worktree,
+        cwd: record.effectiveCwd,
+        onToolActivity: (activity) => {
+          if (activity.type === "end") record.toolUses++;
+          options.onToolActivity?.(activity);
+        },
+        onAssistantUsage: (usage) => {
+          addUsage(record.lifetimeUsage, usage);
+          this.onUsage?.(record, usage);
+          options.onAssistantUsage?.(usage);
+        },
+        onCompaction: (info) => {
+          record.compactionCount++;
+          this.onCompact?.(record, info);
+          options.onCompaction?.(info);
+        },
+        signal: abortController.signal,
+      });
+    };
+    const execution = record.worktree
+      ? this.prepareWorktreeResume(record).then(() => {
+          acquired = true;
+          if (abortController.signal.aborted) throw new Error("Agent stopped before resume.");
+          return run();
+        })
+      : run();
+    const promise = execution
+      .then(async ({ text, failure }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
@@ -1292,16 +1469,16 @@ export class AgentManager {
         }
         record.result = text;
         record.completedAt ??= Date.now();
-        settle();
+        await settle();
         return text;
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
-        settle();
+        await settle();
         return "";
       });
 
@@ -1418,7 +1595,7 @@ export class AgentManager {
       return true;
     }
 
-    if (record.status !== "running") return false;
+    if (record.status !== "running" && !this.activeRuns.has(id)) return false;
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
@@ -1436,6 +1613,7 @@ export class AgentManager {
     // A failed startup keeps its (rejected) entry so a late awaitStartup still
     // sees it; drop it with the record so the map can't grow unbounded.
     this.startups.delete(id);
+    this.worktreeApis.delete(id);
     // Fire-and-forget is right here and only here: this runs from the 60s cleanup timer
     // and from `clearCompleted()` on session boundaries, with the process staying alive,
     // so handlers get their full window. The quit path awaits instead — see dispose().
@@ -1458,6 +1636,12 @@ export class AgentManager {
       description: record.description,
       sessionFile: record.sessionFile,
       completedAt: record.completedAt ?? Date.now(),
+      worktree: record.worktree,
+      effectiveCwd: record.effectiveCwd,
+      configCwd: record.configCwd,
+      originCwd: record.originCwd,
+      artifactRoot: record.artifactRoot,
+      rootSessionId: record.rootSessionId,
     });
     // Bound the memory a long session can accumulate. Oldest first, since the
     // agent someone still wants to reach is the one they used most recently.
@@ -1470,7 +1654,7 @@ export class AgentManager {
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -1484,7 +1668,7 @@ export class AgentManager {
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -1500,7 +1684,7 @@ export class AgentManager {
   /** Whether any agents are still running or queued. */
   hasRunning(): boolean {
     return [...this.agents.values()].some(
-      r => r.status === "running" || r.status === "queued",
+      r => (this.activeRuns.has(r.id) && !!r.worktree) || r.status === "running" || r.status === "queued",
     );
   }
 
@@ -1519,7 +1703,7 @@ export class AgentManager {
     this.dequeue(() => true);
     // Abort running agents
     for (const record of this.agents.values()) {
-      if (record.status === "running") {
+      if (record.status === "running" || this.activeRuns.has(record.id)) {
         record.abortController?.abort();
         record.status = "stopped";
         record.completedAt = Date.now();
@@ -1537,7 +1721,7 @@ export class AgentManager {
       this.drainQueue();
       const pending: Promise<unknown>[] = [];
       for (const record of this.agents.values()) {
-        if (record.status !== "running" && record.status !== "queued") continue;
+        if (!(this.activeRuns.has(record.id) && record.worktree) && record.status !== "running" && record.status !== "queued") continue;
         // An agent whose worktree is still being created is "running" with no
         // `promise` yet — without its startup the wait would return too early.
         const startup = this.startups.get(record.id);
@@ -1558,10 +1742,20 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
-    this.dequeue(() => true);
+    this.abortAll();
+    // Give workspace writers time to settle while their ownership records are
+    // still available. Never release a lease underneath a live tool or gate;
+    // a process killed before settlement leaves a recoverable stale lease.
+    const pending = [...this.startups.values(), ...[...this.agents.values()]
+      .filter(record => record.worktree && this.activeRuns.has(record.id))
+      .flatMap(record => record.promise ? [record.promise] : [])];
+    if (pending.length > 0) {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>(resolve => setTimeout(resolve, CHILD_SHUTDOWN_TIMEOUT_MS).unref()),
+      ]);
+    }
     const sessions = [...this.agents.values()].map(record => record.session);
-    this.agents.clear();
-    this.startups.clear();
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited
@@ -1577,5 +1771,8 @@ export class AgentManager {
     // handler and the process exits right after it returns, so anything left unawaited
     // here never runs at all. Bounded — each call carries its own ceiling, concurrently.
     await Promise.all(sessions.map(session => shutdownChildSession(session)));
+    this.agents.clear();
+    this.startups.clear();
+    this.worktreeApis.clear();
   }
 }

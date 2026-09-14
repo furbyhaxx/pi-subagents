@@ -26,10 +26,14 @@ import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./type
  * a second legal value is what lets a model decline one, not being told to.
  */
 const isolationParamShape = {
+  branch: Type.Optional(Type.String({
+    minLength: 1,
+    description: 'Exact local Git branch, e.g. "feat/x". Implies worktree isolation. Reuses its existing linked worktree or creates one; a missing branch starts at the caller\'s HEAD. The workspace and existing changes are retained without automatic commit or removal. Reuses files, not conversation. Cannot combine with resume or isolation "off". Fails when worktrees are disabled or the branch is busy.',
+  })),
   isolation: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
       description:
-        'Isolation mode. Default "off". "off" runs the agent in the current checkout, the same as omitting the field. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo (a copy cannot see uncommitted or staged changes in the main checkout).',
+        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" without branch creates a disposable detached copy; changes are preserved on a reported pi-agent-* branch before removal. With branch, the checked-out workspace is retained without automatic commits. New worktrees cannot see uncommitted or staged changes in the caller; reused named worktrees keep their existing changes.',
     }),
   ),
 };
@@ -69,6 +73,25 @@ interface AgentInvocationParams {
    * for the cross-extension RPC path, where options arrive unvalidated.
    */
   isolation?: unknown;
+  branch?: unknown;
+}
+
+/** Branch requests never silently degrade into work in the caller's checkout. */
+export function resolveBranch(
+  branch: unknown,
+  isolation: unknown,
+  agentIsolation: IsolationMode | undefined,
+  worktreeAllowed: boolean,
+): string | undefined {
+  if (branch === undefined) return undefined;
+  if (typeof branch !== "string" || branch.length === 0) {
+    throw new Error("branch must be a non-empty exact local Git branch name.");
+  }
+  if (!worktreeAllowed) throw new Error("Cannot select a branch: worktree isolation is disabled.");
+  if (isolation === "off" || agentIsolation === "off") {
+    throw new Error('branch cannot be combined with isolation: "off" (including agent frontmatter).');
+  }
+  return branch;
 }
 
 interface ResolveOptions {
@@ -106,6 +129,7 @@ export function resolveAgentInvocationConfig(
   runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;
+  branch?: string;
   /**
    * Caller parameters an agent file's frontmatter outranked, so the surfaces can
    * say "(asked X)" instead of presenting the effective value as the requested
@@ -120,8 +144,10 @@ export function resolveAgentInvocationConfig(
   // Precedence first, collapse second — reversing these loses the veto, since
   // an agent file's "off" only outranks a caller's "worktree" while it is still
   // a value. Everything downstream then sees "worktree" or nothing at all.
+  const branch = resolveBranch(params.branch, params.isolation, agentConfig?.isolation, opts?.worktreeAllowed !== false);
   const requested = agentConfig?.isolation ?? params.isolation;
-  const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
+  const isolation = branch !== undefined || (requested === "worktree" && opts?.worktreeAllowed !== false)
+    ? "worktree" : undefined;
 
   const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
     && agentConfig.thinking !== params.thinking
@@ -141,6 +167,7 @@ export function resolveAgentInvocationConfig(
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation,
+    branch,
     // Undefined rather than an empty object when nothing was overridden: callers
     // spread this into the invocation snapshot, and an always-present key would
     // put `requestedThinking: undefined` on every record.

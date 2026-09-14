@@ -29,7 +29,8 @@ function mockPi(): ExtensionAPI {
           timeout: options?.timeout,
         });
         return { stdout, stderr: "", code: 0, killed: false };
-      } catch (err: any) {
+      } catch (error) {
+        const err = error as { stdout?: string; stderr?: string; status?: number };
         return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", code: err.status ?? 1, killed: false };
       }
     },
@@ -64,6 +65,16 @@ function initGitRepo(): string {
   return dir;
 }
 
+let artifactDir: string;
+beforeEach(() => {
+  artifactDir = mkdtempSync(join(tmpdir(), "pi-wt-artifacts-"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", artifactDir);
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(artifactDir, { recursive: true, force: true });
+});
+
 describe("worktree", () => {
   let repoDir: string;
   let pi: ExtensionAPI;
@@ -80,11 +91,13 @@ describe("worktree", () => {
   });
 
   describe("createWorktree", () => {
-    it("creates a worktree in tmpdir", async () => {
+    it("creates a worktree under persistent session artifacts", async () => {
       const wt = await createWorktree(pi, repoDir, "test-id-1");
       expect(wt).toBeDefined();
       expect(existsSync(wt!.path)).toBe(true);
       expect(wt!.branch).toBe("pi-agent-test-id-1");
+      expect(wt!.path.startsWith(artifactDir)).toBe(true);
+      expect(wt!.lifecycle).toBe("ephemeral");
       expect(wt!.baseSha).toBe(execFileSync("git", ["rev-parse", "HEAD"], {
         cwd: repoDir, stdio: "pipe",
       }).toString().trim());
@@ -486,15 +499,16 @@ describe("worktree isolation switch", () => {
   // The switch gates callers; it deliberately does not disarm createWorktree
   // itself, so a caller that has already decided (agent-manager checks first)
   // still gets a real worktree rather than a silent no-op.
-  it("does not disable createWorktree directly", () => {
+  it("does not disable anonymous createWorktree directly", async () => {
     const repoDir = initGitRepo();
+    const pi = mockPi();
     try {
       setWorktreeIsolationEnabled(false);
-      const wt = createWorktree(repoDir, "switch-test");
+      const wt = await createWorktree(pi, repoDir, "switch-test");
       expect(wt).toBeDefined();
-      cleanupWorktree(repoDir, wt!, "switch test");
+      await cleanupWorktree(pi, repoDir, wt!, "switch test");
     } finally {
-      pruneWorktrees(repoDir);
+      await pruneWorktrees(pi, repoDir);
       rmSync(repoDir, { recursive: true, force: true });
     }
   });

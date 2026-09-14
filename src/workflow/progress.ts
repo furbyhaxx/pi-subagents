@@ -20,6 +20,7 @@
  * unit-testable without a terminal.
  */
 
+import type { WorktreeInfo } from "../worktree.js";
 import type { WorkflowMeta, WorkflowPhaseMeta } from "./meta.js";
 
 /** Raw entry lifecycle, as written by the runtime. */
@@ -96,6 +97,12 @@ export interface WorkflowAgentEntry {
   requestedModel?: string;
   fallbackModel?: string;
   isolation?: "worktree";
+  /** Requested branch; no resolved path is implied while queued. */
+  branch?: string;
+  /** Verified scope, never embedded in the truncated result preview. */
+  workspace?: WorktreeInfo;
+  /** Actual effective cwd, which need not equal the worktree's mapped workPath. */
+  cwd?: string;
   error?: string;
   skipped?: boolean;
   blocked?: boolean;

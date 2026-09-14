@@ -903,7 +903,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
       description: "go", isBackground: true, isolation: "worktree",
     });
     await manager.awaitStartup(id);
-    await vi.waitFor(() => expect(manager.getRecord(id)!.status).toBe("completed"));
+    await manager.getRecord(id)!.promise;
 
     const record = manager.getRecord(id)!;
     expect(JSON.parse(record.structuredJson!)).toEqual({ answer: "42" });
@@ -1179,7 +1179,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
 
-    expect(createWorktree).toHaveBeenCalledWith(mockPi, "/", id);
+    expect(createWorktree).toHaveBeenCalledWith(mockPi, "/", id, expect.objectContaining({ directory: { mode: "session" }, originCwd: "/tmp" }));
     // Worktree wins for the working dir — at workPath, so subdirectory scoping
     // survives isolation. Config still anchored to the parent.
     expect(runAgent).toHaveBeenCalledWith(

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
 import { buildAgentPrompt } from "../src/prompts.js";
 import type { AgentConfig, EnvInfo } from "../src/types.js";
+import type { WorktreeInfo } from "../src/worktree.js";
 
 const env: EnvInfo = {
   isGitRepo: true,
@@ -434,6 +435,23 @@ describe("buildAgentPrompt", () => {
     });
   });
 
+  it("puts verified retained branch scope after custom and inherited instructions in both modes", () => {
+    const worktree: WorktreeInfo = {
+      lifecycle: "retained", sourceRoot: "/repo", commonDir: "/repo/.git", reused: true, initialDirty: true,
+      branch: "feat/x", path: "/worktrees/x", workPath: "/worktrees/x/packages/api", baseSha: "abc",
+    };
+    for (const promptMode of ["append", "replace"] as const) {
+      const config = { ...getDefaultConfig("general-purpose"), promptMode, systemPrompt: "Custom instructions." };
+      const prompt = buildAgentPrompt(config, worktree.workPath, { ...env, branch: "feat/x" }, "Parent prompt.", { worktree });
+      expect(prompt).toContain("Checked-out branch: feat/x");
+      expect(prompt).toContain("Workspace: reused; retained after this run");
+      expect(prompt).toContain("existing uncommitted changes are present");
+      expect(prompt).toContain("No automatic commit, merge or removal occurs");
+      expect(prompt.indexOf("<worktree_scope>")).toBeGreaterThan(prompt.indexOf("Custom instructions."));
+      expect(prompt.endsWith("</worktree_scope>")).toBe(true);
+    }
+  });
+
   describe("workflow child block", () => {
     function childConfig(promptMode: "append" | "replace"): AgentConfig {
       return {
@@ -483,7 +501,7 @@ describe("buildAgentPrompt", () => {
         workflowChild: true,
       });
       expect(prompt).toContain("<worktree_isolation>");
-      expect(prompt.indexOf("<workflow_child>")).toBeGreaterThan(prompt.indexOf("<worktree_isolation>"));
+      expect(prompt.indexOf("<worktree_isolation>")).toBeGreaterThan(prompt.indexOf("<workflow_child>"));
     });
   });
 });

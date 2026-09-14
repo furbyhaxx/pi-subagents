@@ -43,7 +43,7 @@ export interface SpawnCapable {
    * to the two fields `isTopLevelAgent` reads, so the RPC layer keeps its
    * deliberately shallow view of the manager.
    */
-  getRecord(id: string): Pick<AgentRecord, "parentAgentId" | "workflowId"> | undefined;
+  getRecord(id: string): Pick<AgentRecord, "parentAgentId" | "workflowId" | "worktree" | "branch" | "effectiveCwd"> | undefined;
   /**
    * Mark a settled agent's result as read by the caller, suppressing the
    * completion notification — what `get_subagent_result` does when it returns
@@ -160,7 +160,12 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // it, so a strict-isolation failure is still an error envelope rather
       // than an id for an agent that never ran.
       await manager.awaitStartup(id);
-      return { id };
+      const record = manager.getRecord(id);
+      return {
+        id,
+        ...(record?.worktree ? { worktree: record.worktree, cwd: record.effectiveCwd } : {}),
+        ...(record?.branch ? { branch: record.branch, workspacePending: !record.worktree } : {}),
+      };
     },
   );
 

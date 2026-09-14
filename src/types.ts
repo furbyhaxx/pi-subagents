@@ -5,6 +5,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
+import type { WorktreeCleanupResult, WorktreeInfo } from "./worktree.js";
 
 export type { ThinkingLevel };
 
@@ -143,6 +144,12 @@ export interface AgentTombstone {
   /** Always set — a record with no session file is never tombstoned. */
   sessionFile: string;
   completedAt: number;
+  worktree?: WorktreeInfo;
+  effectiveCwd?: string;
+  configCwd?: string;
+  originCwd?: string;
+  artifactRoot?: string;
+  rootSessionId?: string;
 }
 
 /**
@@ -203,9 +210,17 @@ export interface AgentRecord {
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+  worktree?: WorktreeInfo;
+  /** Requested branch, available even while workspace acquisition is pending. */
+  branch?: string;
+  /** Actual tool cwd and trusted config root, preserved for resume. */
+  effectiveCwd?: string;
+  configCwd?: string;
+  /** Root project's cwd and frozen persistent artifact directory. */
+  originCwd?: string;
+  artifactRoot?: string;
   /** Worktree cleanup result after agent completion. */
-  worktreeResult?: { hasChanges: boolean; branch?: string };
+  worktreeResult?: WorktreeCleanupResult;
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
@@ -302,6 +317,7 @@ export interface AgentInvocation {
   inheritContext?: boolean;
   runInBackground?: boolean;
   isolation?: IsolationMode;
+  branch?: string;
 }
 
 /** Details attached to custom notification messages for visual rendering. */
@@ -323,6 +339,9 @@ export interface NotificationDetails {
   outputFile?: string;
   error?: string;
   resultPreview: string;
+  effectiveCwd?: string;
+  worktree?: WorktreeInfo;
+  branch?: string;
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];
 }
@@ -358,6 +377,7 @@ export interface ScheduledSubagent {
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
+  branch?: string;
 
   // state
   enabled: boolean;

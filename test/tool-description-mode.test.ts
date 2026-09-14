@@ -164,6 +164,15 @@ describe("toolDescriptionMode", () => {
     }
   });
 
+  it("rejects branch/resume and schedule/resume before dispatch or startup", async () => {
+    const tool = setup().get("Agent");
+    const base = { prompt: "continue", description: "Continue task", subagent_type: "general-purpose", resume: "existing" };
+    const branchResult = await tool.execute("call", { ...base, branch: "feat/x" }, undefined, undefined, { ui: {} });
+    expect(branchResult.content[0].text).toContain("Cannot combine `branch` with `resume`");
+    const scheduleResult = await tool.execute("call", { ...base, schedule: "5m" }, undefined, undefined, { ui: {} });
+    expect(scheduleResult.content[0].text).toContain("Cannot combine `schedule` with `resume`");
+  });
+
   it("every strategy param carries a real description of its own", () => {
     const props = setup().get("Agent").parameters?.properties ?? {};
     for (const name of ["run_in_background", "model", "thinking", "inherit_context"]) {
@@ -312,14 +321,19 @@ describe("toolDescriptionMode", () => {
     it("advertises `isolation` in schema and prose by default", () => {
       const tools = setup();
       expect(props(tools)).toContain("isolation");
+      expect(props(tools)).toContain("branch");
       expect(tools.get("Agent").description).toContain('Use isolation: "worktree"');
+      expect(tools.get("Agent").description).toContain("retained workspace");
+      expect(tools.get("Agent").description).toContain("no automatic commit or removal");
     });
 
     it("drops both when worktree isolation is disabled", () => {
       const tools = setup({ worktreeIsolation: false });
       const names = props(tools);
       expect(names).not.toContain("isolation");
+      expect(names).not.toContain("branch");
       expect(tools.get("Agent").description).not.toContain("isolation");
+      expect(tools.get("Agent").description).not.toContain("retained workspace");
       // One field, not the tool — and the neighbouring gate is unaffected.
       expect(names).toEqual(expect.arrayContaining(["prompt", "description", "subagent_type", "schedule"]));
     });
@@ -327,6 +341,7 @@ describe("toolDescriptionMode", () => {
     it("drops the compact description's bullet too", () => {
       const enabled = setup({ toolDescriptionMode: "compact" });
       expect(enabled.get("Agent").description).toContain('isolation: "worktree"');
+      expect(enabled.get("Agent").description).toContain("retained local-branch workspace");
     });
 
     it("compact mode says nothing about isolation when disabled", () => {

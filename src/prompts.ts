@@ -3,6 +3,29 @@
  */
 
 import type { AgentConfig, EnvInfo } from "./types.js";
+import type { WorktreeInfo } from "./worktree.js";
+
+/** Runtime-verified repository scope; kept separate from caller-authored task prose. */
+export function buildWorktreeScope(worktree: WorktreeInfo, cwd: string): string {
+  const retained = worktree.lifecycle === "retained";
+  return `<worktree_scope>
+Repository: ${worktree.sourceRoot}
+Worktree root: ${worktree.path}
+Working directory: ${cwd}
+${retained ? `Checked-out branch: ${worktree.branch}` : "Checkout: detached HEAD"}
+Workspace: ${worktree.reused ? "reused" : "created"}; ${retained ? "retained after this run" : "disposable"}
+Initial state at acquisition: ${worktree.initialDirty ? "existing uncommitted changes are present" : "clean"}
+
+Perform repository work in this worktree, not the originating checkout.
+Map repository paths from the task or inherited context to their equivalents here.
+Older cwd/branch statements describe the parent, not this run. Other project rules still apply.
+Do not switch branches or create/remove worktrees to set up this task.
+Preserve pre-existing changes; do not reset, stash or clean them away.
+${retained ? "No automatic commit, merge or removal occurs. Follow the task's explicit commit policy." : "On completion, changes are automatically preserved on a reported pi-agent-* branch and the worktree is removed."}
+Explicitly configured memory and artifact destinations keep their existing semantics.
+Report worktree-relative paths, validation results and remaining changes.
+</worktree_scope>`;
+}
 
 /** Extra sections to inject into the system prompt (memory, skills, etc.). */
 export interface PromptExtras {
@@ -16,6 +39,7 @@ export interface PromptExtras {
    * to stay in the copy.
    */
   worktreeBase?: string;
+  worktree?: WorktreeInfo;
   /**
    * Set only for a workflow's own children, and only when they have no
    * `StructuredOutput` tool to answer through.
@@ -63,14 +87,16 @@ export function buildAgentPrompt(
 
   const envBlock = `# Environment
 Working directory: ${cwd}
-${env.isGitRepo ? `Git repository: yes\nBranch: ${env.branch}` : "Not a git repository"}
+${env.isGitRepo ? `Git repository: yes\nBranch: ${env.branch || "(detached HEAD)"}` : "Not a git repository"}
 Platform: ${env.platform}`;
 
   // A worktree agent is told its cwd twice: by the env block above (the copy)
   // and by whatever names the main checkout — the inherited parent prompt in
   // append mode, or the task prompt in either mode. It follows the latter and
   // works in the shared tree (#187), so resolve the contradiction explicitly.
-  const worktreeBlock = extras?.worktreeBase
+  const worktreeBlock = extras?.worktree
+    ? `\n\n${buildWorktreeScope(extras.worktree, cwd)}`
+    : extras?.worktreeBase
     ? `\n\n<worktree_isolation>
 Your working directory is an isolated git worktree copy of ${extras.worktreeBase}.
 Work only inside it — never in ${extras.worktreeBase}, even if other instructions name that path as your working directory.
@@ -123,7 +149,7 @@ You are operating as a sub-agent invoked to handle a specific task.
     // placed verbatim (no wrapper tag) so it forms an identical byte prefix
     // with the parent session, maximising KV cache hits. The <active_agent>
     // tag and env block vary per call and are placed after the cached prefix.
-    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + worktreeBlock + workflowBlock + customSection + extrasSuffix;
+    return identity + "\n\n" + bridge + "\n\n" + activeAgentTag + envBlock + workflowBlock + customSection + extrasSuffix + worktreeBlock;
   }
 
   // "replace" mode — env header + the config's full system prompt
@@ -132,7 +158,7 @@ You have been invoked to handle a specific task autonomously.
 
 ${envBlock}`;
 
-  return activeAgentTag + replaceHeader + worktreeBlock + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix;
+  return activeAgentTag + replaceHeader + workflowBlock + "\n\n" + config.systemPrompt + extrasSuffix + worktreeBlock;
 }
 
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */

@@ -58,6 +58,9 @@ interface NestedSpawnOptions {
   thinkingLevel?: ThinkingLevel;
   isBackground?: boolean;
   isolation?: IsolationMode;
+  branch?: string;
+  artifactRoot?: string;
+  originCwd?: string;
   invocation?: AgentInvocation;
   signal?: AbortSignal;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
@@ -104,8 +107,12 @@ export interface NestedToolContext {
   configCwd: string;
 }
 
-function textResult(text: string, isError = false) {
-  return { content: [{ type: "text" as const, text }], isError, details: {} };
+function textResult(text: string, isError = false, record?: AgentRecord) {
+  const worktree = record?.worktree;
+  const scope = worktree
+    ? `\n\nWorkspace: ${worktree.branch} at ${worktree.path}; cwd: ${record?.effectiveCwd ?? worktree.workPath}; ${worktree.reused ? "reused" : "created"}; ${worktree.lifecycle}.`
+    : record?.branch ? `\n\nRequested branch: ${record.branch}; workspace pending.` : "";
+  return { content: [{ type: "text" as const, text: text + scope }], isError, details: { worktree, branch: record?.branch } };
 }
 
 function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): record is AgentRecord {
@@ -182,13 +189,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
+        if (params.branch !== undefined) return textResult("branch cannot be combined with resume.", true);
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
         const resumed = await context.manager.resume(params.resume, params.prompt, signal);
         return resumed
-          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
+          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error", resumed)
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);
       }
 
@@ -253,7 +261,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
       // The whole branch shares the root session's transcript directory; read it
       // off the owning parent rather than this child session's own id.
-      const rootSessionId = context.manager.getRecord(context.parentAgentId)?.rootSessionId;
+      const parent = context.manager.getRecord(context.parentAgentId);
+      const rootSessionId = parent?.rootSessionId;
       const childDepth = context.depth + 1;
       const options: NestedSpawnOptions = {
         description: params.description,
@@ -263,6 +272,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         inheritContext: invocation.inheritContext,
         thinkingLevel: invocation.thinking,
         isolation: invocation.isolation,
+        branch: invocation.branch,
+        artifactRoot: parent?.artifactRoot,
+        originCwd: parent?.originCwd,
         invocation: {
           thinking: invocation.thinking,
           maxTurns: invocation.maxTurns,
@@ -270,6 +282,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           inheritContext: invocation.inheritContext,
           runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
+          branch: invocation.branch,
         },
         // Nested children are hidden from every reporting surface, so their spend
         // would otherwise be unattributable. Fold it into every ancestor's record:
@@ -313,13 +326,13 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (transcriptSessionId === undefined) return;
         const rec = context.manager.getRecord(id);
         if (!rec) return;
-        rec.outputFile = createOutputFilePath(context.configCwd, id, transcriptSessionId);
+        rec.outputFile = createOutputFilePath(parent?.originCwd ?? context.configCwd, id, transcriptSessionId, parent?.artifactRoot);
         writeInitialEntry(rec.outputFile, id, params.prompt, ctx.cwd);
       };
       options.onSessionCreated = (session) => {
         const rec = childId === undefined ? undefined : context.manager.getRecord(childId);
         if (rec?.outputFile && childId !== undefined) {
-          rec.outputCleanup = streamToOutputFile(session, rec.outputFile, childId, ctx.cwd);
+          rec.outputCleanup = streamToOutputFile(session, rec.outputFile, childId, rec.effectiveCwd ?? ctx.cwd);
         }
       };
 
@@ -344,7 +357,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           // Worktree isolation starts the agent asynchronously; surface its
           // failure as a tool error, like the synchronous throw used to.
           await context.manager.awaitStartup(id);
-          return textResult(`Nested agent started in background. Agent ID: ${id}`);
+          return textResult(`Nested agent started in background. Agent ID: ${id}`, false, context.manager.getRecord(id));
         }
 
         const { record } = await context.manager.spawnAndWait(
@@ -355,7 +368,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           { ...options, signal },
           attachTranscript,
         );
-        return textResult(formatRecord(record, "inline"), record.status === "error");
+        return textResult(formatRecord(record, "inline"), record.status === "error", record);
       } catch (err) {
         return textResult(err instanceof Error ? err.message : String(err), true);
       }
@@ -385,7 +398,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         if (record.promise) await abortable(record.promise, signal);
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error");
+      return textResult(formatRecord(record, "fetched"), record.status === "error", record);
     },
   });
 

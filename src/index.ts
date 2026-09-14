@@ -10,8 +10,9 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -31,7 +32,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, getSessionArtifactDirectory, getWorktreeDirectory, sessionArtifactRoot, sessionTaskDir, setOutputTranscriptDefault, setSessionArtifactDirectory, setWorktreeDirectory, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -56,6 +57,7 @@ import {
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
+import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
@@ -78,8 +80,10 @@ import { escapeXml } from "./xml.js";
 // ---- Shared helpers ----
 
 /** Tool execute return value for a text response. */
-function textResult(msg: string, details?: AgentDetails) {
-  return { content: [{ type: "text" as const, text: msg }], details: details as any };
+type ScopedAgentDetails = AgentDetails & Pick<AgentRecord, "worktree" | "branch" | "effectiveCwd">;
+
+function textResult(msg: string, details?: ScopedAgentDetails) {
+  return { content: [{ type: "text" as const, text: msg }], details };
 }
 
 export function renderRunningAgentStatus(
@@ -92,6 +96,13 @@ export function renderRunningAgentStatus(
   container.addChild(new Text(theme.fg("accent", frame) + (statsText ? " " + statsText : ""), 0, 0));
   container.addChild(new Text(theme.fg("dim", `  ⎿  ${activity}`), 0, 0));
   return container;
+}
+
+/** Authoritative scope is separate from (possibly truncated) model prose. */
+function formatWorkspace(record: Pick<AgentRecord, "worktree" | "branch" | "effectiveCwd"> | undefined): string {
+  const scope = record?.worktree;
+  if (!scope) return record?.branch ? `Requested branch: ${record.branch} (workspace pending)\n` : "";
+  return `Workspace: ${scope.path}\nBranch: ${scope.branch}\nWorking directory: ${record?.effectiveCwd ?? scope.workPath}\nLifecycle: ${scope.lifecycle}; ${scope.reused ? "reused" : "created"}${scope.lifecycle === "retained" ? "; changes remain in the worktree" : ""}\n`;
 }
 
 /** Format an agent's lifetime token total, or "" when zero. */
@@ -191,6 +202,8 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
     `<task-id>${record.id}</task-id>`,
     record.toolCallId ? `<tool-use-id>${escapeXml(record.toolCallId)}</tool-use-id>` : null,
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
+    record.worktree ? `<worktree_scope>${escapeXml(JSON.stringify({ ...record.worktree, effectiveCwd: record.effectiveCwd }))}</worktree_scope>` : null,
+    !record.worktree && record.branch ? `<requested-branch>${escapeXml(record.branch)}</requested-branch>` : null,
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
@@ -202,12 +215,15 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage } & Pick<AgentRecord, "worktree" | "branch" | "effectiveCwd">,
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
-): AgentDetails {
+): ScopedAgentDetails {
   return {
     ...base,
+    effectiveCwd: record.effectiveCwd,
+    worktree: record.worktree,
+    branch: record.branch,
     toolUses: record.toolUses,
     tokens: formatLifetimeTokens(record),
     // Raw, and unconditional: `tokens` is preformatted because it is one stat,
@@ -242,6 +258,9 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     totalCost: getLifetimeCost(record.lifetimeUsage),
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
+    effectiveCwd: record.effectiveCwd,
+    worktree: record.worktree,
+    branch: record.branch,
     error: record.error,
     resultPreview: record.result
       ? record.result.length > resultMaxLen
@@ -343,6 +362,9 @@ export default function (pi: ExtensionAPI) {
           const preview = d.resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
           line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
         }
+
+        const scope = formatWorkspace(d);
+        if (scope) line += "\n  " + theme.fg("muted", scope.trim());
 
         // Line 4: output file link (if present)
         if (d.outputFile) {
@@ -561,6 +583,9 @@ export default function (pi: ExtensionAPI) {
       durationMs,
       tokens,
       usage,
+      effectiveCwd: record.effectiveCwd,
+      worktree: record.worktree,
+      branch: record.branch,
     };
   }
 
@@ -586,6 +611,8 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      worktree: record.worktree, branch: record.branch, effectiveCwd: record.effectiveCwd,
+      artifactRoot: record.artifactRoot, originCwd: record.originCwd,
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -626,6 +653,9 @@ export default function (pi: ExtensionAPI) {
       id: record.id,
       type: record.type,
       description: record.description,
+      effectiveCwd: record.effectiveCwd,
+      worktree: record.worktree,
+      branch: record.branch,
     });
   }, (record, info) => {
     if (!isTopLevelAgent(record)) return;
@@ -690,7 +720,7 @@ export default function (pi: ExtensionAPI) {
     const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
     // Repaints are left to the manager's `onStart` callback, which already starts
     // the widget/fleet timers for agents that enter this way.
-    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
+    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...sessionArtifacts(ctxRef), ...options, ...callbacks });
     agentActivity.set(id, state);
     return id;
   };
@@ -707,6 +737,9 @@ export default function (pi: ExtensionAPI) {
     // Also internal: it names a transcript directory, so a forged value would
     // be a path-traversal primitive.
     delete safeOptions.rootSessionId;
+    delete safeOptions.artifactRoot;
+    delete safeOptions.originCwd;
+    delete safeOptions.resumeWorktree;
     // Worse than rootSessionId: this one names a file to OPEN and replay as a
     // conversation. Only the mention dispatcher may set it, and only from a
     // path this extension itself recorded — never from anything a caller sent.
@@ -751,6 +784,28 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  let artifactBinding: { rootSessionId: string; artifactRoot: string; originCwd: string } | undefined;
+
+  function sessionArtifacts(ctx: ExtensionContext) {
+    const rootSessionId = ctx.sessionManager.getSessionId();
+    if (artifactBinding?.rootSessionId === rootSessionId) return artifactBinding;
+    for (const entry of ctx.sessionManager.getEntries?.() ?? []) {
+      if (entry.type !== "custom" || entry.customType !== "subagents:artifacts") continue;
+      const data = entry.data as Partial<NonNullable<typeof artifactBinding>> | undefined;
+      if (data?.rootSessionId !== rootSessionId) continue;
+      if (typeof data.artifactRoot !== "string" || !isAbsolute(data.artifactRoot)
+        || typeof data.originCwd !== "string" || !isAbsolute(data.originCwd)) {
+        throw new Error("Invalid subagents:artifacts session metadata; repair the recorded artifact root before launching agents");
+      }
+      artifactBinding = { rootSessionId, artifactRoot: data.artifactRoot, originCwd: data.originCwd };
+      return artifactBinding;
+    }
+    const originCwd = resolve(ctx.cwd);
+    const binding = { rootSessionId, originCwd, artifactRoot: sessionArtifactRoot(originCwd, rootSessionId) };
+    pi.appendEntry("subagents:artifacts", binding);
+    artifactBinding = binding;
+    return binding;
+  }
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -774,7 +829,7 @@ export default function (pi: ExtensionAPI) {
       if (!sessionId) return;  // sessionId not yet available — try again on next event
       const path = resolveStorePath(ctx.cwd, sessionId);
       const store = new ScheduleStore(path);
-      scheduler.start(pi, ctx, manager, store);
+      scheduler.start(pi, ctx, manager, store, sessionArtifacts(ctx));
       pi.events.emit("subagents:scheduler_ready", { sessionId, jobCount: store.list().length });
     } catch (err) {
       // Scheduling is non-essential — log and move on so the rest of the
@@ -792,6 +847,23 @@ export default function (pi: ExtensionAPI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
     }
+    // Resolve relative storage against the originating repository, not a nested
+    // worktree or a monorepo package. Existing session metadata always wins.
+    const common = await pi.exec?.("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: ctx.cwd, timeout: 5000 });
+    const commonPath = common?.code === 0 && !common.killed ? common.stdout.trim() : "";
+    let origin = ctx.cwd;
+    if (commonPath && basename(commonPath) === ".git") origin = dirname(commonPath);
+    else if (commonPath) {
+      // A separate Git directory identifies the repository, not its checkout.
+      // Preserve package scope for execution, but anchor relative storage at
+      // the checkout root rather than the package that launched the session.
+      const top = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: ctx.cwd, timeout: 5000 });
+      if (top.code !== 0 || top.killed || !top.stdout.trim()) {
+        throw new Error(`Cannot resolve origin repository root: ${top.stderr.trim() || "git rev-parse --show-toplevel failed"}`);
+      }
+      origin = top.stdout.trim();
+    }
+    sessionArtifacts({ ...ctx, cwd: origin });
     manager.clearCompleted(true);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
@@ -988,6 +1060,12 @@ export default function (pi: ExtensionAPI) {
           description: entry.description,
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
+          resumeWorktree: entry.worktree,
+          cwd: entry.effectiveCwd,
+          configCwd: entry.configCwd,
+          originCwd: entry.originCwd,
+          artifactRoot: entry.artifactRoot,
+          rootSessionId: entry.rootSessionId,
           isBackground: true,
         });
         // The agent may still be starting — wait, so a startup failure lands in
@@ -1293,7 +1371,7 @@ export default function (pi: ExtensionAPI) {
     // path is deterministic per agent+session, so writing an initial entry
     // would truncate the previous run's turns (see ensureOutputFile).
     if (opts.outputTranscript) {
-      existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+      existing.outputFile = createOutputFilePath(ctx.cwd, id, existing.rootSessionId ?? ctx.sessionManager.getSessionId(), existing.artifactRoot ?? sessionArtifacts(ctx).artifactRoot);
       ensureOutputFile(existing.outputFile);
     }
     // Anchor streaming past the turns already on disk, captured BEFORE the
@@ -1321,7 +1399,7 @@ export default function (pi: ExtensionAPI) {
       onStarted: () => {
         const rec = manager.getRecord(id);
         if (rec?.session && rec.outputFile) {
-          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
+          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, rec.effectiveCwd ?? ctx.cwd, transcriptAnchor);
         }
       },
     });
@@ -1352,6 +1430,9 @@ export default function (pi: ExtensionAPI) {
       type: existing.type,
       description: existing.description,
       isBackground: true,
+      effectiveCwd: record.effectiveCwd,
+      worktree: record.worktree,
+      branch: record.branch,
     });
 
     return record;
@@ -1400,6 +1481,8 @@ export default function (pi: ExtensionAPI) {
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
   // to stderr and falls back to defaults.
+  setSessionArtifactDirectory(undefined);
+  setWorktreeDirectory({ mode: "session" });
   applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
@@ -1418,6 +1501,8 @@ export default function (pi: ExtensionAPI) {
       setRememberAgents,
       setWidgetMode: setWidgetMode,
       setOutputTranscript: setOutputTranscriptDefault,
+      setSessionArtifactDirectory,
+      setWorktreeDirectory,
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
@@ -1462,11 +1547,11 @@ export default function (pi: ExtensionAPI) {
   // With no per-result note by design, the model would have every reason to go
   // on reporting a `pi-agent-*` branch that was never created.
   const isolationGuideline = isWorktreeIsolationEnabled()
-    ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
+    ? `\n- Use isolation: "worktree" without branch for a disposable detached copy; changes are preserved on a reported pi-agent-* branch before removal. With branch: "feat/x", Agent creates or reuses a retained workspace checked out on that exact local branch, with no automatic commit or removal. A missing branch starts at caller HEAD. Creation never copies caller uncommitted changes; reuse exposes the existing workspace changes. Pass branch as a tool argument, not a request to create/switch worktrees. Use repository-relative task paths; state objective, permitted edits, validation and commit policy. Do not ask parallel agents to write the same branch. A fresh call reuses files, not conversation; use resume for conversation continuity. Branch cannot combine with resume or isolation: "off", and fails when worktrees are disabled or the branch is busy.`
     : "";
 
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
-    ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
+    ? `\n- isolation: "worktree" is disposable; changes commit to a reported branch before removal. branch: "feat/x" creates/reuses a retained local-branch workspace, without auto-commit/removal. Creation copies committed files; reuse keeps changes. Pass branch as an argument; use repo-relative paths. One writer per branch; resume continues conversation, not branch reuse.`
     : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
@@ -1480,7 +1565,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls — they run concurrently.
-- Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
+- Background by default; completion notifies you. Pass run_in_background: false only when your next action depends on the result and no independent work remains. Never invent pending results; say the agent is still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
@@ -1670,7 +1755,7 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     renderResult(result, { expanded, isPartial }, theme, renderContext) {
-      const details = result.details as AgentDetails | undefined;
+      const details = result.details as ScopedAgentDetails | undefined;
       const text = result.content[0]?.type === "text" ? result.content[0].text : "";
       // Pi reports pre-execution failures (extension block, abort, argument
       // validation) as `{ content: [reason], details: {} }` with isError set —
@@ -1700,12 +1785,15 @@ Terse command-style prompts produce shallow, generic work.
       if (isPartial || details.status === "running") {
         const frame = SPINNER[details.spinnerFrame ?? 0];
         const s = stats(details);
-        return renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        const status = renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        const scope = formatWorkspace(details);
+        if (scope) status.addChild(new Text(theme.fg("muted", scope.trim()), 0, 0));
+        return status;
       }
 
       // ---- Background agent launched ----
       if (details.status === "background") {
-        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
+        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})\n${formatWorkspace(details)}`), 0, 0);
       }
 
       // ---- Completed / Steered ----
@@ -1731,6 +1819,7 @@ Terse command-style prompts produce shallow, generic work.
         } else {
           const doneText = isSteered ? "Wrapped up (turn limit)" : "Done";
           line += "\n" + theme.fg("dim", `  ⎿  ${doneText}`);
+          if (details.worktree) line += "\n" + theme.fg("muted", formatWorkspace(details).trim());
         }
         return new Text(line, 0, 0);
       }
@@ -1740,6 +1829,7 @@ Terse command-style prompts produce shallow, generic work.
         const s = stats(details);
         let line = theme.fg("dim", "■") + (s ? " " + s : "");
         line += "\n" + theme.fg("dim", "  ⎿  Stopped");
+        if (details.worktree) line += "\n" + theme.fg("muted", formatWorkspace(details).trim());
         return new Text(line, 0, 0);
       }
 
@@ -1759,6 +1849,7 @@ Terse command-style prompts produce shallow, generic work.
         line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
       }
 
+      if (details.worktree) line += "\n" + theme.fg("muted", formatWorkspace(details).trim());
       return new Text(line, 0, 0);
     },
 
@@ -1771,6 +1862,8 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
+      if (params.resume && params.branch !== undefined) return { ...textResult("Cannot combine `branch` with `resume` — resume keeps its recorded workspace."), isError: true };
+      if (params.resume && params.schedule) return { ...textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents."), isError: true };
       const rawType = params.subagent_type as SubagentType;
       // Single decision point for dispatch (#183): unknown, disabled and
       // case-ambiguous types are refused here, BEFORE anything spawns, so a
@@ -1846,7 +1939,7 @@ Terse command-style prompts produce shallow, generic work.
       const outputTranscript = customConfig?.outputTranscript ?? getOutputTranscriptDefault();
       const attachTranscript = (rec: AgentRecord | undefined, agentId: string): void => {
         if (!rec || !outputTranscript) return;
-        rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
+        rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId(), rec.artifactRoot ?? sessionArtifacts(ctx).artifactRoot);
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
       };
 
@@ -1894,6 +1987,9 @@ Terse command-style prompts produce shallow, generic work.
         subagentType,
         modelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
+        effectiveCwd: undefined as string | undefined,
+        worktree: undefined as AgentRecord["worktree"],
+        branch: resolvedConfig.branch,
       };
 
       /**
@@ -1910,7 +2006,8 @@ Terse command-style prompts produce shallow, generic work.
        * buildInvocationTags would silently drop `twin`.
        */
       const detailBaseFor = (rec: AgentRecord | undefined): typeof detailBase => {
-        if (!rec?.invocation) return detailBase;
+        if (!rec) return detailBase;
+        if (!rec.invocation) return { ...detailBase, worktree: rec.worktree, branch: rec.branch, effectiveCwd: rec.effectiveCwd };
         const type = rec.type;
         const { modelName: recModelName, tags } = buildInvocationTags(rec.invocation);
         const recModeLabel = getPromptModeLabel(type);
@@ -1921,6 +2018,9 @@ Terse command-style prompts produce shallow, generic work.
           subagentType: type,
           modelName: recModelName,
           tags: recTags.length > 0 ? recTags : undefined,
+          worktree: rec.worktree,
+          branch: rec.branch,
+          effectiveCwd: rec.effectiveCwd,
         };
       };
 
@@ -1955,10 +2055,12 @@ Terse command-style prompts produce shallow, generic work.
             max_turns: effectiveMaxTurns,
             isolated: isolated,
             isolation: isolation,
+            branch: resolvedConfig.branch,
           });
           const next = scheduler.getNextRun(job.id);
           return textResult(
             `${fallbackNote}Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
+            (resolvedConfig.branch ? `Requested branch: ${resolvedConfig.branch} (workspace pending). ` : "") +
             `Next run: ${next ?? "(unknown)"}. ` +
             `Manage via /agents → Scheduled jobs.`,
           );
@@ -2008,7 +2110,7 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(
             `Agent ${isQueued ? "queued" : "resumed"} in background.\n` +
             `Agent ID: ${id}\n` +
-            `Type: ${existing.type}\n` +
+            `Type: ${existing.type}\n` + formatWorkspace(record) +
             (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
             `\nYou will be notified when this agent completes.\n` +
@@ -2024,10 +2126,10 @@ Terse command-style prompts produce shallow, generic work.
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
+          return textResult(`Agent failed: ${record.error}\n${formatWorkspace(record)}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
         }
         return textResult(
-          record.result?.trim() || "No output.",
+          formatWorkspace(record) + (record.result?.trim() || "No output."),
           buildDetails(detailBaseFor(record), record),
         );
       }
@@ -2045,7 +2147,7 @@ Terse command-style prompts produce shallow, generic work.
           origBgOnSession(session);
           const rec = manager.getRecord(id);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, rec.effectiveCwd ?? ctx.cwd);
           }
         };
 
@@ -2063,7 +2165,8 @@ Terse command-style prompts produce shallow, generic work.
           isBackground: true,
           isolation,
           invocation: agentInvocation,
-          rootSessionId: ctx.sessionManager.getSessionId(),
+          ...sessionArtifacts(ctx),
+          branch: resolvedConfig.branch,
           ...bgCallbacks,
         });
 
@@ -2106,6 +2209,8 @@ Terse command-style prompts produce shallow, generic work.
           type: subagentType,
           description: params.description,
           isBackground: true,
+          worktree: record?.worktree,
+          branch: record?.branch,
         });
 
         const isQueued = record?.status === "queued";
@@ -2113,7 +2218,7 @@ Terse command-style prompts produce shallow, generic work.
           `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
-          `Description: ${params.description}\n` +
+          `Description: ${params.description}\n` + formatWorkspace(record) +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
@@ -2157,7 +2262,7 @@ Terse command-style prompts produce shallow, generic work.
           spinnerFrame: spinnerFrame % SPINNER.length,
         };
         onUpdate?.({
-          content: [{ type: "text", text: `${fgState.toolUses} tool uses...` }],
+          content: [{ type: "text", text: `${fgState.toolUses} tool uses...\n${formatWorkspace(fgRecord ?? { branch: resolvedConfig.branch })}` }],
           details: details as any,
         });
       };
@@ -2191,7 +2296,7 @@ Terse command-style prompts produce shallow, generic work.
         if (fgId) {
           const rec = manager.getRecord(fgId);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, rec.effectiveCwd ?? ctx.cwd);
           }
         }
       };
@@ -2217,7 +2322,8 @@ Terse command-style prompts produce shallow, generic work.
           isolation,
           invocation: agentInvocation,
           signal,
-          rootSessionId: ctx.sessionManager.getSessionId(),
+          ...sessionArtifacts(ctx),
+          branch: resolvedConfig.branch,
           // Deliberately does NOT set fgId: that drives agentActivity, the
           // widget and the `finally` cleanup below, none of which should see an
           // agent that has no session and may never get one.
@@ -2250,7 +2356,7 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+        return textResult(`${fallbackNote}Agent failed: ${record.error}\n${formatWorkspace(record)}${partialOutputSuffix(record)}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -2262,7 +2368,7 @@ Terse command-style prompts produce shallow, generic work.
       }
       return textResult(
         `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
-        (record.result?.trim() || "No output."),
+        formatWorkspace(record) + (record.result?.trim() || "No output."),
         details,
       );
     },
@@ -2352,7 +2458,7 @@ Terse command-style prompts produce shallow, generic work.
           ctx,
           manager,
           signal: task.abortController.signal,
-          rootSessionId: ctx.sessionManager.getSessionId(),
+          ...sessionArtifacts(ctx),
           workflowId: task.id,
         }),
         onProgress: entries => updateWorkflowProgressBatch(task, entries),
@@ -2525,14 +2631,12 @@ Terse command-style prompts produce shallow, generic work.
       let savedPath: string | undefined;
       let journalPath: string | undefined;
       try {
-        const dir = sessionTaskDir(ctx.cwd, ctx.sessionManager.getSessionId());
+        const dir = sessionTaskDir(ctx.cwd, ctx.sessionManager.getSessionId(), sessionArtifacts(ctx).artifactRoot);
         savedPath = join(dir, `${runId}.workflow.js`);
         writeFileSync(savedPath, resolved.script, "utf-8");
         journalPath = join(dir, `${runId}.workflow.jsonl`);
       } catch (err) {
-        savedPath = undefined;
-        journalPath = undefined;
-        console.warn(`[pi-subagents] could not persist workflow script: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(`Could not persist workflow script: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       const replay = resumeFrom !== undefined ? readJournal(resumeFrom.journalPath) : undefined;
@@ -2704,7 +2808,10 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
+    const runId = workflowRunId();
+    const dir = sessionTaskDir(ctx.cwd, ctx.sessionManager.getSessionId(), sessionArtifacts(ctx).artifactRoot);
+    writeFileSync(join(dir, `${runId}.workflow.js`), script, "utf-8");
+    const task = createWorkflowTask({ id: runId, script, scriptPath: path, meta, journalPath: join(dir, `${runId}.workflow.jsonl`) });
     workflowTasks.set(task.id, task);
     widget.update();
     fleet.update();
@@ -2788,7 +2895,7 @@ Terse command-style prompts produce shallow, generic work.
       let output =
         `Agent: ${record.id}\n` +
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
-        `Description: ${record.description}\n\n`;
+        `Description: ${record.description}\n` + formatWorkspace(record) + "\n";
 
       if (record.status === "running") {
         output += "Agent is still running. Use wait: true or check back later.";
@@ -2812,7 +2919,7 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      return textResult(output);
+      return { ...textResult(output), details: { worktree: record.worktree, branch: record.branch, effectiveCwd: record.effectiveCwd } };
     },
   }));
 
@@ -3047,7 +3154,7 @@ Terse command-style prompts produce shallow, generic work.
     const record = await selectItem(ctx.ui, "Running agents", agents, a => {
       const dn = getDisplayName(a.type);
       const dur = formatDuration(a.startedAt, a.completedAt);
-      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
+      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}${a.worktree ? ` · ${a.worktree.branch} · ${a.worktree.path} · ${a.worktree.lifecycle}` : a.branch ? ` · ${a.branch} (workspace pending)` : ""}`;
     });
     if (!record) return;
 
@@ -3062,7 +3169,8 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const { ConversationViewer, VIEWPORT_HEIGHT_PCT } = await import("./ui/conversation-viewer.js");
+    const scope = formatWorkspace(record);
+    if (scope) ctx.ui.notify(scope.trim(), "info");
     const session = record.session;
     const activity = agentActivity.get(record.id);
 
@@ -3335,6 +3443,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // cancel at all. It is also one human action that cannot fan out, which
       // is what the limit exists to bound. It still counts once started.
       bypassQueue: true,
+      ...sessionArtifacts(ctx),
     });
 
     if (record.status === "error") {
@@ -3456,6 +3565,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       rememberAgents: getRememberAgents(),
       widgetMode: getWidgetMode(),
       outputTranscript: getOutputTranscriptDefault(),
+      sessionArtifactDirectory: getSessionArtifactDirectory(),
+      worktreeDirectory: getWorktreeDirectory(),
       worktreeIsolation: isWorktreeIsolationEnabled(),
       // The user's answer, not the effective one. A stand-down for another
       // extension's workflow tool is scoped to the session it was detected in;
@@ -3494,6 +3605,19 @@ Write the file using the write tool. Only write the file, nothing else.`;
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
+    const placement = getWorktreeDirectory();
+    const binding = sessionArtifacts(ctx);
+    const artifactDirectory = getSessionArtifactDirectory();
+    const artifactDirectoryLabel = artifactDirectory === undefined || artifactDirectory === join(getAgentDir(), "sessions") ? "Default" : artifactDirectory;
+    let worktreeContainer = placement.mode === "session" ? join(binding.artifactRoot, "worktrees")
+      : placement.mode === "project" ? join(binding.originCwd, ".worktrees") : resolve(binding.originCwd, placement.path);
+    if (placement.mode === "custom") {
+      const common = await pi.exec("git", ["rev-parse", "--git-common-dir"], { cwd: binding.originCwd, timeout: 5000 });
+      if (common.code === 0 && !common.killed) {
+        const identity = realpathSync(resolve(binding.originCwd, common.stdout.trim()));
+        worktreeContainer = join(worktreeContainer, createHash("sha256").update(identity).digest("hex").slice(0, 16));
+      } else worktreeContainer += " (repository identity unavailable)";
+    }
     function buildItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
       const mcf = manager.getMaxConcurrentForeground();
@@ -3608,6 +3732,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Write each subagent's .output transcript by default. A custom agent's output_transcript frontmatter overrides this.",
           currentValue: getOutputTranscriptDefault() ? "on" : "off",
           values: ["on", "off"],
+        },
+        {
+          id: "sessionArtifactDirectory",
+          label: "Session artifact directory",
+          description: `Persistent transcripts, scripts and journals. New sessions only. Current root: ${sessionArtifacts(ctx).artifactRoot}`,
+          currentValue: artifactDirectoryLabel,
+          values: [artifactDirectoryLabel],
+        },
+        {
+          id: "worktreeDirectory",
+          label: "Worktree directory",
+          description: `Future acquisitions only; registered worktrees take precedence. Effective container: ${worktreeContainer}`,
+          currentValue: placement.mode === "custom" ? placement.path : placement.mode,
+          values: [placement.mode === "custom" ? placement.path : placement.mode],
         },
         {
           id: "worktreeIsolation",
@@ -3861,7 +3999,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
         items.length + 2,
         getSettingsListTheme(),
         (id, newValue) => {
-          applyValue(id, newValue);
+          if (id === "sessionArtifactDirectory" || id === "worktreeDirectory") done(id);
+          else applyValue(id, newValue);
         },
         () => done(undefined as undefined),
       );
@@ -3891,6 +4030,38 @@ Write the file using the write tool. Only write the file, nothing else.`;
         },
       };
     });
+
+    if (result === "sessionArtifactDirectory" || result === "worktreeDirectory") {
+      if (result === "sessionArtifactDirectory") {
+        const choice = await ctx.ui.select("Session artifact directory", ["Default", "Custom path"]);
+        if (choice === "Default") {
+          // An explicit path also overrides a custom global default; omission
+          // would restore that global value on the next load.
+          setSessionArtifactDirectory(join(getAgentDir(), "sessions"));
+          notifyApplied(ctx, "Session artifact directory reset. Applies to new sessions only.");
+        } else if (choice === "Custom path") {
+          const input = await ctx.ui.input("Artifact container (absolute or relative to origin project)", getSessionArtifactDirectory());
+          if (input?.trim()) {
+            setSessionArtifactDirectory(input);
+            notifyApplied(ctx, "Session artifact directory updated. Applies to new sessions only.");
+          }
+        }
+      } else {
+        const choice = await ctx.ui.select("Worktree directory", ["Session (default)", "Project (.worktrees)", "Custom path"]);
+        if (choice === "Session (default)" || choice === "Project (.worktrees)") {
+          setWorktreeDirectory({ mode: choice === "Session (default)" ? "session" : "project" });
+          notifyApplied(ctx, "Worktree directory updated. Applies to future acquisitions; existing worktrees are not moved.");
+        } else if (choice === "Custom path") {
+          const input = await ctx.ui.input("Worktree container (absolute or relative to origin repository)", placement.mode === "custom" ? placement.path : undefined);
+          if (input?.trim()) {
+            setWorktreeDirectory({ mode: "custom", path: input });
+            notifyApplied(ctx, "Worktree directory updated. Applies to future acquisitions; existing worktrees are not moved.");
+          }
+        }
+      }
+      await showSettings(ctx);
+      return;
+    }
 
     // If a numeric field ID was returned, prompt for typed input
     if (result && NUMERIC_IDS.has(result)) {

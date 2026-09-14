@@ -142,9 +142,15 @@ describe("the registry spawn strips internal capabilities", () => {
   it("refuses a forged transcript directory and config root", async () => {
     // rootSessionId names a directory the transcript is written into, and
     // configCwd names where agent files and memory are resolved from.
-    const { entry, id, root, runOpts } = forge({ rootSessionId: "../../elsewhere", configCwd: "/etc" });
+    const { entry, id, root, runOpts } = forge({
+      rootSessionId: "../../elsewhere", configCwd: "/etc", artifactRoot: "/etc/artifacts", originCwd: "/etc",
+      resumeWorktree: { path: "/etc" },
+    });
 
-    expect(entry.getRecord(id).rootSessionId).toBeUndefined();
+    expect(entry.getRecord(id).rootSessionId).toBe("s1");
+    expect(entry.getRecord(id).originCwd).toBe(process.cwd());
+    expect(entry.getRecord(id).artifactRoot).not.toBe("/etc/artifacts");
+    expect(runOpts().resumeWorktree).toBeUndefined();
     expect(runOpts().configCwd).toBeUndefined();
     await root.lifecycle.get("session_shutdown")?.();
   });

@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { WorktreeInfo } from "../worktree.js";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
@@ -286,6 +287,15 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     : task.status === "killed" ? "Stopped"
     : `Error: ${task.error ?? "unknown"}`;
   const result = workflowResultText(task);
+  const workspaces = new Map<string, { worktree: WorktreeInfo; cwd?: string }>();
+  for (const agent of collapse(task.workflowProgress).agents) {
+    if (agent.workspace === undefined) continue;
+    const scope = agent.workspace;
+    // Sequential calls may reuse one tree; different effective package scopes
+    // still need separate records. Never derive cwd from a guessed workPath.
+    const key = JSON.stringify([scope.commonDir, scope.path, scope.branch, agent.cwd]);
+    workspaces.set(key, { worktree: scope, ...(agent.cwd !== undefined ? { cwd: agent.cwd } : {}) });
+  }
   return [
     `<task-notification>`,
     `<task-id>${task.id}</task-id>`,
@@ -296,6 +306,7 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
       task.replayedCount > 0 ? `, ${task.replayedCount} replayed from ${escapeXml(task.resumedFrom ?? "an earlier run")}` : ""
     }</summary>`,
     `<result>${escapeXml(result.length > 4000 ? `${result.slice(0, 4000)}\n...(truncated)` : result)}</result>`,
+    workspaces.size > 0 ? `<workspaces>${escapeXml(JSON.stringify([...workspaces.values()]))}</workspaces>` : null,
     `<usage><total_tokens>${task.totalTokens}</total_tokens><tool_uses>${task.totalToolCalls}</tool_uses><duration_ms>${elapsedMs(task, now)}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join("\n");

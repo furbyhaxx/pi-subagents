@@ -330,7 +330,7 @@ describe("resume", () => {
   it("resumes a child whose gate rejected its work", async () => {
     // The loop gate exists for: run it, the tests fail, hand the child the
     // failure instead of starting over.
-    const { host, resumeCalls } = stubHost({ gate: () => ({ ok: false, output: "1 failing" }) });
+    const { host, resumeCalls, gateCalls } = stubHost({ gate: () => ({ ok: false, output: "1 failing" }) });
 
     const result = await run(
       [
@@ -343,6 +343,7 @@ describe("resume", () => {
 
     expect(result.value).toEqual([null, "resumed:still failing, try again"]);
     expect(resumeCalls).toHaveLength(1);
+    expect(gateCalls).toHaveLength(1);
   });
 
   it("names the label and lists the known ones when it does not exist", async () => {

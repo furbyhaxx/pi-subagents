@@ -137,6 +137,18 @@ describe("resolveAgentInvocationConfig", () => {
   });
 });
 
+describe("branch-scoped invocation", () => {
+  it("implies worktree isolation without changing the exact branch name", () => {
+    expect(resolveAgentInvocationConfig(undefined, { branch: "feat/x" })).toMatchObject({ branch: "feat/x", isolation: "worktree" });
+  });
+
+  it("rejects explicit, frontmatter and project-wide worktree vetoes", () => {
+    expect(() => resolveAgentInvocationConfig(undefined, { branch: "feat/x", isolation: "off" })).toThrow(/off/);
+    expect(() => resolveAgentInvocationConfig(makeConfig({ isolation: "off" }), { branch: "feat/x" })).toThrow(/frontmatter/);
+    expect(() => resolveAgentInvocationConfig(undefined, { branch: "feat/x" }, { worktreeAllowed: false })).toThrow(/disabled/);
+  });
+});
+
 describe("resolveJoinMode", () => {
   it("returns the global default for background agents", () => {
     expect(resolveJoinMode("smart", true)).toBe("smart");

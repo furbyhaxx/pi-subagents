@@ -15,10 +15,14 @@ import {
   completeWorkflowTask,
   createWorkflowTask,
   failWorkflowTask,
+  formatWorkflowNotification,
   pauseWorkflowTask,
   resumeWorkflowTask,
+  updateWorkflowProgressBatch,
   type WorkflowTask,
 } from "../src/workflow/task.js";
+import type { WorktreeInfo } from "../src/worktree.js";
+import { escapeXml } from "../src/xml.js";
 
 function stubControl(): WorkflowControl & { pause: ReturnType<typeof vi.fn> } {
   return {
@@ -89,6 +93,34 @@ describe("pausing a run", () => {
     expect(resumeWorkflowTask(task, 3_000)).toBe(true);
     expect(resumeWorkflowTask(task, 4_000)).toBe(false);
     expect(control.resume).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("completion workspace metadata", () => {
+  it("deduplicates verified scopes outside result truncation without changing the script value", () => {
+    const { task } = runningTask();
+    const workspace: WorktreeInfo = {
+      path: "/trees/feat&x", workPath: "/trees/feat&x/packages/api",
+      branch: "feat/x", baseSha: "abc123", lifecycle: "retained",
+      sourceRoot: "/repo", commonDir: "/repo/.git", reused: true, initialDirty: true,
+    };
+    const value = { summary: "x".repeat(5000) };
+    task.value = value;
+    task.status = "completed";
+    const cwd = workspace.path;
+    updateWorkflowProgressBatch(task, [
+      { type: "workflow_agent", index: 0, label: "first", state: "start", workspace, cwd },
+      { type: "workflow_agent", index: 0, label: "first", state: "done", workspace, cwd },
+      { type: "workflow_agent", index: 1, label: "reuse", state: "done", workspace, cwd },
+      { type: "workflow_agent", index: 2, label: "queued", state: "start", branch: "pending" },
+    ]);
+    const xml = formatWorkflowNotification(task);
+    const scopes = escapeXml(JSON.stringify([{ worktree: workspace, cwd }]));
+    expect(xml).toContain(`</result>\n<workspaces>${scopes}</workspaces>`);
+    expect(xml).toContain("...(truncated)");
+    expect(task.value).toBe(value);
+    expect(xml).not.toContain("pending");
+    expect(xml.match(/<workspaces>/g)).toHaveLength(1);
   });
 });
 

@@ -28,7 +28,8 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
-- **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
+- **Git worktree isolation** — disposable detached copies with automatic branch preservation, or `branch: "feat/x"` for a retained, reusable linked worktree without automatic commit or removal
+- **Persistent session artifacts** — transcripts, workflow scripts and journals under `<agent dir>/sessions/<project>/<session>/tasks/` by default, with sibling `worktrees/`; configure artifact and worktree storage independently
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
@@ -105,6 +106,7 @@ Restrictions:
 - `run_in_background: false` is refused — scheduled jobs always run in the background. Omitting it, or passing `true`, is fine.
 - Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
+- `branch` is persisted with the schedule and revalidated at fire time; overlapping writers to the same repository/branch are refused rather than queued.
 
 ## UI
 
@@ -226,13 +228,13 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
-By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled boxes:
+By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<agent dir>/sessions/<project>/<session>/tasks/<agent-id>.output` by default (owner-only directories, persistent across restart; see [storage settings](#persistent-settings)). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect worktree storage (anonymous copies preserve changes on a git branch; named worktrees retain files and index without automatic commits) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled boxes:
 
 ```
 ✓ Find auth files completed
   ↻3 · 3 tool uses · 12.4k token · 4.1s
   ⎿  Found 5 files related to authentication...
-  transcript: /tmp/pi-subagents-501/home-user-project/sess-1/tasks/agent-abc123.output
+  transcript: /home/user/.pi/agent/sessions/<project>/sess-1/tasks/agent-abc123.output
 ```
 
 Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
@@ -308,7 +310,7 @@ All fields are optional — sensible defaults for everything.
 | `skills` | `true` | `true` inherits the parent's skills; `false` inherits none. A comma-separated list preloads **only** those skills into the system prompt and does not inherit the rest (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
-| `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
+| `isolation` | — | Set to `worktree` for a disposable isolated copy, or `off` to veto worktrees (frontmatter is authoritative). A caller supplying `branch` against an `off` veto gets an error, not an unisolated run. `none`, `no`, and `false` are accepted spellings of `off` |
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
@@ -415,7 +417,8 @@ Launch a sub-agent.
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
-| `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
+| `isolation` | `"off"` \| `"worktree"` | no | Without `branch`, `worktree` creates a disposable detached copy; `off` does not. Hidden with `branch` when `worktreeIsolation: false` |
+| `branch` | string | no | Exact local Git branch, e.g. `feat/x`. Implies worktree isolation and creates or reuses a retained linked worktree. A missing branch starts at caller HEAD. No automatic commit or removal. Cannot combine with `resume` or `isolation: "off"`; fails if worktrees are disabled, vetoed, or the branch is busy |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
 
 ### `SubagentWorkflow`
@@ -428,7 +431,7 @@ Run a deterministic script that orchestrates many subagents. Returns a task id i
 | `scriptPath` | string | no | Path to a script file. Takes precedence over `script` and `name` |
 | `name` | string | no | A saved workflow — `<name>.js` in `.pi/workflows/`, `.agents/workflows/` or `<agent dir>/workflows/`, carrying an `export const meta` declaration |
 | `args` | any | no | Passed through to the script as the `args` global, verbatim |
-| `resumeFromRunId` | string | no | Replay an earlier run in this session — its unchanged leading `agent()` calls return their recorded results instead of spawning |
+| `resumeFromRunId` | string | no | Replay an earlier run's unchanged leading calls in this session. Replay stops at branch-scoped calls; journals containing child `resume` calls are not replayed |
 | `title` / `description` | string | no | Accepted and ignored, as in Claude Code — a workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`. Each invocation's script is persisted to the session directory and its path returned, so iterating means editing that file and re-running rather than resending the source. A saved workflow reports its own file instead, so the same loop works on it — project `.pi/workflows/` shadows a same-named global one. Those directories are ordinary folders that may hold other scripts, so only files carrying the `export const meta = { name, description }` declaration are listed or resolved; naming anything else reports that it is not a workflow rather than running it. The check is a regex over the source — nothing in the file is executed to make it, and even a real parse evaluates only the `meta` object literal, in an empty `node:vm` context with a 100ms bound.
@@ -452,6 +455,8 @@ return await pipeline(
   (found, file) => agent(`Try to REFUTE this finding about ${file}: ${found}`, { label: `verify:${file}` }),
 )
 ```
+
+Workflow `agent()` accepts `branch: "feat/x"` for sequential work in a retained workspace. Gates run in the child's effective cwd before cleanup or branch lease release. Resume does not inherit a gate, and explicit `resume + gate` remains invalid; re-verification needs a fresh gated call. Workspace metadata stays separate from schema-validated output; `agent()` still returns text or its validated object. Completion XML includes deduplicated authoritative `{ worktree, cwd? }` records in `<workspaces>`, outside result truncation. Branch calls end journal replay at that position because their files are mutable external state. See the [branch workflow guide](docs/workflows.md#retained-branch-workspaces).
 
 Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, independent of the session's `maxConcurrent` pool, which its agents do not enter. There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
 
@@ -631,9 +636,29 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 
 **Remember agents** (`rememberAgents`, default `true`): whether subagents persist their pi session, which is what lets [`@handle`](#agent-mentions) reopen an agent's conversation after its in-memory record has been evicted. Two visible consequences of the default: top-level subagents write a session file, and they nest under the session that spawned them in pi's `/resume`. Agents spawned by another agent are excluded — they get no handle, so nothing could reopen their transcript. A custom agent's `persist_session` frontmatter overrides this per agent, in both directions. Toggle via `/agents → Settings → Remember agents`; with it off, handles expire with their record (roughly ten minutes past completion) and `@explore` then starts a fresh agent rather than resuming — the behaviour before this setting existed.
 
-**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
+**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree storage/commits, workflow artifacts, or memory files.
 
-**Worktree isolation** (`worktreeIsolation`, default `true`): whether `isolation: "worktree"` may create a worktree at all. Toggle via `/agents → Settings → Worktree isolation`, or set `false` in `subagents.json` on a repo where a copy costs too much time or disk. Off, the `Agent` tool's `isolation` parameter is dropped from the schema entirely and the bullet describing it leaves the tool description with it — nothing to pass, and no context spent describing it — and worktrees are refused on every other path too (agent files, scheduled jobs, cross-extension RPC). The `/agents` agent-file generator stops offering the `isolation:` frontmatter field too, so a generated agent can't bake in a request that would be refused. A requested worktree is downgraded to a normal run rather than failing the call, since declining one is the point; there is deliberately no note on the result, which is exactly why the prose has to go when the parameter does. The refusal applies immediately; the parameter and its prose appear or disappear on the next pi session. See [Turning worktrees off](#turning-worktrees-off).
+**Session artifact directory** (`sessionArtifactDirectory`, omitted by default): base directory for transcripts, inline workflow scripts, journals and default worktrees. Default `join(getAgentDir(), "sessions")`; `getAgentDir()` respects `PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`. Custom paths may be absolute or relative to the origin project; relative values stay relative in settings. `/agents → Settings → Session artifact directory` offers Default and Custom path. A collision-resistant project key and root-session id separate concurrent sessions:
+
+```text
+<agent dir>/sessions/<project>/<root-session-id>/
+├── tasks/       # .output transcripts, .workflow.js scripts, .workflow.jsonl journals
+└── worktrees/   # default worktree container
+```
+
+The resolved artifact root is recorded for each root session and reused on resume. Changes apply to **new sessions only**; no live-file moves, automatic migration, expiration or cleanup on shutdown/record eviction. Old temporary files are neither migrated nor deleted. Unwritable storage is reported, never silently replaced with `/tmp`; extension-owned directories remain owner-only. This storage survives ordinary restart/reboot, unless you explicitly choose temporary or externally managed storage. Persistence does **not** restart interrupted agents, reconstruct old agent/workflow handles, or enable cross-session workflow replay. It is separate from pi's own session JSONL location: `session_dir` and `PI_CODING_AGENT_SESSION_DIR` do not redirect extension artifacts.
+
+**Worktree directory** (`worktreeDirectory`, default `{ "mode": "session" }`): independently chooses the worktree container. `/agents → Settings → Worktree directory` offers Session, Project (.worktrees), and Custom path and shows the effective absolute container; cancelling preserves the previous value.
+
+| Value | Container |
+|---|---|
+| `{ "mode": "session" }` | `<session-artifact-root>/worktrees/`, sibling to `tasks/` |
+| `{ "mode": "project" }` | `<origin-repository-root>/.worktrees/` |
+| `{ "mode": "custom", "path": "..." }` | Absolute path, or relative to the origin repository root — never a nested child's worktree |
+
+The entire object is one setting: project overrides global atomically. Relative custom paths are saved as entered. Shared custom containers are namespaced by repository identity; safe hashed names avoid branch-path collisions. Changes apply to future acquisitions, never migrate existing worktrees, and registered branch paths take precedence over placement. A container inside the repository **must already be ignored**. Otherwise acquisition fails with an actionable error; add a local rule to the common repository's `info/exclude` (for project mode, `/.worktrees/`) and retry. The extension never edits tracked `.gitignore` for you.
+
+**Worktree isolation** (`worktreeIsolation`, default `true`): enables disposable isolation and retained branch workspaces. Off, the `Agent` tool's `isolation` and `branch` fields and their descriptions disappear together on the next pi session; runtime enforcement applies immediately, including workflow, nested, scheduled and RPC paths. Existing anonymous requests keep their downgrade-to-normal-run behavior without a note. Explicit `branch` requests instead **fail** when disabled or vetoed; they never silently run in the parent checkout. The agent-file generator also stops offering `isolation:`. See [Turning worktrees off](#turning-worktrees-off).
 
 **Report usage to session** (`reportUsage`, default `false`): whether subagent spend is added to *this* session's own totals. Subagents run in their own pi sessions, so by default pi's footer, statusline and `/cost` count only what the main model spent — a session that delegated most of its work reads as nearly free. Turn it on and each `Agent` / `get_subagent_result` / `steer_subagent` result carries the spend accumulated since the last one, which pi folds into `getSessionStats()`; `/cost` attributes it to the **Tools/summaries** bucket. Toggle via `/agents → Settings → Report usage to session`; applied live.
 
@@ -778,7 +803,7 @@ pi.events.emit("subagents:rpc:ping", { requestId });
 
 ### Spawn
 
-Spawn a subagent and receive its ID:
+Spawn a subagent and receive `{ id, worktree?, cwd?, branch?, workspacePending? }` in the reply's `data`. Non-worktree replies remain `{ id }`. Workspace fields are authoritative only once acquired; queued requests report branch and `workspacePending: true`, not an invented path:
 
 ```typescript
 const requestId = crypto.randomUUID();
@@ -802,7 +827,9 @@ pi.events.emit("subagents:rpc:spawn", {
 
 `options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context. Resolution is fuzzy, so a bare `"sonnet"` can land on a provider you never named: with [Model Scope](#model-scope) on, an override that resolves outside `enabledModels` is refused with an error envelope listing the allowed models, exactly as a caller-supplied `Agent({ model })` is. `null` means unset — the agent inherits, same as omitting the field.
 
-`options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. On session end, worktree registrations are pruned in every repo that received one; only a hard crash can leave a stale entry (then: `git worktree prune` in the target repo). Agents with `memory:` keep reading/writing the parent project's memory.
+`options.branch` has the same retained-workspace contract as the `Agent` tool: exact local name, implied isolation, no auto-commit/removal, busy-branch refusal. The extension supplies the root-session artifact and origin anchors; RPC callers cannot retarget those internal fields. Resolved workspace metadata is separate from result prose; a queued spawn may only know the requested branch, not its eventual path.
+
+`options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. With `branch`, the same subdirectory mapping applies, but the actual linked worktree, branch, index and files remain after settlement and shutdown. Missing or stale registrations fail with an actionable error rather than being forced or silently recreated. Agents with `memory:` keep reading/writing the parent project's memory.
 
 ### Stop
 
@@ -853,7 +880,7 @@ The `disallowed_tools` field is respected when determining write capability — 
 
 ## Worktree Isolation
 
-Set `isolation: worktree` to run an agent in a temporary git worktree:
+Set `isolation: worktree` without `branch` to run an agent in a disposable detached git worktree:
 
 ```
 Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
@@ -861,7 +888,7 @@ Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
 
 The agent gets a full, isolated copy of the repository. The worktree directory is removed on completion either way — what differs is whether a branch is left behind:
 - **No changes:** worktree is cleaned up automatically, no branch
-- **Changes made:** changes are committed to a new branch (`pi-agent-<id>`), and the result names the branch and the `git merge` command for it. The branch is the only artifact — the worktree path is gone, so nothing points into it
+- **Changes made:** changes are committed to a new branch (`pi-agent-<id>`), and the result names the branch and the `git merge` command for it. The worktree path is gone; the preservation branch and session artifacts remain
 - **Agent committed its own work:** the branch is created at the agent's HEAD, preserving its commits (uncommitted leftovers are committed on top first)
 
 The agent's system prompt names the worktree as an isolated copy and tells it to work only there, even if other instructions name the main checkout — otherwise an inherited parent prompt or a task prompt mentioning the project path walks it straight back out of the copy. This is a directive, not a sandbox: an agent with shell access can still `cd` out, so don't rely on `isolation` alone to protect the main checkout.
@@ -870,17 +897,38 @@ The automatic preservation commit uses `--no-verify`, so local pre-commit hooks 
 
 If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` call fails with a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
 
-A worktree is a *copy*, so the agent cannot see uncommitted or staged changes in the main checkout. Never use it to review a working-tree or staged diff: the agent finds an empty `git diff` and reports nothing wrong.
+A newly created worktree does not copy uncommitted or staged changes from the caller. Never use a fresh copy to review the caller's working-tree or staged diff: the agent sees committed files, not that diff. Reusing a named worktree, below, does expose **that worktree's** existing changes.
+
+### Retained branch workspaces
+
+```js
+Agent({
+  subagent_type: "general-purpose",
+  description: "Implement feature X",
+  branch: "feat/x",
+  prompt: "Implement src/x.ts. Run npm test. Do not commit.",
+})
+```
+
+`branch` implies `isolation: "worktree"` and names an exact local branch, validated by Git — not a tag, revision shortcut or arbitrary commit-ish. A missing branch starts at the caller's resolved HEAD. An existing local branch without a worktree gets a copy at its tip. A branch already checked out in a linked worktree reuses its registered path even outside the configured container, preserving staged, unstaged and untracked files. There is no fetch or remote-branch guessing. Main/orchestrating-checkout reuse is refused, and stale, inaccessible, missing or conflicting registrations fail without `--force` or resetting branches.
+
+Named worktrees are **retained** on success, failure, cancellation and shutdown. The extension never automatically commits, merges, resets, stashes, cleans or removes them. A fresh call on the same branch reuses files, not conversation; `resume` continues the original conversation and recorded scope and cannot be combined with `branch`. Resume reacquires the repository/branch lease and validates path, repository and checked-out branch; it refuses a missing or changed scope rather than falling back to the parent directory.
+
+One extension-managed writer holds a cross-process repository/branch lease through execution and any workflow gate. Contention fails fast: steer/resume the owning agent or use another branch. Nested children inheriting cwd intentionally share their parent's workspace; explicitly reacquiring that same branch does not bypass the lease. Human processes are outside this guard.
+
+Named execution keeps configuration discovery anchored to the initiating project, not the branch's `.pi` extensions, and preserves monorepo subdirectory scope (missing target subdirectories fail). Runtime context reports actual cwd, checked-out branch, reuse, initial dirty state and retention after inherited/custom instructions. Use repository-relative task paths, pass `branch` as an argument rather than asking the child to switch worktrees, and state permitted edits, validation and commit policy. Preserve pre-existing work. This is workspace discipline, not a shell sandbox; configured memory/artifact locations retain their semantics.
+
+Results carry authoritative workspace metadata separately from truncated prose: actual branch, worktree path, effective cwd, created/reused and retained status. Queued calls report requested branch and workspace pending, never an invented path. Named completions say edits remain in the worktree, not to merge a generated branch. Workflow schema output stays separate from workspace metadata. See [storage settings](#persistent-settings) for placement.
 
 ### Turning worktrees off
 
 Three levers, from narrowest to broadest:
 
-- **Per call** — omit `isolation`, or pass `isolation: "off"`. The explicit value exists because some models fill every optional parameter they are offered; with `worktree` as the only legal value they had no way to decline one (#231, #184).
-- **Per agent** — `isolation: off` in an agent file. Frontmatter is authoritative, so this refuses a worktree even when the caller passes `isolation: "worktree"` — the only way to override a caller.
-- **Per project** — `"worktreeIsolation": false` in `subagents.json`. The `Agent` tool's `isolation` parameter disappears from the schema entirely, along with the usage-note bullet that describes it (so it costs the model no context and cannot be passed), and worktree creation is refused on every other path too: agent files, scheduled jobs, and cross-extension RPC. The `/agents` generator also stops offering `isolation:` when writing a new agent file. Use it on a repo large enough that a copy costs real time and disk. The schema and the description are both built at tool registration, so they appear or disappear in the next pi session; the refusal itself takes effect immediately.
+- **Per call** — omit both `isolation` and `branch`, or pass `isolation: "off"` without `branch`. The explicit value exists because some models fill every optional parameter they are offered; with `worktree` as the only legal value they had no way to decline one (#231, #184).
+- **Per agent** — `isolation: off` in an agent file vetoes worktrees. Anonymous requests follow existing precedence; an explicit `branch` request fails rather than running unisolated.
+- **Per project** — `"worktreeIsolation": false` in `subagents.json`. The `Agent` tool's `isolation` and `branch` parameters disappear from the schema together, along with their usage-note bullet (so it costs the model no context and cannot be passed), and worktree creation is refused on every other path too: agent files, scheduled jobs, and cross-extension RPC. The `/agents` generator also stops offering `isolation:` when writing a new agent file. Use it on a repo large enough that a copy costs real time and disk. The schema and the description are both built at tool registration, so they appear or disappear in the next pi session; the refusal itself takes effect immediately.
 
-  Schema and prose are gated together on purpose. Leaving the bullet in would teach the model to pass a field that is no longer declared — accepted silently, then dropped — and since a refused worktree carries no note on the result, the model would have every reason to go on reporting a `pi-agent-*` branch that was never created. A custom tool description should use the `{{isolationGuideline}}` placeholder rather than hardcoding the bullet, for the same reason.
+  Schema and prose are gated together on purpose. Anonymous requests retain their silent downgrade behavior; explicit branch requests fail at runtime, including after live settings changes. A custom tool description should use the `{{isolationGuideline}}` placeholder rather than hardcoding the bullet, for the same reason.
 
 ## Skill Preloading
 

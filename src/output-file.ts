@@ -5,10 +5,40 @@
  * matching Claude Code's task output file format.
  */
 
+import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { type AgentSession, type AgentSessionEvent, getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { WorktreeDirectory } from "./worktree.js";
+
+let sessionArtifactDirectory: string | undefined;
+let worktreeDirectory: WorktreeDirectory = { mode: "session" };
+
+export function getSessionArtifactDirectory(): string | undefined { return sessionArtifactDirectory; }
+export function setSessionArtifactDirectory(path: string | undefined): void { sessionArtifactDirectory = path; }
+export function getWorktreeDirectory(): WorktreeDirectory { return { ...worktreeDirectory }; }
+export function setWorktreeDirectory(value: WorktreeDirectory): void { worktreeDirectory = { ...value }; }
+
+/** Create extension-owned directories without relaxing their permissions. */
+function privateDirectory(path: string): string {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  try { chmodSync(path, 0o700); } catch (err) {
+    if (process.platform !== "win32") throw err;
+  }
+  return path;
+}
+
+/** Resolve durable storage from the origin project, independently of transcripts. */
+export function sessionArtifactRoot(cwd: string, sessionId: string): string {
+  if (!sessionId || sessionId === "." || sessionId === ".." || /[/\\\\]/.test(sessionId)) {
+    throw new Error("Invalid root session id for artifact storage");
+  }
+  const origin = resolve(cwd);
+  const project = `${basename(origin).replace(/[^a-zA-Z0-9_-]/g, "-") || "project"}-${createHash("sha256").update(origin).digest("hex").slice(0, 16)}`;
+  const container = sessionArtifactDirectory === undefined
+    ? join(getAgentDir(), "sessions") : resolve(origin, sessionArtifactDirectory);
+  return privateDirectory(join(privateDirectory(join(container, project)), sessionId));
+}
 
 /**
  * Project/global default for writing a subagent's `.output` transcript; a custom
@@ -37,32 +67,15 @@ export function encodeCwd(cwd: string): string {
     .replace(/^-+/, "");           // strip leading dashes (POSIX root, UNC)
 }
 
-/**
- * The per-session scratch directory, created if missing.
- * Mirrors Claude Code's layout: /tmp/{prefix}-{uid}/{encoded-cwd}/{sessionId}/tasks
- *
- * Shared with the workflow tool, which persists each invocation's script here so
- * iterating on one is edit-file-then-rerun — the same convention, one directory.
- */
-export function sessionTaskDir(cwd: string, sessionId: string): string {
-  const encoded = encodeCwd(cwd);
-  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  // chmod is a no-op on Windows and throws on some Windows filesystems.
-  // On Unix we still want to enforce 0o700 past umask, so only swallow on Windows.
-  try {
-    chmodSync(root, 0o700);
-  } catch (err) {
-    if (process.platform !== "win32") throw err;
-  }
-  const dir = join(root, encoded, sessionId, "tasks");
-  mkdirSync(dir, { recursive: true });
-  return dir;
+/** Shared persistent directory for transcripts, workflow scripts and journals. */
+export function sessionTaskDir(cwd: string, sessionId: string, artifactRoot?: string): string {
+  if (artifactRoot !== undefined && !isAbsolute(artifactRoot)) throw new Error("Artifact root must be absolute");
+  return privateDirectory(join(artifactRoot ? privateDirectory(artifactRoot) : sessionArtifactRoot(cwd, sessionId), "tasks"));
 }
 
 /** Create the output file path, ensuring the directory exists. */
-export function createOutputFilePath(cwd: string, agentId: string, sessionId: string): string {
-  return join(sessionTaskDir(cwd, sessionId), `${agentId}.output`);
+export function createOutputFilePath(cwd: string, agentId: string, sessionId: string, artifactRoot?: string): string {
+  return join(sessionTaskDir(cwd, sessionId, artifactRoot), `${agentId}.output`);
 }
 
 /**
@@ -75,9 +88,7 @@ export function createOutputFilePath(cwd: string, agentId: string, sessionId: st
  * when this is the agent's first transcript and is a no-op when it is not.
  */
 export function ensureOutputFile(path: string): void {
-  try {
-    appendFileSync(path, "", "utf-8");
-  } catch { /* ignore — streaming writes are best-effort too */ }
+  appendFileSync(path, "", "utf-8");
 }
 
 /** Write the initial user prompt entry. */

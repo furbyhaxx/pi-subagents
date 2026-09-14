@@ -23,7 +23,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
 import { runPrintMode, toolCallsNamed, toolResultsNamed } from "../helpers/print-mode-runner.js";
 
@@ -38,7 +37,7 @@ import { runPrintMode, toolCallsNamed, toolResultsNamed } from "../helpers/print
 function workflowProject(): string {
   const dir = mkdtempSync(join(tmpdir(), "subagents-wf-e2e-"));
   mkdirSync(join(dir, ".pi"), { recursive: true });
-  writeFileSync(join(dir, ".pi", "subagents.json"), JSON.stringify({ workflowsEnabled: true }));
+  writeFileSync(join(dir, ".pi", "subagents.json"), JSON.stringify({ workflowsEnabled: true, sessionArtifactDirectory: "artifacts" }));
   return dir;
 }
 
@@ -48,20 +47,14 @@ const workflowCall = (script: string, id = "wf-call-1") =>
 
 /**
  * Every workflow journal written for `cwd`, across whatever session id the run
- * ended up with. The path is derived the same way `sessionTaskDir` derives it.
+ * ended up with, under the project's configured artifact container.
  */
 function journalsFor(cwd: string): string[] {
-  const root = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
+  const root = join(cwd, "artifacts");
   if (!existsSync(root)) return [];
-  const found: string[] = [];
-  for (const session of readdirSync(root)) {
-    const tasks = join(root, session, "tasks");
-    if (!existsSync(tasks)) continue;
-    for (const file of readdirSync(tasks)) {
-      if (file.endsWith(".workflow.jsonl")) found.push(join(tasks, file));
-    }
-  }
-  return found;
+  return readdirSync(root, { recursive: true, encoding: "utf8" })
+    .filter(file => file.endsWith(".workflow.jsonl"))
+    .map(file => join(root, file));
 }
 
 /** Everything the faux backend was ever asked, flattened for substring checks. */

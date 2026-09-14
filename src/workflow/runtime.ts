@@ -15,6 +15,7 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import type { WorktreeInfo } from "../worktree.js";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
@@ -67,6 +68,7 @@ export interface WorkflowSpawnRequest {
    */
   effort?: string;
   isolation?: "worktree";
+  branch?: string;
   /**
    * Called by the host once the child's EFFECTIVE configuration is known —
    * which is when its session exists, not when the spawn resolves.
@@ -91,6 +93,8 @@ export interface WorkflowSpawnRequest {
      * never got a model is exactly the one worth opening.
      */
     recordId?: string;
+    workspace?: WorktreeInfo;
+    cwd?: string;
     modelName?: string;
     modelId?: string;
     thinking?: string;
@@ -122,6 +126,8 @@ export interface WorkflowSpawnRequest {
 
 export interface WorkflowSpawnResult {
   ok: boolean;
+  /** Verified workspace scope, separate from schema-validated child output. */
+  workspace?: WorktreeInfo;
   /** The agent's answer. Present when `ok`. */
   text?: string;
   /** Why it failed. Present when not `ok`. */
@@ -147,9 +153,9 @@ export interface WorkflowSpawnResult {
    * verifies the wrong working copy. Left unset, a gate runs wherever the host
    * runs commands by default.
    *
-   * Usually unset for a worktree child even so: the copy is removed during the
-   * child's own settle, so it no longer exists by the time this is read. That
-   * is what {@link gate} is for.
+   * A disposable copy may already be removed during the child's own settle.
+   * Its cwd still describes where it ran, not a promise the directory exists.
+   * Gates must run before cleanup and return their verdict through {@link gate}.
    */
   cwd?: string;
   /**
@@ -434,6 +440,7 @@ interface AgentCallPayload {
   model?: string;
   agentType?: string;
   isolation?: "worktree";
+  branch?: string;
   phaseIndex?: number;
   phaseTitle?: string;
   /** Shell command that has to pass before the agent counts as done. */
@@ -477,6 +484,8 @@ interface CompletedChild {
   agentType: string;
   model?: string;
   isolation?: "worktree";
+  branch?: string;
+  workspace?: WorktreeInfo;
 }
 
 /**
@@ -852,6 +861,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       const agentType = resumed?.agentType ?? payload.agentType ?? "general-purpose";
       const model = resumed !== undefined ? resumed.model : payload.model;
       const isolation = resumed !== undefined ? resumed.isolation : payload.isolation;
+      const branch = resumed !== undefined ? resumed.branch : payload.branch;
       openLaunches.set(callId, label);
 
       const base: WorkflowAgentEntry = {
@@ -864,6 +874,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         promptPreview: preview(payload.prompt),
         ...(model !== undefined ? { model } : {}),
         ...(isolation !== undefined ? { isolation } : {}),
+        ...(branch !== undefined ? { branch } : {}),
         ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
         ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
       };
@@ -881,6 +892,9 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         ...payload,
         schema: payload.schema !== undefined ? JSON.stringify(payload.schema) : undefined,
       };
+      // A named workspace is mutable external state, not a cacheable output.
+      // Stop AT this call (and at continuations of branch-scoped children).
+      if (branch !== undefined || resumed?.workspace?.lifecycle === "retained") prefixIntact = false;
       let replayed = replayAt(index, journalKey(keyInput));
       // A replayed answer still has to satisfy the schema. The key covers a
       // schema that *changed*, but not a journal that was hand-edited, and not
@@ -987,15 +1001,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           // without knowing they were ever corrected. Re-emitting under the
           // same `index` is what the append-only, last-write-wins progress log
           // is for — the row updates in place while the agent is still running.
-          const onResolved = (info: {
-            recordId?: string;
-            modelName?: string;
-            modelId?: string;
-            thinking?: string;
-            requestedThinking?: string;
-            requestedModel?: string;
-          }) => {
+          const onResolved: NonNullable<WorkflowSpawnRequest["onResolved"]> = info => {
             if (info.recordId !== undefined) base.recordId = info.recordId;
+            if (info.workspace !== undefined) base.workspace = info.workspace;
+            if (info.cwd !== undefined) base.cwd = info.cwd;
             if (info.modelName !== undefined) base.model = info.modelName;
             if (info.modelId !== undefined) base.modelId = info.modelId;
             if (info.thinking !== undefined) base.thinking = info.thinking;
@@ -1027,6 +1036,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     ...(payload.effort !== undefined ? { effort: payload.effort } : {}),
                     ...(compiledSchema !== undefined ? { schema: compiledSchema } : {}),
                     ...(isolation !== undefined ? { isolation } : {}),
+                    ...(branch !== undefined ? { branch } : {}),
                     ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
                     ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
                     // Offered, not delegated: a host that can run it inside the
@@ -1044,6 +1054,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                 agentType,
                 ...(model !== undefined ? { model } : {}),
                 ...(isolation !== undefined ? { isolation } : {}),
+                ...(branch !== undefined ? { branch } : {}),
+                ...(result.workspace !== undefined ? { workspace: result.workspace } : {}),
               });
               // Re-checked here, not just in the child's tool: this is the one
               // place that decides the script's value matches the schema it
@@ -1092,6 +1104,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             ...attemptMark,
             lastProgressAt: finishedAt,
             durationMs: finishedAt - startedAt,
+            ...(result.workspace !== undefined ? { workspace: result.workspace } : {}),
+            ...(result.cwd !== undefined ? { cwd: result.cwd } : {}),
             ...(result.tokens !== undefined ? { tokens: result.tokens } : {}),
             ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls } : {}),
           };

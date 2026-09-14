@@ -23,7 +23,6 @@ import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
-import { encodeCwd } from "../src/output-file.js";
 import {
   agentCall,
   type FauxReply,
@@ -182,8 +181,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
     const cwd = mkdtempSync(join(tmpdir(), "nested-e2e-bg-"));
     tmpDirs.push(cwd);
     writeAgents(cwd);
-    const transcriptRoot = join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encodeCwd(cwd));
-    rmSync(transcriptRoot, { recursive: true, force: true });
+    let transcriptRoot: string | undefined;
 
     const respond = (context: Context): FauxReply => {
       const text = firstUserText(context);
@@ -249,7 +247,16 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       // prompt that agent was given. Searching the whole file would also match the
       // orchestrator's, which records the same string inside its Agent tool-call
       // arguments, and would pass with nested transcripts switched off entirely.
-      const transcripts = findOutputFiles(transcriptRoot).map((f) => readFileSync(f, "utf-8"));
+      const binding = run.parentSession.sessionManager.getEntries().find(
+        entry => entry.type === "custom" && entry.customType === "subagents:artifacts",
+      );
+      expect(binding?.type).toBe("custom");
+      const data = binding?.type === "custom" ? binding.data as { artifactRoot: string; rootSessionId: string } : undefined;
+      expect(data?.rootSessionId).toBe(run.parentSession.sessionManager.getSessionId());
+      transcriptRoot = data!.artifactRoot;
+      const files = findOutputFiles(transcriptRoot);
+      expect(files.every(file => file.startsWith(join(transcriptRoot!, "tasks")))).toBe(true);
+      const transcripts = files.map((f) => readFileSync(f, "utf-8"));
       const workerTranscript = transcripts.find((t) => {
         const first = JSON.parse(t.split("\n")[0]) as { message?: { content?: unknown } };
         return first.message?.content === "Do the leaf work.";
@@ -258,7 +265,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
       // ...and it streamed the child's own turn, not just the seeded prompt.
       expect(workerTranscript).toContain(WORKER_MARKER);
     } finally {
-      rmSync(transcriptRoot, { recursive: true, force: true });
+      if (transcriptRoot) rmSync(transcriptRoot, { recursive: true, force: true });
     }
   });
 });

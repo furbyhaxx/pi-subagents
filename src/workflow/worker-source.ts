@@ -327,6 +327,7 @@ const AGENT_OPTIONS = [
   "model",
   "agentType",
   "isolation",
+  "branch",
   "gate",
   "resume",
   "effort",
@@ -460,6 +461,7 @@ async function agentIn(scope, prompt, opts) {
   const phaseName = optionalText(options.phase, "agent() opts.phase");
   const model = optionalText(options.model, "agent() opts.model");
   const agentType = optionalText(options.agentType, "agent() opts.agentType");
+  const branch = options.branch === undefined ? undefined : requireText(options.branch, "agent() opts.branch");
   const isolation = optionalText(options.isolation, "agent() opts.isolation");
   if (isolation !== undefined && isolation !== "worktree") {
     throw new Error("agent() opts.isolation must be \\"worktree\\".");
@@ -486,6 +488,9 @@ async function agentIn(scope, prompt, opts) {
   // keeps the agent, model and tool contract it was started with. Rejecting is
   // the point: silently ignoring these opts would look like they applied.
   if (resume !== undefined) {
+    if (branch !== undefined) {
+      throw new Error("agent() opts.resume and opts.branch are mutually exclusive: a resumed agent keeps its recorded workspace.");
+    }
     if (agentType !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.agentType are mutually exclusive: a resumed agent keeps the agent type it was started with."
@@ -529,6 +534,7 @@ async function agentIn(scope, prompt, opts) {
     model: model,
     agentType: agentType,
     isolation: isolation,
+    branch: branch,
     phaseIndex: phaseIndex,
     phaseTitle: phaseTitle,
     gate: gate,

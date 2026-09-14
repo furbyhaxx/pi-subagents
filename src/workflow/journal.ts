@@ -21,6 +21,9 @@
  * a run that died at agent 5 exists to retry agent 5, so the prefix ends there
  * and 5 onwards run live — the alternative would make a failure permanent.
  *
+ * Named branch calls end replay at their position: the branch is mutable
+ * external state, so an unchanged call cannot prove its cached result is valid.
+ *
  * ## Runs that use `agent({ resume })`
  *
  * Those are not replayed at all. A replayed agent is text from a file, not a
@@ -83,6 +86,7 @@ export interface JournalKeyInput {
   agentType?: string;
   effort?: string;
   isolation?: string;
+  branch?: string;
   gate?: string;
   resume?: string;
   /** Serialized `agent({ schema })`, when the call asked for one. */
@@ -106,6 +110,7 @@ export function journalKey(input: JournalKeyInput): string {
     // call keys exactly as it always did, and adding or changing a schema still
     // produces a different key.
     ...(input.schema !== undefined ? [input.schema] : []),
+    ...(input.branch !== undefined ? [{ branch: input.branch }] : []),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }

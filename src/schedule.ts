@@ -20,10 +20,12 @@ import { Cron } from "croner";
 import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
-import { resolveSpawnType } from "./agent-types.js";
+import { getAgentConfig, resolveSpawnType } from "./agent-types.js";
+import { resolveBranch } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+import { isWorktreeIsolationEnabled } from "./worktree.js";
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -45,6 +47,7 @@ export interface NewJobInput {
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
+  branch?: string;
 }
 
 export class SubagentScheduler {
@@ -54,13 +57,21 @@ export class SubagentScheduler {
   private pi: ExtensionAPI | undefined;
   private ctx: ExtensionContext | undefined;
   private manager: AgentManager | undefined;
+  private scope?: { artifactRoot?: string; originCwd?: string; rootSessionId?: string };
 
   /** Start the scheduler: bind to a session's store and arm enabled jobs. */
-  start(pi: ExtensionAPI, ctx: ExtensionContext, manager: AgentManager, store: ScheduleStore): void {
+  start(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    manager: AgentManager,
+    store: ScheduleStore,
+    scope?: { artifactRoot?: string; originCwd?: string; rootSessionId?: string },
+  ): void {
     this.pi = pi;
     this.ctx = ctx;
     this.manager = manager;
     this.store = store;
+    this.scope = scope;
 
     for (const job of store.list()) {
       if (job.enabled) this.scheduleJob(job);
@@ -77,6 +88,7 @@ export class SubagentScheduler {
     this.pi = undefined;
     this.ctx = undefined;
     this.manager = undefined;
+    this.scope = undefined;
   }
 
   /** True if start() has bound a store and the scheduler is active. */
@@ -93,6 +105,7 @@ export class SubagentScheduler {
    * format and tags `scheduleType`. Throws on invalid input.
    */
   buildJob(input: NewJobInput): ScheduledSubagent {
+    const branch = resolveBranch(input.branch, input.isolation, getAgentConfig(input.subagent_type)?.isolation, isWorktreeIsolationEnabled());
     const detected = SubagentScheduler.detectSchedule(input.schedule);
     return {
       id: nanoid(10),
@@ -108,6 +121,7 @@ export class SubagentScheduler {
       max_turns: input.max_turns,
       isolated: input.isolated,
       isolation: input.isolation,
+      branch,
       enabled: true,
       createdAt: new Date().toISOString(),
       runCount: 0,
@@ -249,6 +263,7 @@ export class SubagentScheduler {
       const dispatch = resolveSpawnType(job.subagent_type);
       if (!dispatch.ok) throw new Error(dispatch.message);
       agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
+        ...this.scope,
         description: job.description,
         isBackground: true,
         bypassQueue: true,
@@ -257,6 +272,7 @@ export class SubagentScheduler {
         isolated: job.isolated,
         thinkingLevel: job.thinking,
         isolation: job.isolation,
+        branch: job.branch,
         // A scheduled run has no tool call to build this, so without it the
         // conversation viewer shows nothing about how the job was configured.
         // The model is left out on purpose: agent-manager fills in the effective
@@ -270,6 +286,7 @@ export class SubagentScheduler {
           isolated: job.isolated,
           runInBackground: true,
           isolation: job.isolation,
+          branch: job.branch,
         },
       });
     } catch (err) {

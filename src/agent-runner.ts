@@ -24,12 +24,13 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { buildAgentPrompt, buildWorktreeScope, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
+import type { WorktreeInfo } from "./worktree.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -438,6 +439,8 @@ export interface RunOptions {
    * instead of following the inherited parent prompt back to the main tree.
    */
   worktreeBase?: string;
+  /** Verified workspace metadata, also provided on resumed turns. */
+  worktree?: WorktreeInfo;
   /**
    * Where .pi config is discovered (project extensions, skills, pi settings,
    * agent memory). Default: same as the working directory. The manager sets
@@ -630,6 +633,7 @@ export async function runAgent(
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
+  if (options.worktree) extras.worktree = options.worktree;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
   // Resolve extensions/skills: isolated overrides to false
@@ -1105,11 +1109,16 @@ export async function runAgent(
     }
   }
 
+  if (options.worktree) {
+    effectivePrompt = `${effectivePrompt}\n\n${buildWorktreeScope(options.worktree, effectiveCwd)}`;
+  }
+
   // Boundary for the history fallback: only assistant text produced from here
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
+    if (options.signal?.aborted) throw new Error("Agent stopped before execution.");
     await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
@@ -1155,6 +1164,8 @@ export async function resumeAgent(
   session: AgentSession,
   prompt: string,
   options: {
+    worktree?: WorktreeInfo;
+    cwd?: string;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
@@ -1189,7 +1200,11 @@ export async function resumeAgent(
     : () => {};
 
   try {
-    await session.prompt(prompt);
+    if (options.signal?.aborted) throw new Error("Agent stopped before resume.");
+    const scopedPrompt = options.worktree
+      ? `${prompt}\n\n${buildWorktreeScope(options.worktree, options.cwd ?? options.worktree.workPath)}`
+      : prompt;
+    await session.prompt(scopedPrompt);
   } finally {
     collector.unsubscribe();
     unsubEvents();
