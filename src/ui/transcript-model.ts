@@ -109,6 +109,16 @@ function firstLine(text: string, max = TARGET_MAX): string | undefined {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+function formatAssistantError(text: string): string {
+  const jsonStart = text.search(/\{|\[/);
+  if (jsonStart < 0) return text;
+  try {
+    return text.slice(0, jsonStart) + JSON.stringify(JSON.parse(text.slice(jsonStart)), null, 2);
+  } catch {
+    return text;
+  }
+}
+
 function stableStringify(value: unknown): string {
   if (value === undefined) return "";
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -526,12 +536,15 @@ export class TranscriptModel {
           calls.set(part.id, step);
           push(step);
         }
-        if (message.errorMessage) push({
-          key: `${source.id}:error`, sourceId: source.id, sourceRevision: source.revision,
-          kind: "error", at: message.timestamp, label: "assistant error", target: firstLine(message.errorMessage),
-          outcome: "error", isError: true, body: message.errorMessage,
-          bodySections: [{ label: "Text", text: message.errorMessage, markdown: false }],
-        });
+        if (message.errorMessage) {
+          const body = formatAssistantError(message.errorMessage);
+          push({
+            key: `${source.id}:error`, sourceId: source.id, sourceRevision: source.revision,
+            kind: "error", at: message.timestamp, label: "assistant error", target: firstLine(message.errorMessage),
+            outcome: "error", isError: true, body,
+            bodySections: [{ label: "Text", text: body, markdown: false }],
+          });
+        }
       } else if (message.role === "toolResult" && !knownCallIds.has(message.toolCallId)) {
         const text = textContent(message.content);
         push({

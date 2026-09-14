@@ -270,6 +270,12 @@ export interface AgentRecord {
   /** Restored from a persisted child session for transcript viewing only. */
   restoredSession?: boolean;
   /**
+   * Parent session had no terminal `subagents:record` for this child, so it was
+   * still active (or interrupted) when the parent exited. Eligible for the
+   * above-editor widget; FleetView still excludes every restored session.
+   */
+  restoredInterrupted?: boolean;
+  /**
    * Whether this agent was spawned to run in the background. Tri-state, set at
    * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =
    * foreground (has an inline Agent tool-result surface), `undefined` = the

@@ -70,6 +70,65 @@ function viewer(messages: any[], options: { rows?: number; rec?: AgentRecord & {
 }
 
 describe("approved transcript interactions", () => {
+  it("shows local step timestamps with seconds while preserving the narrow layout", () => {
+    const at = new Date(2025, 4, 6, 7, 8, 9).getTime();
+    const { component } = viewer([assistant([{ type: "text", text: "timestamped note" }], at)]);
+
+    expect(component.render(80).join("\n")).toContain("07:08:09");
+    expect(component.render(55).join("\n")).not.toContain("07:08:09");
+  });
+
+  it("shows a body-only preview on first Right and enters it on second Right", () => {
+    const message = assistant([]);
+    message.errorMessage = '429 {"type":"error","message":"rate limited"}';
+    const { component } = viewer([message], { rows: 40 });
+    component.render(80);
+
+    component.handleInput("\x1b[C");
+    const expanded = component.render(80).join("\n");
+    expect(expanded).toContain("429 {");
+    expect(expanded).toContain('"type": "error"');
+    expect((component as any).readingRegion).toBe("timeline");
+
+    component.handleInput("\x1b[D");
+    expect(component.render(80).join("\n")).not.toContain('"type": "error"');
+
+    component.handleInput("\x1b[C");
+    component.handleInput("\x1b[C");
+    expect((component as any).readingRegion).toBe("preview");
+    const preview = component.render(80).join("\n");
+    expect(preview).toContain("Preview 1-4/4 · Left row");
+    expect(preview).not.toContain("↑↓ select");
+    component.handleInput("o");
+    expect(component.render(80).join("\n")).toContain('"message": "rate limited"');
+    component.handleInput("?");
+    expect(component.render(80).join("\n")).toContain("Viewer keys");
+    component.handleInput("?");
+    expect(component.render(80).join("\n")).toContain("Detail · general-purpose · assistant error");
+    component.handleInput("\x1b");
+    expect((component as any).readingRegion).toBe("preview");
+    component.handleInput("\x1b[D");
+    expect((component as any).readingRegion).toBe("timeline");
+    expect(component.render(80).join("\n")).toContain('"type": "error"');
+
+    component.handleInput(" ");
+    expect(component.render(80).join("\n")).not.toContain('"type": "error"');
+  });
+
+  it("scrolls enough to reveal a first-Right body at the timeline tail", () => {
+    const messages = Array.from({ length: 20 }, (_, index) => assistant([{ type: "text", text: `note ${index}` }], now + index));
+    const failed = assistant([], now + 21);
+    failed.errorMessage = '429 {"type":"error","message":"rate limited"}';
+    messages.push(failed);
+    const { component } = viewer(messages, { rows: 12 });
+    component.render(80);
+
+    component.handleInput("\x1b[C");
+
+    expect(component.render(80).join("\n")).toContain("│    │ 429 {");
+    expect((component as any).readingRegion).toBe("timeline");
+  });
+
   it("keeps a 10k-line task internally scrollable with history and protected footer at 40x12", () => {
     const task = Array.from({ length: 10_000 }, (_, index) => `task row ${index + 1}`).join("\n");
     const { component } = viewer([assistant([{ type: "text", text: "history row" }])], {

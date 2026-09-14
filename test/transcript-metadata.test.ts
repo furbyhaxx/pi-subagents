@@ -50,14 +50,22 @@ describe("transcript task metadata", () => {
 
     expect(record.taskPrompt).toBe(prompt);
     expect(runAgent).toHaveBeenCalledWith(ctx, "Explore", prompt, expect.objectContaining({ inheritContext: true }));
-    expect(appendCustomEntry).toHaveBeenCalledTimes(1);
+    expect(appendCustomEntry).toHaveBeenCalledTimes(2);
     expect(appendCustomEntry).toHaveBeenCalledWith("subagents:task", { prompt });
+    expect(appendCustomEntry).toHaveBeenCalledWith("subagents:invocation", {
+      agentId: id,
+      startedAt: expect.any(Number),
+    });
     expect(appendCustomMessageEntry).not.toHaveBeenCalled();
 
     vi.mocked(resumeAgent).mockResolvedValue({ text: "continued" });
     await manager.resume(id, "A later continuation prompt");
     expect(record.taskPrompt).toBe(prompt);
-    expect(appendCustomEntry).toHaveBeenCalledTimes(1);
+    expect(appendCustomEntry).toHaveBeenCalledTimes(3);
+    expect(appendCustomEntry).toHaveBeenLastCalledWith("subagents:invocation", {
+      agentId: id,
+      startedAt: record.startedAt,
+    });
   });
 
   it("hydrates the original task from the active resumed branch without overwriting it", async () => {
@@ -88,7 +96,10 @@ describe("transcript task metadata", () => {
     expect(getBranch).toHaveBeenCalledOnce();
     expect(record.taskPrompt).toBe(originalPrompt);
     expect(record.taskPrompt).not.toBe(resumePrompt);
-    expect(appendCustomEntry).not.toHaveBeenCalled();
+    expect(appendCustomEntry).toHaveBeenCalledWith("subagents:invocation", {
+      agentId: id,
+      startedAt: record.startedAt,
+    });
   });
 
   it("leaves task metadata absent when an older resumed branch has no task entry", async () => {

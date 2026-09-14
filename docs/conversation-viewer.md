@@ -5,7 +5,7 @@ The viewer separates the assignment, activity history, and full output so readin
 
 ## Task and activity
 
-The default **Steps** view pins the original task above a condensed timeline. Each tool call is paired with its result; commands, file paths, failures, assistant notes, compactions, and nested agent calls become individual rows. Consecutive successful read-only calls form expandable groups. Failed calls stay visible rather than disappearing into a group.
+The default **Steps** view pins the original task above a condensed timeline. Each tool call is paired with its result; commands, file paths, failures, assistant notes, compactions, and nested agent calls become individual rows. Step timestamps use local `HH:mm:ss` time. Consecutive successful read-only calls form expandable groups. Failed calls stay visible rather than disappearing into a group.
 
 Press `t` to expand and focus the task. Arrow keys, Page Up/Down, and Home/End then scroll the task independently of the history. Press `t` again to return. Task text is retained separately from inherited parent context for new agent sessions; older sessions fall back to the original task available in their session history.
 
@@ -16,13 +16,15 @@ The viewer starts **Following** the latest activity. Navigating or expanding pau
 | Key | Action |
 |---|---|
 | Up/Down, `k`/`j` | Select a step or group member |
-| Right | Expand; press again to enter children or the preview |
-| Space | Toggle expansion |
-| Left | Collapse or return to the parent row |
+| Right | Expand inline; press again to enter children or the preview |
+| Space | Toggle inline expansion |
+| Left | Leave the preview, collapse, or return to the parent row |
 | Page Up/Down | Page through the active reading region |
 | `o` | Open the selected step's arguments and output in Detail |
 | `f` | Cycle All, errors+mutations, and tools-only filters |
 | `?` | Show pageable key help |
+
+The first Right press on a text-bearing row opens its body inline without moving focus; the second enters that preview for independent scrolling. Error messages whose complete suffix is valid JSON are pretty-printed across lines in Preview and Detail while their timeline header remains concise.
 
 Previews show the first 30 and last 10 source lines of long output, with an explicit count of omitted middle lines. **Detail** displays all text retained locally, including the omitted middle, without launching an external editor. Escape returns to the previous view. Tool output remains literal by default; Markdown formatting is configurable with `m`.
 

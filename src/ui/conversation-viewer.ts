@@ -142,7 +142,7 @@ function truncationNote(elided: number): string {
 function clock(timestamp: number | undefined): string {
   if (timestamp === undefined || !Number.isFinite(timestamp)) return "";
   const date = new Date(timestamp);
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
 }
 
 function elapsedLabel(milliseconds: number | undefined): string {
@@ -204,6 +204,7 @@ export class ConversationViewer implements Component {
   private layerOrigin: SavedView | undefined;
   private detailNode: FlatStep | undefined;
   private detailKey: string | undefined;
+  private detailHelpScroll: number | undefined;
   private detailLinesCache: { signature: string; lines: string[]; sourceRows: number[] } | undefined;
   private helpLinesCache: { width: number; lines: string[] } | undefined;
   private selectedKey: string | undefined;
@@ -862,27 +863,39 @@ export class ConversationViewer implements Component {
       this.tui.requestRender();
     } else if (matchesKey(data, "right")) {
       this.following = false;
+      const hasChildren = !!node.step.children?.length || node.step.kind === "agent";
+      const hasBody = !!node.step.bodySections?.length;
       if (node.owner && node.step.kind === "agent" && !node.step.key.startsWith("child:")) {
         this.message = "O opens this child in its own viewer.";
-      } else if (!this.expanded.has(node.key) && (node.step.children?.length || node.step.kind === "agent" || node.step.bodySections?.length)) {
+      } else if (hasBody && !hasChildren && !this.previewOpen.has(node.key)) {
+        this.previewOpen.add(node.key);
+        const physical = this.physicalRows(Math.max(1, this.lastWidth - 4));
+        const header = physical.findIndex(row => row.kind === "header" && row.node.key === node.key);
+        if (header >= 0) {
+          const firstBody = header + 1;
+          const bodyVisibleScroll = Math.max(0, firstBody - this.lastViewport + 1);
+          this.timelineScroll = Math.min(header, Math.max(this.timelineScroll, bodyVisibleScroll));
+        }
+      } else if (!this.expanded.has(node.key) && hasChildren) {
         this.expanded.add(node.key);
-      } else if (node.step.children?.length || node.step.kind === "agent") {
+      } else if (hasChildren) {
         const next = this.flatSteps().findIndex((entry) => entry.parentKey === node.step.key);
         if (next >= 0) this.selectedKey = this.flatSteps()[next]?.key;
         else this.message = node.step.kind === "agent" ? "Child transcript unavailable; o reads the spawn result." : "No text body available.";
-      } else if (node.step.bodySections?.length) {
-        this.previewOpen.add(node.key);
+      } else if (hasBody) {
         this.readingRegion = "preview";
         this.previewOffset = this.previewOffsets.get(node.key) ?? 0;
       }
       this.tui.requestRender();
     } else if (matchesKey(data, "space")) {
       this.following = false;
-      if (this.expanded.has(node.key) || this.previewOpen.has(node.key)) {
-        this.expanded.delete(node.key);
-        this.previewOpen.delete(node.key);
-      } else if (node.step.children?.length || node.step.kind === "agent" || node.step.bodySections?.length) {
-        this.expanded.add(node.key);
+      const hasChildren = !!node.step.children?.length || node.step.kind === "agent";
+      if (hasChildren) {
+        if (this.expanded.has(node.key)) this.expanded.delete(node.key);
+        else this.expanded.add(node.key);
+      } else if (node.step.bodySections?.length) {
+        if (this.previewOpen.has(node.key)) this.previewOpen.delete(node.key);
+        else this.previewOpen.add(node.key);
       }
       this.tui.requestRender();
     } else if (matchesKey(data, "left")) {
@@ -1015,6 +1028,7 @@ export class ConversationViewer implements Component {
     this.layerOrigin = this.captureView();
     this.layer = layer;
     this.layerScroll = 0;
+    this.detailHelpScroll = undefined;
     this.stopArmed = false;
     this.following = false;
     this.tui.requestRender();
@@ -1102,18 +1116,32 @@ export class ConversationViewer implements Component {
     const range = `Lines ${content.length === 0 ? 0 : this.layerScroll + 1}-${Math.min(content.length, this.layerScroll + viewport)}/${content.length}`;
     const lines = [this.border(width, "top"), this.row(this.theme.bold(title), innerWidth)];
     for (let index = 0; index < viewport; index++) lines.push(this.row(content[this.layerScroll + index] ?? "", innerWidth));
-    lines.push(this.row(wholeTokens(["Esc back", "? close help", range], innerWidth), innerWidth));
+    const help = this.layer === "help" ? "? close help" : "? help";
+    lines.push(this.row(wholeTokens(["Esc back", help, range], innerWidth), innerWidth));
     lines.push(this.border(width, "bottom"));
     return lines.slice(0, allocated);
   }
 
   private handlePagerInput(data: string): void {
+    if (this.layer === "detail" && matchesKey(data, "?")) {
+      this.detailHelpScroll = this.layerScroll;
+      this.layer = "help";
+      this.layerScroll = 0;
+      this.tui.requestRender();
+      return;
+    }
     if (matchesKey(data, "escape") || matchesKey(data, "q") || matchesKey(data, "ctrl+c") || (this.layer === "help" && matchesKey(data, "?"))) {
-      const origin = this.layerOrigin;
-      this.layer = undefined;
-      this.detailNode = undefined;
-      this.detailKey = undefined;
-      if (origin) this.restoreView(origin);
+      if (this.layer === "help" && this.detailHelpScroll !== undefined) {
+        this.layer = "detail";
+        this.layerScroll = this.detailHelpScroll;
+        this.detailHelpScroll = undefined;
+      } else {
+        const origin = this.layerOrigin;
+        this.layer = undefined;
+        this.detailNode = undefined;
+        this.detailKey = undefined;
+        if (origin) this.restoreView(origin);
+      }
       this.tui.requestRender();
       return;
     }
@@ -1219,15 +1247,30 @@ export class ConversationViewer implements Component {
     return parts.length > 0 ? this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`) : undefined;
   }
 
+  private previewFooter(width: number): string | undefined {
+    if (this.readingRegion !== "preview") return undefined;
+    const node = this.focusedNode();
+    if (!node) return undefined;
+    const rows = this.previewRows(node, width);
+    const visible = this.physicalRows(width)
+      .slice(this.timelineScroll, this.timelineScroll + this.lastViewport)
+      .filter((row): row is Extract<PhysicalRow, { kind: "body" }> => row.kind === "body" && row.node.key === node.key);
+    const start = visible[0]?.bodyRow ?? this.previewOffset;
+    const end = visible.at(-1)?.bodyRow ?? this.previewOffset;
+    const range = `${rows.length === 0 ? 0 : start + 1}-${rows.length === 0 ? 0 : end + 1}/${rows.length}`;
+    return width < 58 ? `Preview ${range} · ←` : `Preview ${range} · Left row`;
+  }
+
   private footer(width: number): string {
     if (this.composer) return wholeTokens(["Enter send", "Esc cancel"], width);
     if (this.stopArmed) return wholeTokens(["x again to STOP", this.options.parent ? "Esc back" : "Esc close"], width);
     const base = [this.options.parent ? "Esc back" : "Esc close", "? help"];
     if (this.isStoppable()) base.push("x stop");
     const optional = [
+      this.previewFooter(width) ?? "",
       this.viewMode() === "steps" ? "Tab raw" : "Tab steps",
       this.canSteer() ? "Enter steer" : "",
-      this.readingRegion === "task" ? "↑↓ task" : this.viewMode() === "steps" ? "↑↓ select" : "↑↓ scroll",
+      this.readingRegion === "task" ? "↑↓ task" : this.readingRegion === "preview" ? "↑↓ preview" : this.viewMode() === "steps" ? "↑↓ select" : "↑↓ scroll",
     ].filter(Boolean);
     const status = this.message || (this.viewMode() === "steps" && this.filterMode !== "all" ? `filter: ${this.filterMode === "key" ? "errors+mutations" : "tools only"}` : "");
     return wholeTokens(status ? [...base, ...optional, status] : [...base, ...optional], width);

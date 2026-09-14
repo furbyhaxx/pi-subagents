@@ -565,6 +565,32 @@ describe("FleetList overlay lifecycle", () => {
     const old = makeRecord({ id: "o", description: "old done", status: "completed", completedAt: Date.now() - 60_000 });
     expect(harness([old]).render().some(l => l.includes("old done"))).toBe(false);
   });
+
+  it("excludes restored sessions even when they finished recently", () => {
+    const restored = makeRecord({
+      id: "restored-1",
+      description: "old restored",
+      status: "completed",
+      completedAt: Date.now(),
+      restoredSession: true,
+    });
+    expect(harness([restored]).render().some(l => l.includes("old restored"))).toBe(false);
+  });
+
+  it("excludes interrupted restored sessions from the fleet list", () => {
+    const restored = makeRecord({
+      id: "restored-2",
+      description: "cut short",
+      status: "aborted",
+      completedAt: Date.now(),
+      restoredSession: true,
+      restoredInterrupted: true,
+    });
+    const live = makeRecord({ id: "live", description: "still running" });
+    const output = harness([restored, live]).render().join("\n");
+    expect(output).toContain("still running");
+    expect(output).not.toContain("cut short");
+  });
 });
 
 describe("FleetList cost display", () => {

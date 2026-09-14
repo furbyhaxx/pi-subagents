@@ -304,7 +304,9 @@ export class AgentWidget {
    *   - `all`: every agent.
    */
   private widgetAgents() {
-    const all = this.manager.listAgents().filter(isTopLevelAgent);
+    const all = this.manager.listAgents().filter(a =>
+      isTopLevelAgent(a) && (!a.restoredSession || a.restoredInterrupted),
+    );
     switch (this.mode()) {
       case "off": return [];
       case "background": return all.filter(a => a.isBackground !== false);

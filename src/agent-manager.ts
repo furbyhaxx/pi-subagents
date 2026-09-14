@@ -946,6 +946,7 @@ export class AgentManager {
           // Custom entries persist extension metadata without entering LLM context.
           session.sessionManager?.appendCustomEntry?.("subagents:task", { prompt: record.taskPrompt });
         }
+        this.recordInvocation(record, id);
         if (record.worktree) {
           session.sessionManager?.appendCustomEntry?.("subagents:workspace", {
             worktree: { ...record.worktree },
@@ -1267,6 +1268,13 @@ export class AgentManager {
     return { id, record };
   }
 
+  private recordInvocation(record: AgentRecord, id: string): void {
+    record.session?.sessionManager?.appendCustomEntry?.("subagents:invocation", {
+      agentId: id,
+      startedAt: record.startedAt,
+    });
+  }
+
   /**
    * Resume an existing agent session with a new prompt.
    */
@@ -1335,6 +1343,7 @@ export class AgentManager {
     this.activeRuns.add(id);
     record.status = "running";
     record.startedAt = Date.now();
+    this.recordInvocation(record, id);
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
@@ -1440,6 +1449,7 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    this.recordInvocation(record, id);
     this.activeRuns.add(id);
     if (occupiesPoolSlot(record)) this.runningBackground++;
 

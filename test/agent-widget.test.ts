@@ -224,6 +224,46 @@ describe("AgentWidget", () => {
     const manager = { listAgents: () => [makeRecord("background", { isBackground: true })] };
     expect(renderLines(manager, "background", () => "off")).toBe("");
   });
+
+  it("excludes a completed restored session without markFinished", () => {
+    const restored = {
+      ...makeRecord("old", { isBackground: true }),
+      status: "completed",
+      completedAt: Date.now(),
+      restoredSession: true,
+    };
+    expect(renderLines({ listAgents: () => [restored] }, "old")).toBe("");
+  });
+
+  it("shows an interrupted restored session and ages it out through turn linger", () => {
+    const restored = {
+      ...makeRecord("cut", { isBackground: true }),
+      status: "aborted",
+      completedAt: Date.now(),
+      restoredSession: true,
+      restoredInterrupted: true,
+    };
+    const widget = new AgentWidget(
+      { listAgents: () => [restored] } as any,
+      new Map(),
+      () => "all",
+    );
+    let factory: any;
+    widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });
+    const render = () => {
+      widget.update();
+      if (!factory) return "";
+      return factory({ terminal: { columns: 120 }, requestRender: () => {} }, theme).render().join("\n");
+    };
+
+    widget.markFinished(restored.id);
+    expect(render()).toContain("cut description");
+
+    widget.onTurnStart();
+    expect(render()).toContain("cut description");
+    widget.onTurnStart();
+    expect(render()).not.toContain("cut description");
+  });
 });
 
 // The widget caps itself at MAX_WIDGET_LINES (12) and, past that, hands out a

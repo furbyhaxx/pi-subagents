@@ -61,7 +61,6 @@ import {
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
-import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
@@ -83,6 +82,9 @@ import { escapeXml } from "./xml.js";
 /** Tool execute return value for a text response. */
 type ScopedAgentDetails = AgentDetails & Pick<AgentRecord, "worktree" | "branch" | "effectiveCwd">;
 type TaskEntryData = { prompt?: unknown };
+type InvocationEntryData = { agentId?: unknown; startedAt?: unknown };
+type RecordEntryData = { id?: unknown; status?: unknown; result?: unknown; error?: unknown; startedAt?: unknown };
+const RESTORED_TERMINAL_STATUSES = new Set<AgentRecord["status"]>(["completed", "steered", "aborted", "stopped", "error"]);
 type WorkspaceEntryData = { worktree?: AgentRecord["worktree"] };
 type ArtifactEntryData = { artifactRoot?: unknown; originCwd?: unknown; rootSessionId?: unknown };
 
@@ -129,7 +131,57 @@ function findLastEntry(entries: readonly SessionEntry[], predicate: (entry: Sess
   return undefined;
 }
 
-export function restoredRecordFromSession(info: SessionInfo, parentSessionId: string): AgentRecord | undefined {
+function parentRecordId(entry: SessionEntry): string | undefined {
+  if (entry.type !== "custom" || entry.customType !== "subagents:record") return undefined;
+  const id = (entry.data as RecordEntryData | undefined)?.id;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function shortIdFromSessionName(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const sep = name.lastIndexOf("#");
+  if (sep < 0) return undefined;
+  const shortId = name.slice(sep + 1).trim();
+  return shortId.length > 0 ? shortId.slice(0, 8) : undefined;
+}
+
+function matchParentRecord(
+  parentEntries: readonly SessionEntry[],
+  agentId: string | undefined,
+  sessionName: string | undefined,
+  invocationStartedAt: number | undefined,
+): SessionEntry | undefined {
+  const matchesInvocation = (entry: SessionEntry): boolean => {
+    if (invocationStartedAt === undefined || entry.type !== "custom") return true;
+    const startedAt = (entry.data as RecordEntryData | undefined)?.startedAt;
+    return typeof startedAt === "number" && startedAt >= invocationStartedAt;
+  };
+  if (agentId) {
+    const matched = findLastEntry(parentEntries, entry => parentRecordId(entry) === agentId && matchesInvocation(entry));
+    if (matched) return matched;
+  }
+  const shortId = shortIdFromSessionName(sessionName);
+  if (!shortId) return undefined;
+  return findLastEntry(parentEntries, entry => {
+    const id = parentRecordId(entry);
+    return id != null && id.slice(0, 8) === shortId && matchesInvocation(entry);
+  });
+}
+
+function transcriptEndedInError(entries: readonly SessionEntry[]): boolean {
+  const last = findLastEntry(entries, entry => entry.type === "message" && entry.message.role === "assistant");
+  return last?.type === "message" && last.message.role === "assistant" && last.message.stopReason === "error";
+}
+
+function isRestoredTerminalStatus(status: unknown): status is AgentRecord["status"] {
+  return typeof status === "string" && RESTORED_TERMINAL_STATUSES.has(status as AgentRecord["status"]);
+}
+
+export function restoredRecordFromSession(
+  info: SessionInfo,
+  parentSessionId: string,
+  parentEntries: readonly SessionEntry[] = [],
+): AgentRecord | undefined {
   let sessionManager: SessionManager;
   try {
     sessionManager = SessionManager.open(info.path);
@@ -139,6 +191,14 @@ export function restoredRecordFromSession(info: SessionInfo, parentSessionId: st
   const entries = sessionManager.getEntries();
   const taskEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:task");
   const taskData = taskEntry?.type === "custom" ? taskEntry.data as TaskEntryData | undefined : undefined;
+  const invocationEntry = findLastEntry(entries, entry => entry.type === "custom" && entry.customType === "subagents:invocation");
+  const invocationData = invocationEntry?.type === "custom" ? invocationEntry.data as InvocationEntryData | undefined : undefined;
+  const agentId = typeof invocationData?.agentId === "string" && invocationData.agentId.trim()
+    ? invocationData.agentId.trim()
+    : undefined;
+  const invocationStartedAt = typeof invocationData?.startedAt === "number" && Number.isFinite(invocationData.startedAt)
+    ? invocationData.startedAt
+    : undefined;
   const prompt = typeof taskData?.prompt === "string" && taskData.prompt.trim()
     ? taskData.prompt.trim()
     : entryText(entries.find(entry => entry.type === "message" && entry.message.role === "user"));
@@ -150,15 +210,27 @@ export function restoredRecordFromSession(info: SessionInfo, parentSessionId: st
   const thinking = findLastEntry(entries, entry => entry.type === "thinking_level_change");
   const last = entries.at(-1);
   const type = restoredType(info);
-  const status = entries.some(entry => entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error") ? "error" : "completed";
+  const matched = matchParentRecord(parentEntries, agentId, info.name, invocationStartedAt);
+  const matchedData = matched?.type === "custom" ? matched.data as RecordEntryData | undefined : undefined;
+  const restoredInterrupted = matched == null;
+  let status: AgentRecord["status"];
+  if (matchedData && isRestoredTerminalStatus(matchedData.status)) {
+    status = matchedData.status;
+  } else if (transcriptEndedInError(entries)) {
+    status = "error";
+  } else {
+    status = restoredInterrupted ? "aborted" : "completed";
+  }
   return {
     id: `restored-${info.id}`,
     type,
     description: prompt?.split("\n").find(line => line.trim())?.trim().slice(0, 120) || info.name || type,
     taskPrompt: prompt,
     status,
+    result: typeof matchedData?.result === "string" ? matchedData.result : undefined,
+    error: typeof matchedData?.error === "string" ? matchedData.error : undefined,
     toolUses: entries.reduce((count, entry) => count + (entry.type === "message" && entry.message.role === "toolResult" ? 1 : 0), 0),
-    startedAt: info.created.getTime(),
+    startedAt: invocationStartedAt ?? info.created.getTime(),
     completedAt: entryTimestamp(last, info.modified.getTime()),
     session: makeRestoredSession(sessionManager),
     worktree: workspaceData?.worktree,
@@ -172,6 +244,7 @@ export function restoredRecordFromSession(info: SessionInfo, parentSessionId: st
     isBackground: true,
     resultConsumed: true,
     restoredSession: true,
+    restoredInterrupted: restoredInterrupted || undefined,
     invocation: model?.type === "model_change" ? {
       modelId: `${model.provider}/${model.modelId}`,
       thinking: thinking?.type === "thinking_level_change" ? thinking.thinkingLevel as AgentInvocation["thinking"] : undefined,
@@ -971,12 +1044,16 @@ export default function (pi: ExtensionAPI) {
     const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
     if (parentSessionFile) {
       try {
+        const parentEntries = ctx.sessionManager?.getEntries?.() ?? [];
         const sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager?.getSessionDir?.());
         for (const info of sessions) {
           if (info.parentSessionPath !== parentSessionFile) continue;
-          const record = restoredRecordFromSession(info, ctx.sessionManager?.getSessionId?.() ?? "standalone");
-          if (record) manager.restoreCompleted(record);
+          const record = restoredRecordFromSession(info, ctx.sessionManager?.getSessionId?.() ?? "standalone", parentEntries);
+          if (!record) continue;
+          const restored = manager.restoreCompleted(record);
+          if (restored.restoredInterrupted) widget.markFinished(restored.id);
         }
+        widget.update();
       } catch (error) {
         console.warn("[pi-subagents] Failed to restore persisted subagent sessions:", error);
       }
@@ -3292,25 +3369,57 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   async function showRunningAgents(ctx: ExtensionCommandContext) {
-    const agents = manager.listAgents().filter(isTopLevelAgent);
-    if (agents.length === 0) {
-      ctx.ui.notify("No agents.", "info");
-      return;
+    let previousId: string | undefined;
+    while (true) {
+      const agents = manager.listAgents().filter(isTopLevelAgent).sort((a, b) => b.startedAt - a.startedAt);
+      if (agents.length === 0) {
+        ctx.ui.notify("No agents.", "info");
+        return;
+      }
+
+      const records = new Map(agents.map(agent => [agent.id, agent]));
+      const items: SettingItem[] = agents.map(agent => {
+        const started = new Date(agent.startedAt);
+        const startedAt = `${started.getFullYear()}-${String(started.getMonth() + 1).padStart(2, "0")}-${String(started.getDate()).padStart(2, "0")} ${String(started.getHours()).padStart(2, "0")}:${String(started.getMinutes()).padStart(2, "0")}:${String(started.getSeconds()).padStart(2, "0")}`;
+        const duration = formatDuration(agent.startedAt, agent.completedAt);
+        const workspace = agent.worktree
+          ? ` · ${agent.worktree.branch} · ${agent.worktree.path} · ${agent.worktree.lifecycle}`
+          : agent.branch ? ` · ${agent.branch} (workspace pending)` : "";
+        return {
+          id: agent.id,
+          label: `${startedAt} · ${getDisplayName(agent.type)} (${agent.description})`,
+          currentValue: agent.status,
+          description: `${agent.toolUses} tools · ${duration}${workspace}`,
+          values: [agent.status],
+        };
+      });
+
+      const selectedId = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+        const list = new SettingsList(
+          items,
+          Math.min(items.length, 12),
+          getSettingsListTheme(),
+          id => done(id),
+          () => done(undefined),
+        );
+        if (previousId) list.selectItem(previousId);
+        const container = new Container();
+        container.addChild(new Text("Running agents · newest first", 0, 0));
+        container.addChild(new Spacer(1));
+        container.addChild(list);
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => list.handleInput?.(data),
+        };
+      });
+      if (!selectedId) return;
+
+      const record = records.get(selectedId);
+      if (!record) continue;
+      previousId = record.id;
+      await viewAgentConversation(ctx, record);
     }
-
-    // Numbered + item-paired. Two same-type agents spawned together with the
-    // same description render identically here, and resolving the choice by
-    // string match would open whichever came first.
-    const record = await selectItem(ctx.ui, "Running agents", agents, a => {
-      const dn = getDisplayName(a.type);
-      const dur = formatDuration(a.startedAt, a.completedAt);
-      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}${a.worktree ? ` · ${a.worktree.branch} · ${a.worktree.path} · ${a.worktree.lifecycle}` : a.branch ? ` · ${a.branch} (workspace pending)` : ""}`;
-    });
-    if (!record) return;
-
-    await viewAgentConversation(ctx, record);
-    // Back-navigation: re-show the list
-    await showRunningAgents(ctx);
   }
 
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {

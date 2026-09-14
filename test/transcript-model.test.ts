@@ -59,7 +59,23 @@ describe("TranscriptModel", () => {
     const bash = snapshot.steps.find((step) => step.toolCallId === "call-1");
     expect(bash).toMatchObject({ label: "bash", target: "npm test", running: false, outcome: "3 tests passed" });
     expect(bash?.bodySections?.map((section) => section.label)).toEqual(["Arguments", "Result"]);
+    expect(bash?.bodySections?.[0]?.text).toBe('{"command":"npm test"}');
     expect(snapshot.steps.find((step) => step.toolCallId === "gone")).toMatchObject({ isError: true, label: "read" });
+  });
+
+  it("pretty-prints a complete JSON suffix only in assistant error bodies", () => {
+    const valid = assistant([]);
+    valid.errorMessage = '429 {"type":"error","retry":{"after":2}}';
+    const invalid = assistant([], timestamp + 10);
+    invalid.errorMessage = '429 {"type":"error"} trailing';
+
+    const steps = new TranscriptModel([entry("valid", valid), entry("invalid", invalid)]).current().steps;
+
+    expect(steps[0]).toMatchObject({
+      target: valid.errorMessage,
+      body: '429 {\n  "type": "error",\n  "retry": {\n    "after": 2\n  }\n}',
+    });
+    expect(steps[1]?.body).toBe(invalid.errorMessage);
   });
 
   it("does not duplicate message_end followed by entry_appended", () => {
