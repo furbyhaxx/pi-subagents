@@ -286,6 +286,13 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
+  /**
+   * Whether the parent registry exposed the recognized background-jobs family
+   * when this record was launched. This is record-scoped so a runtime that
+   * disappears after launch cannot be mistaken for one that was never present;
+   * it also survives an error and later resume in this in-memory record.
+   */
+  jobsPossible?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */

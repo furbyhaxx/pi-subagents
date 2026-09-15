@@ -58,6 +58,7 @@ import {
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
+import { createBackgroundJobsMenuRpc } from "./ui/background-jobs-rpc.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
@@ -489,6 +490,8 @@ export default function (pi: ExtensionAPI) {
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
   if (inChildSessionContext()) return;
+
+  const jobsRpc = createBackgroundJobsMenuRpc(pi.events);
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -1019,6 +1022,7 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    void jobsRpc.checkBackgroundJobs();
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -1366,6 +1370,7 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    jobsRpc.dispose();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -3263,6 +3268,17 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Workflows (${workflowTasks.size})`);
     }
 
+    if (jobsRpc.available) {
+      try {
+        if (await jobsRpc.checkBackgroundJobs()) {
+          const jobs = await jobsRpc.jobList(ctx.cwd);
+          options.push(`Jobs (${jobs.filter(job => job.isBackground).length})`);
+        }
+      } catch (error) {
+        ctx.ui.notify(`Could not load background jobs: ${error instanceof Error ? error.message : String(error)}. Run /jobs directly.`, "warning");
+      }
+    }
+
     // Actions
     options.push("Create new agent");
     options.push("Settings");
@@ -3292,6 +3308,14 @@ Terse command-style prompts produce shallow, generic work.
     } else if (choice.startsWith("Workflows (")) {
       await showWorkflowsMenu(ctx, workflowMenuDeps);
       await showAgentsMenu(ctx);
+    } else if (choice.startsWith("Jobs (")) {
+      try {
+        const opened = await jobsRpc.openJobs(ctx.cwd);
+        if (!opened) ctx.ui.notify("The jobs overlay could not open here. Run /jobs directly.", "warning");
+      } catch (error) {
+        ctx.ui.notify(`Could not open the jobs overlay: ${error instanceof Error ? error.message : String(error)}. Run /jobs directly.`, "warning");
+      }
+      return;
     } else if (choice === "Create new agent") {
       await showCreateWizard(ctx);
     } else if (choice === "Settings") {

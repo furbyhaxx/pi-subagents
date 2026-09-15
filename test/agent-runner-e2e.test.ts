@@ -44,9 +44,27 @@ const FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-probe-ext.mjs", im
 const EXT_TOOL = "e2e_probe";
 const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
+/**
+ * The background-jobs family fixture: the exact four-tool contract the parent
+ * registry must expose for propagation (see bash-family.ts).
+ */
+const FAMILY_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/ext-bash-family.mjs", import.meta.url)));
+const FAMILY_NAMES = ["bash", "job_list", "job_output", "job_stop"];
+
+/** What a parent running the real background-jobs package would report. */
+function familyRegistry(): unknown[] {
+  return FAMILY_NAMES.map((name) => ({
+    name,
+    sourceInfo: { path: FAMILY_FIXTURE, source: "extension", scope: "user", origin: "package" },
+  }));
+}
+
 /** Minimal `pi` stub — `detectEnv` only needs `exec` (returns non-git). */
-function makePi() {
-  return { exec: async () => ({ code: 1, stdout: "", stderr: "" }) } as any;
+function makePi(parentTools?: unknown[]) {
+  return {
+    exec: async () => ({ code: 1, stdout: "", stderr: "" }),
+    ...(parentTools ? { getAllTools: () => parentTools } : {}),
+  } as any;
 }
 
 describe("agent-runner end-to-end (real pi-mono session + real extension)", () => {
@@ -67,8 +85,9 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
   /**
    * Register `cfg` as agent type "e2e", run it through the REAL runAgent, and
    * return the real session's active tool names captured at construction time.
+   * `parentTools` stands in for the parent's `getAllTools()` registry.
    */
-  async function activeToolsFor(cfg: Partial<AgentConfig>): Promise<string[]> {
+  async function activeToolsFor(cfg: Partial<AgentConfig>, parentTools?: unknown[]): Promise<string[]> {
     registerAgents(
       new Map([
         [
@@ -104,7 +123,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     let active: string[] = [];
     try {
       await runAgent(ctx, "e2e", "go", {
-        pi: makePi(),
+        pi: makePi(parentTools),
         model,
         onSessionCreated: (s) => {
           active = s.getActiveToolNames();
@@ -157,5 +176,27 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     expect(active).toContain(EXT_TOOL); // selected → surfaces despite the flip
     expect(active).toContain("read");
     expect(active).not.toContain("bash"); // builtinToolNames: ["read"] only
+  });
+
+  it("an isolated child with bash gets the family extension loaded by its source path", async () => {
+    // `extensions: false` is `isolated` at the loader: nothing is discovered,
+    // so only the explicit family path can reach the real session.
+    const active = await activeToolsFor({ extensions: false, builtinToolNames: ["bash"] }, familyRegistry());
+    for (const name of FAMILY_NAMES) expect(active).toContain(name);
+  });
+
+  it("a child without bash gets no family tools when extensions are off", async () => {
+    const active = await activeToolsFor({ extensions: false, builtinToolNames: ["read"] }, familyRegistry());
+    expect(active).toEqual(["read"]);
+  });
+
+  it("an explicitly denied job tool stays out of the real session", async () => {
+    const active = await activeToolsFor(
+      { extensions: false, builtinToolNames: ["bash"], disallowedTools: ["job_stop"] },
+      familyRegistry(),
+    );
+    expect(active).toContain("job_list");
+    expect(active).toContain("job_output");
+    expect(active).not.toContain("job_stop");
   });
 });

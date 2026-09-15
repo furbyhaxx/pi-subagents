@@ -393,6 +393,7 @@ A few rules the examples don't make obvious:
 - Plain `tools:` typos fail loudly: `tools: reed, grep` fires `tools-error:…` instead of silently producing an under-tooled agent.
 - `exclude_extensions:` wins over `extensions:` and over `ext:` selectors — an excluded extension never loads and a `tools: ext:` entry can't pull it back. Plain names only (no paths, no `*`); a name matching nothing fires an `extension-error:…` warning.
 - `exclude_extensions:` is **not a sandbox**: excluded extensions' factory code still executes once during loading. Exclusion suppresses their tools and their bound lifecycle hooks (`pi.on` handlers like `session_start` only fire for extensions bound to the session), but not other load-time side effects — a factory that subscribes directly to the shared `pi.events` bus stays live. Don't rely on it to contain an untrusted extension.
+- **A child whose allowlist contains `bash` also gets the parent's background-jobs tools** (`job_list`, `job_output`, `job_stop`) when the parent's `bash` comes from an extension registering the full four-tool family. That extension is loaded by its exact source path, so it reaches `isolated: true` and `extensions: false` children too — the one deliberate extension-loading exception to isolation. This family auto-inclusion intentionally overrides `ext:` narrowing so the child receives all required job-management tools; `disallowed_tools` remains the supported trim for explicitly withholding individual family tools. A child without `bash`, or with it denied, gets no job tools in any loader mode; `exclude_extensions:` wins and fires an `extension-error:…` note, and an unrelated extension that merely overrides `bash` is never propagated (the child keeps the built-in shell, with a note saying so).
 - Array and string forms are equivalent: `[a, b]` == `"a, b"`.
 
 **How an agent's scope is advertised.** The Agent tool description lists every available agent with a `(Tools: …)` suffix, and that suffix is what the orchestrator reads when deciding where to route work. It describes **built-in scope only** — extension tools are resolved when the agent runs (extensions may register lazily, see above), so they can't be enumerated when the description is built:
@@ -494,7 +495,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 
 | Command | Description |
 |---------|-------------|
-| `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
+| `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, optional background jobs, settings |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
 
@@ -538,11 +539,13 @@ The `/agents` command opens an interactive menu:
 ```
 Running agents (2) — 1 running, 1 done     ← only shown when agents exist
 Agent types (6)                             ← unified list: defaults + custom
+Jobs (2)                                    ← only with pi-background-jobs
 Create new agent                            ← manual wizard or AI-generated
 Settings                                    ← concurrency, retries/wraparounds, turns, join mode
 ```
 
 - **Running agents** — newest-started first, with each row showing its local `YYYY-MM-DD HH:mm:ss` start time. Select one to open its conversation viewer; closing it returns the cursor to that same row. While it is still running, press `Enter` to open the steering composer, then `Enter` again to redirect it (`Esc` or an empty submit returns), or press `x` twice to stop/abort it — including **background** agents, which a global Esc cannot unambiguously target. A stopped agent reports partial output as incomplete. `m` cycles transcript Markdown — see [Viewer markdown](#persistent-settings).
+- **Jobs** — active effective background-job count from the optional `@furbyhaxx/pi-background-jobs` companion. Opens that extension's existing `/jobs` overlay rather than creating a second manager, and stays hidden when the companion is absent.
 - **Agent types** — unified list with source indicators: `•` (project), `◦` (global), `✕` (disabled). Each row shows the agent's model, and the highlighted agent's full description appears below the list. The model column flags `(unavailable, fallback: inherit)` when a configured model can't be resolved (it would silently inherit the parent model), and shows `(→ provider/id)` when it resolves to a different provider or version than configured. Select an agent to manage it:
   - **Default agents** (no override): Eject (export as `.md`), Disable
   - **Default agents** (ejected/overridden): Edit, Disable, Reset to default, Delete
@@ -908,6 +911,8 @@ The automatic preservation commit uses `--no-verify`, so local pre-commit hooks 
 
 If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` call fails with a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
 
+When a background-jobs runtime answers on the event bus, the copy is only removed after that worktree's background jobs are stopped, and the result lists what was stopped (`Stopped 2 background job(s) still running in the worktree: …`). If termination cannot be confirmed — the runtime errored, timed out, or speaks a protocol this build does not know — the worktree is **retained**, the failure is reported in the result (or error), and no removal is attempted: a tree a live job may still be writing is never deleted. With no runtime loaded the step is a no-op and cleanup is unchanged. Named (`branch`) worktrees are never implicitly stopped and keep their jobs.
+
 A newly created worktree does not copy uncommitted or staged changes from the caller. Never use a fresh copy to review the caller's working-tree or staged diff: the agent sees committed files, not that diff. Reusing a named worktree, below, does expose **that worktree's** existing changes.
 
 ### Retained branch workspaces
@@ -989,7 +994,7 @@ This is useful for creating agents that inherit extension tools but should not h
 ```
 docs/                 # Long-form guides (shipped to npm; README links out to them)
   workflows.md        # SubagentWorkflow: writing, editing, saving and re-running scripts
-  rpc.md              # Cross-extension integration: pi.events, subagents:rpc:*, manager registry
+  rpc.md              # Cross-extension integration: pi.events, subagents:rpc:*, background-jobs stop-worktree, manager registry
   conversation-viewer.md # Reading tasks, grouped activity, retained output, and nested agents
 examples/
   workflows/          # Runnable examples, executed by test/workflow-examples.test.ts
@@ -1008,6 +1013,7 @@ src/
 
   # Execution
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
+  bash-family.ts      # Recognize the parent's background-jobs tool family for child propagation
   pi-retry-adapter.ts # Pi-owned retry coordination and in-session model transitions
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
   nested-tools.ts     # Delegation tools handed to subagents (nested spawn/collect/steer)
@@ -1025,6 +1031,7 @@ src/
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
   cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
+  background-jobs-rpc.ts # Outbound stop-worktree call before an ephemeral worktree is removed
 
   # Scheduling
   schedule.ts         # SubagentScheduler: cron / +10m / interval / ISO dispatch
@@ -1055,6 +1062,7 @@ src/
     transcript-model.ts  # Session history/live events paired into steps and read-only groups
     viewer-keys.ts        # Viewer scroll keys resolved through user keybindings
     agent-mention.ts      # `@` roster (running, resumable, and startable agents) + popup rows
+    background-jobs-rpc.ts # UI-only Jobs menu link to the companion's existing overlay
     schedule-menu.ts      # /agents → Scheduled jobs submenu
     select-item.ts        # Collision-safe ctx.ui.select wrapper (numbered rows)
     workflow-card.ts      # Inline workflow card (tool result and session entry)

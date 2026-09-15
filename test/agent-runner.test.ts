@@ -2040,6 +2040,288 @@ describe("agent-runner extension allowlist", () => {
   });
 });
 
+// ─── background-jobs bash family propagation ────────────────────────────
+// A child whose tool allowlist contains `bash` inherits the parent's bash
+// implementation only when the parent's registry proves the complete
+// background-jobs family on one non-builtin source path (see bash-family.ts).
+// The family is loaded by its exact path, so it works under `isolated`; a
+// child without bash never sees it, in every loader mode.
+describe("agent-runner bash family propagation", () => {
+  const FAMILY_PATH = "/ext/pi-background-jobs/src/index.ts";
+  const FAMILY_TOOLS = ["bash", "job_list", "job_output", "job_stop"];
+
+  /** The parent registry as `pi.getAllTools()` reports it. */
+  function parentTools(path: string = FAMILY_PATH): any[] {
+    return FAMILY_TOOLS.map((name) => ({
+      name,
+      sourceInfo: { path, source: "extension" },
+    }));
+  }
+  function piWithFamily(tools: any[] = parentTools()): any {
+    return { getAllTools: () => tools };
+  }
+  function setupFamilyAgent(overrides: Record<string, unknown>) {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig(overrides));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig(overrides));
+  }
+  function extensionErrors(onToolActivity: ReturnType<typeof vi.fn>): string[] {
+    return onToolActivity.mock.calls
+      .map((c) => c[0]?.toolName)
+      .filter((n): n is string => typeof n === "string" && n.startsWith("extension-error:"));
+  }
+
+  it("an isolated child with bash loads the family by its exact source path", async () => {
+    // `isolated` means no extensions are discovered; only the explicit path in
+    // additionalExtensionPaths can reach the child, which is the whole point.
+    setupFamilyAgent({ extensions: true });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["bash"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily(), isolated: true });
+
+    const opts = lastLoaderOpts();
+    expect(opts.noExtensions).toBe(true);
+    expect(opts.additionalExtensionPaths).toEqual([FAMILY_PATH]);
+    expect(lastToolsPassed()).toEqual(["bash", "job_list", "job_output", "job_stop"]);
+  });
+
+  it("loads the family when extensions are on and bash is in the allowlist", async () => {
+    setupFamilyAgent({ extensions: true });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toEqual([FAMILY_PATH]);
+    const active = lastToolsPassed();
+    for (const name of FAMILY_TOOLS) expect(active).toContain(name);
+  });
+
+  it("dedupes against an extension path the agent already requested", async () => {
+    setupFamilyAgent({ extensions: [FAMILY_PATH] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toEqual([FAMILY_PATH]);
+  });
+
+  it("a child without bash never sees a discovered family", async () => {
+    setupFamilyAgent({ extensions: true });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS, "/ext/keep.ts": ["keep_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    // The loader override is installed BECAUSE the family must be removed even
+    // though `extensions: true` would otherwise keep every discovered one.
+    const opts = lastLoaderOpts();
+    expect(opts.additionalExtensionPaths).toBeUndefined();
+    expect(opts.extensionsOverride).toBeDefined();
+    expect(loaderExtensionsRef.current.extensions.map((e) => e.path)).not.toContain(FAMILY_PATH);
+    const active = lastToolsPassed();
+    expect(active).not.toContain("job_list");
+    expect(active).not.toContain("job_output");
+    expect(active).not.toContain("job_stop");
+    expect(active).toContain("keep_tool");
+  });
+
+  it("disallowed bash removes the family under extensions too", async () => {
+    setupFamilyAgent({ extensions: true, disallowedTools: ["bash"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+    const active = lastToolsPassed();
+    expect(active).not.toContain("bash");
+    expect(active).not.toContain("job_stop");
+  });
+
+  it("a wildcard loader also drops the family when bash is not allowed", async () => {
+    setupFamilyAgent({ extensions: ["*"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS, "/ext/keep.ts": ["keep_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    const opts = lastLoaderOpts();
+    expect(opts.additionalExtensionPaths).toBeUndefined();
+    expect(opts.extensionsOverride).toBeDefined();
+    const active = lastToolsPassed();
+    expect(active).not.toContain("job_list");
+    expect(active).toContain("keep_tool");
+  });
+
+  it("an explicitly denied job tool loads with the family but stays out of scope", async () => {
+    setupFamilyAgent({ extensions: true, disallowedTools: ["job_stop"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toEqual([FAMILY_PATH]);
+    const active = lastToolsPassed();
+    expect(active).toContain("bash");
+    expect(active).toContain("job_list");
+    expect(active).toContain("job_output");
+    expect(active).not.toContain("job_stop");
+  });
+
+  it("a denied job tool is stripped from the isolated allowlist too", async () => {
+    setupFamilyAgent({ extensions: true, disallowedTools: ["job_list"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["bash"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily(), isolated: true });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toEqual([FAMILY_PATH]);
+    expect(lastToolsPassed()).toEqual(["bash", "job_output", "job_stop"]);
+  });
+
+  it("exclude_extensions naming the package wins, with a diagnostic", async () => {
+    // A package entry (`src/index.ts`) is answered to by its package short name
+    // too, so that is what an exclude can be written against (#143).
+    const dir = mkdtempSync(join(tmpdir(), "subagents-bg-family-"));
+    try {
+      writeFileSync(
+        join(dir, "package.json"),
+        JSON.stringify({ name: "@furbyhaxx/pi-background-jobs", pi: { extensions: ["./src/index.ts"] } }),
+      );
+      mkdirSync(join(dir, "src"));
+      writeFileSync(join(dir, "src", "index.ts"), "export default () => {};");
+      const familyPath = join(dir, "src", "index.ts");
+
+      setupFamilyAgent({ extensions: true, excludeExtensions: ["pi-background-jobs"] });
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      withExtensions({ [familyPath]: FAMILY_TOOLS, "/ext/keep.ts": ["keep_tool"] });
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      const onToolActivity = vi.fn();
+
+      await runAgent(ctx, "Explore", "go", {
+        pi: piWithFamily(parentTools(familyPath)),
+        onToolActivity,
+      });
+
+      expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+      expect(extensionErrors(onToolActivity)).toEqual([
+        expect.stringContaining('bash family "pi-background-jobs" excluded'),
+      ]);
+      const active = lastToolsPassed();
+      expect(active).not.toContain("job_list");
+      // Only the family is removed — every other extension is untouched.
+      expect(active).toContain("keep_tool");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("family tools survive an ext: allowlist flip that never names the family", async () => {
+    setupFamilyAgent({ extensions: true, extSelectors: ["ext:keep"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    withExtensions({
+      [FAMILY_PATH]: FAMILY_TOOLS,
+      "/ext/keep.ts": ["keep_tool"],
+      "/ext/other.ts": ["other_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily() });
+
+    const active = lastToolsPassed();
+    expect(active).toContain("job_list");
+    expect(active).toContain("keep_tool");
+    expect(active).not.toContain("other_tool");
+  });
+
+  it("an unrelated bash override is not propagated and is reported", async () => {
+    setupFamilyAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["bash"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+    const sandbox = piWithFamily([
+      { name: "bash", sourceInfo: { path: "/ext/sandbox/index.ts", source: "extension" } },
+    ]);
+
+    await runAgent(ctx, "Explore", "go", { pi: sandbox, onToolActivity });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+    expect(lastToolsPassed()).toEqual(["bash"]);
+    expect(extensionErrors(onToolActivity)).toEqual([
+      expect.stringContaining('bash override "/ext/sandbox/index.ts"'),
+    ]);
+  });
+
+  it("a host without getAllTools gets the built-in bash and no warning", async () => {
+    // Nothing to detect, nothing to say: print/RPC hosts without the API are
+    // not misconfigured, and a note on every spawn would be noise.
+    setupFamilyAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["bash"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("a bashless isolated child does not warn about internal family exclusions", async () => {
+    setupFamilyAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", {
+      pi: piWithFamily(),
+      isolated: true,
+      onToolActivity,
+    });
+
+    expect(lastToolsPassed()).toEqual(["read"]);
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("reports one dedicated diagnostic when an explicitly requested family lacks bash", async () => {
+    setupFamilyAgent({ extensions: [FAMILY_PATH] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ [FAMILY_PATH]: FAMILY_TOOLS });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithFamily(), onToolActivity });
+
+    const errors = extensionErrors(onToolActivity);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("background-jobs family");
+    expect(errors[0]).toContain("bash is not available");
+    expect(errors[0]).not.toContain("was not loaded");
+    expect(lastToolsPassed()).toEqual(["read"]);
+  });
+});
+
 // ─── exclude_extensions: denylist (#94) ──────────────────────────────────
 describe("agent-runner exclude_extensions", () => {
   function setupAgent(overrides: Record<string, unknown>) {

@@ -254,6 +254,8 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` may be combined with `model` to continue the same conversation on a replacement model. It cannot be combined with `agentType`, `effort`, `isolation`, `branch`, `gate` or `schema` — the child keeps its agent type and tree, and its session predates the `StructuredOutput` tool.
 
+Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`, and a disposable `isolation: "worktree"` copy is removed only after that worktree's jobs are stopped — if termination cannot be confirmed the worktree is retained and the failure is reported in that agent's output instead of deleting a tree a live job may still be writing in. A retained `branch` worktree is never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
+
 ### Retained branch workspaces
 
 Pass `branch` as an option rather than asking a child to switch branches or create worktrees:

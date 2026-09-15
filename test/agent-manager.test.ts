@@ -16,14 +16,29 @@ vi.mock("../src/worktree.js", () => ({
   cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
   pruneWorktrees: vi.fn(),
   isWorktreeIsolationEnabled: vi.fn(() => true),
+  releaseWorktreeLease: vi.fn(),
+  resumeWorktree: vi.fn(),
 }));
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
+import { PING_TIMEOUT_MS } from "../src/background-jobs-rpc.js";
 import { addUsage } from "../src/usage.js";
 import { isWorktreeIsolationEnabled } from "../src/worktree.js";
+import { createTestEventBus, type TestEventBus } from "./helpers/event-bus.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
+const BACKGROUND_JOBS_FAMILY = ["bash", "job_list", "job_output", "job_stop"];
+
+function piWithBackgroundJobs(events: TestEventBus): any {
+  return {
+    events,
+    getAllTools: () => BACKGROUND_JOBS_FAMILY.map(name => ({
+      name,
+      sourceInfo: { path: "/ext/pi-background-jobs/src/index.ts", source: "extension" },
+    })),
+  };
+}
 
 const mockSession = () => ({ dispose: vi.fn() } as any);
 
@@ -1064,6 +1079,305 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     });
 
     expect(order).toEqual([]);
+  });
+});
+
+// An ephemeral worktree is removed inside the agent's settle path, so a job the
+// child left running there is stopped first, over the same `background-jobs`
+// RPC the runtime answers (see background-jobs-rpc.ts). If termination cannot
+// be confirmed the tree is RETAINED and the failure is reported: cleanup must
+// never delete a tree a live job is still writing in. Retained/branch trees are
+// never implicitly stopped.
+describe("AgentManager — background jobs before ephemeral worktree cleanup", () => {
+  let manager: AgentManager;
+  const wt = {
+    path: "/wt/jobs",
+    branch: "pi-agent-j",
+    baseSha: "abc",
+    workPath: "/wt/jobs",
+    lifecycle: "ephemeral",
+    sourceRoot: "/repo",
+    commonDir: "/repo/.git",
+    reused: false,
+    initialDirty: false,
+  };
+  const PING = "background-jobs:rpc:ping";
+  const STOP = "background-jobs:rpc:stop-worktree";
+
+  type StopOutcome = { kind: "ok"; stopped: string[] } | { kind: "error"; error: string } | { kind: "silent" };
+
+  /**
+   * A version-1 companion on the test bus. `stopOutcomes` is consumed per stop
+   * call; the last entry repeats, so a two-phase test (spawn cleanup, then
+   * resume cleanup) can answer differently each time.
+   */
+  function companion(bus: TestEventBus, stopOutcomes: StopOutcome[] = [{ kind: "ok", stopped: [] }], ping: "ok" | "error" | "silent" = "ok") {
+    const stops: { requestId: string; path: string }[] = [];
+    let call = 0;
+    bus.on(PING, (raw) => {
+      const { requestId } = raw as { requestId: string };
+      if (ping === "silent") return;
+      if (ping === "error") bus.emit(`${PING}:reply:${requestId}`, { success: false, error: "ping exploded" });
+      else bus.emit(`${PING}:reply:${requestId}`, { success: true, data: { version: 1 } });
+    });
+    bus.on(STOP, (raw) => {
+      const { requestId, path } = raw as { requestId: string; path: string };
+      stops.push({ requestId, path });
+      const outcome = stopOutcomes[Math.min(call, stopOutcomes.length - 1)];
+      call++;
+      if (outcome.kind === "silent") return;
+      if (outcome.kind === "error") bus.emit(`${STOP}:reply:${requestId}`, { success: false, error: outcome.error });
+      else bus.emit(`${STOP}:reply:${requestId}`, { success: true, data: { stopped: outcome.stopped } });
+    });
+    return { stops };
+  }
+
+  afterEach(async () => {
+    manager?.dispose();
+    vi.useRealTimers();
+    const { cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(cleanupWorktree).mockReset();
+    vi.mocked(cleanupWorktree).mockImplementation(async () => ({ hasChanges: false }));
+  });
+
+  it("stops the worktree's jobs before removal and reports the ids", async () => {
+    const bus = createTestEventBus();
+    const { stops } = companion(bus, [{ kind: "ok", stopped: ["job-00000001", "job-00000002"] }]);
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    const order: string[] = [];
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockImplementation(async () => {
+      order.push("cleanup");
+      return { hasChanges: false };
+    });
+    bus.on(STOP, () => order.push("stop"));
+    resolvedRun();
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(stops).toEqual([{ requestId: expect.any(String), path: "/wt/jobs" }]);
+    expect(order).toEqual(["stop", "cleanup"]);
+    expect(record.result).toContain(
+      "Stopped 2 background job(s) still running in the worktree: job-00000001, job-00000002.",
+    );
+    expect(record.worktreeResult).toEqual({ hasChanges: false });
+  });
+
+  it("retains the worktree and reports the failure when jobs cannot be stopped", async () => {
+    const bus = createTestEventBus();
+    companion(bus, [{ kind: "error", error: "cannot signal pid" }]);
+    const { createWorktree, cleanupWorktree, releaseWorktreeLease } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockImplementation(async () => {
+      throw new Error("cleanup must not run when the stop failed");
+    });
+    vi.mocked(releaseWorktreeLease).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(cleanupWorktree).not.toHaveBeenCalled();
+    expect(releaseWorktreeLease).toHaveBeenCalledWith(wt);
+    // The child's own outcome is untouched — this is a cleanup failure.
+    expect(record.status).toBe("completed");
+    expect(record.jobsPossible).toBe(true);
+    expect(record.worktreeResult?.path).toBe("/wt/jobs");
+    expect(record.result).toContain("could not be stopped (background-jobs stop-worktree failed: cannot signal pid)");
+    expect(record.result).toContain("Worktree retained at `/wt/jobs`; no cleanup was attempted.");
+  });
+
+  it("a host that never exposed the family keeps an unavailable companion as a no-op", async () => {
+    const bus = createTestEventBus();
+    companion(bus, undefined, "silent");
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    resolvedRun();
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait({ events: bus } as never, mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(record.jobsPossible).toBe(false);
+    expect(bus.emitted).toEqual([]);
+    expect(cleanupWorktree).toHaveBeenCalledTimes(1);
+    expect(record.result ?? "").not.toContain("Stopped");
+  });
+
+  it("retains a worktree when the family runtime disappears after launch", async () => {
+    vi.useFakeTimers();
+    const bus = createTestEventBus();
+    const { createWorktree, cleanupWorktree, releaseWorktreeLease } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(releaseWorktreeLease).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const pending = manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+    await vi.advanceTimersByTimeAsync(PING_TIMEOUT_MS);
+    const { record } = await pending;
+
+    expect(record.jobsPossible).toBe(true);
+    expect(cleanupWorktree).not.toHaveBeenCalled();
+    expect(releaseWorktreeLease).toHaveBeenCalledWith(wt);
+    expect(record.worktreeResult?.path).toBe("/wt/jobs");
+    expect(record.result).toContain("runtime became unavailable after launch");
+  });
+
+  it("never stops jobs for a retained worktree", async () => {
+    const retained = { ...wt, path: "/wt/retained", branch: "feat/x", lifecycle: "retained" };
+    const bus = createTestEventBus();
+    const { stops } = companion(bus, [{ kind: "ok", stopped: ["job-must-not-be-stopped"] }]);
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(retained as never);
+    resolvedRun();
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(stops).toEqual([]);
+    expect(cleanupWorktree).toHaveBeenCalledTimes(1);
+    expect(record.result).toContain("Workspace retained on branch");
+  });
+
+  it("stops jobs before best-effort cleanup on the error path too", async () => {
+    const bus = createTestEventBus();
+    const { stops } = companion(bus, [{ kind: "ok", stopped: ["job-err"] }]);
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(runAgent).mockRejectedValue(new Error("boom"));
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(stops.map((entry) => entry.path)).toEqual(["/wt/jobs"]);
+    expect(cleanupWorktree).toHaveBeenCalledTimes(1);
+    expect(record.status).toBe("error");
+    expect(record.error).toContain("boom");
+    expect(record.error).toContain("Stopped 1 background job(s) still running in the worktree: job-err.");
+  });
+
+  it("keeps confirmed stopped ids when error-path Git cleanup fails", async () => {
+    const bus = createTestEventBus();
+    companion(bus, [{ kind: "ok", stopped: ["job-cleanup-error"] }]);
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockRejectedValueOnce(new Error("git cleanup failed"));
+    vi.mocked(runAgent).mockRejectedValue(new Error("boom"));
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(record.status).toBe("error");
+    expect(record.error).toContain("Stopped 1 background job(s) still running in the worktree: job-cleanup-error.");
+    expect(record.error).toContain("boom");
+  });
+
+  it("retains the worktree when a failed run's jobs cannot be stopped", async () => {
+    const bus = createTestEventBus();
+    companion(bus, [{ kind: "error", error: "no reply" }]);
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockImplementation(async () => {
+      throw new Error("cleanup must not run when the stop failed");
+    });
+    vi.mocked(runAgent).mockRejectedValue(new Error("boom"));
+
+    manager = new AgentManager();
+    const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
+      description: "go",
+      isolation: "worktree",
+    });
+
+    expect(cleanupWorktree).not.toHaveBeenCalled();
+    expect(record.status).toBe("error");
+    expect(record.error).toContain("boom");
+    expect(record.error).toContain("could not be stopped (background-jobs stop-worktree failed: no reply)");
+    expect(record.error).toContain("Worktree retained at `/wt/jobs`");
+  });
+
+  it("gates resume cleanup through the same stop", async () => {
+    const bus = createTestEventBus();
+    const { stops } = companion(bus, [
+      { kind: "ok", stopped: [] },
+      { kind: "ok", stopped: ["job-resume"] },
+    ]);
+    const { createWorktree, cleanupWorktree, resumeWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(resumeWorktree).mockResolvedValue(undefined);
+    resolvedRun();
+
+    manager = new AgentManager();
+    const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+      isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)!.promise;
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockResolvedValue({ text: "second" });
+
+    const record = await manager.resume(id, "more");
+
+    // One stop for the spawn's cleanup, one for the resume's.
+    expect(stops.map((entry) => entry.path)).toEqual(["/wt/jobs", "/wt/jobs"]);
+    expect(cleanupWorktree).toHaveBeenCalledTimes(2);
+    expect(record!.result).toContain("Stopped 1 background job(s) still running in the worktree: job-resume.");
+  });
+
+  it("retains the worktree when resume cleanup cannot confirm termination", async () => {
+    const bus = createTestEventBus();
+    companion(bus, [
+      { kind: "ok", stopped: [] },
+      { kind: "error", error: "resume stop failed" },
+    ]);
+    const { createWorktree, cleanupWorktree, resumeWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(resumeWorktree).mockResolvedValue(undefined);
+    resolvedRun();
+
+    manager = new AgentManager();
+    const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "general-purpose", "task", {
+      description: "task",
+      isBackground: true,
+      isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)!.promise;
+    vi.mocked(cleanupWorktree).mockClear();
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockResolvedValue({ text: "second" });
+
+    const record = await manager.resume(id, "more");
+
+    // The resume's stop failed, so the resume skipped deletion; only the
+    // spawn's cleanup (before the mockClear) ran.
+    expect(cleanupWorktree).not.toHaveBeenCalled();
+    expect(record!.jobsPossible).toBe(true);
+    expect(record!.result).toContain("could not be stopped (background-jobs stop-worktree failed: resume stop failed)");
+    expect(record!.result).toContain("Worktree retained at `/wt/jobs`");
   });
 });
 

@@ -21,6 +21,8 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { buildAgentRegistry, getAgentConfig, getAgentConfigIn } from "./agent-types.js";
+import { type StopWorktreeResult, stopWorktreeJobs } from "./background-jobs-rpc.js";
+import { resolveBashFamily } from "./bash-family.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { resolveBranch } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
@@ -30,10 +32,38 @@ import type { ModelTransition, RetryModelCandidate } from "./pi-retry-adapter.js
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, ModelThinkingLevel, SubagentType } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, releaseWorktreeLease, resumeWorktree, type WorktreeInfo } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, releaseWorktreeLease, resumeWorktree, type WorktreeCleanupResult, type WorktreeInfo } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
+
+/** Result note after background jobs in an ephemeral worktree were confirmed stopped. */
+function stoppedJobsNote(ids: string[]): string {
+  return `\n\nStopped ${ids.length} background job(s) still running in the worktree: ${ids.join(", ")}.`;
+}
+
+/**
+ * Record metadata for a worktree kept because its jobs could not be stopped.
+ * `hasChanges: true` is the conservative reading on purpose: the tree was NOT
+ * verified clean, so nothing may treat it as a discarded/empty copy.
+ */
+function retainedWorktreeResult(worktree: WorktreeInfo): WorktreeCleanupResult {
+  return { hasChanges: true, path: worktree.path };
+}
+
+/**
+ * Result note when the worktree's background jobs could not be confirmed
+ * stopped. The tree is deliberately kept: deleting it could strand a live job
+ * against a path that no longer exists, so the failure is reported instead.
+ */
+function worktreeJobsRetainedNote(worktree: WorktreeInfo, error: string): string {
+  return `\n\nBackground jobs in the worktree could not be stopped (${error}). Worktree retained at \`${worktree.path}\`; no cleanup was attempted.`;
+}
+
+/** Whether the parent's current tool registry proves a background-jobs family. */
+function backgroundJobsPossible(pi: ExtensionAPI | undefined): boolean {
+  return resolveBashFamily(pi?.getAllTools?.()) !== undefined;
+}
 
 function applyModelTransition(record: AgentRecord, transition: ModelTransition): void {
   record.invocation ??= {};
@@ -596,6 +626,10 @@ export class AgentManager {
       branch: options.branch ?? options.resumeWorktree?.branch,
       artifactRoot: options.artifactRoot,
       originCwd: options.originCwd ?? ctx.cwd,
+      // Capture this before any async work starts. The parent registry is the
+      // conservative source of truth: a nested child may not itself expose
+      // bash, but its worktree can still contain jobs started by the branch.
+      jobsPossible: backgroundJobsPossible(pi),
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -758,6 +792,9 @@ export class AgentManager {
     this.activeRuns.add(id);
     if (pool === "background") this.runningBackground++;
     else if (pool === "foreground") this.runningForeground++;
+    // A queued record may start after the parent runtime was installed. Keep
+    // the per-record flag conservative without replacing a prior true value.
+    record.jobsPossible ||= backgroundJobsPossible(pi);
 
     // Worktree isolation: try to create a temporary git worktree. Strict —
     // fail loud if not possible (no silent fallback to main tree). Done BEFORE
@@ -807,6 +844,9 @@ export class AgentManager {
         throw error;
       }
       record.worktree = wt;
+      // The registry may have become available while the copy was being
+      // created. Capture that too, before runAgent gets its first await.
+      record.jobsPossible ||= backgroundJobsPossible(pi);
       // workPath preserves subdirectory scoping for caller-supplied cwds: a
       // cwd deep in a monorepo maps to the same subdir inside the copy, not
       // the copied repo's root. Plain worktree spawns keep the historical
@@ -1035,19 +1075,33 @@ export class AgentManager {
               await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
             } catch { /* ignore — never block cleanup */ }
           }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (record.worktree.lifecycle === "retained") {
-            record.result = (record.result ?? "") + `\n\nWorkspace retained on branch \`${record.worktree.branch}\` at \`${record.worktree.path}\`. No automatic commit or merge performed.`;
-          } else if (wtResult.hasChanges && wtResult.branch) {
-            // With a caller-supplied cwd the branch lives in THAT repo, not the
-            // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
-            // Appended to the prose only. A structured child's caller parses
-            // `structuredJson`, which stays untouched — but `result` is also
-            // what a human reads, so the note still belongs on it.
-            record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
+          const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
+          if (jobs?.outcome === "failed") {
+            // Termination could not be confirmed, so the tree stays: removing it
+            // could strand a live job against a path that no longer exists. The
+            // cleanup failure travels in the result prose — the child's own
+            // outcome is unchanged.
+            record.worktreeResult = retainedWorktreeResult(record.worktree);
+            releaseWorktreeLease(record.worktree);
+            record.result = (record.result ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
+          } else {
+            if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
+              record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
+            }
+            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+            record.worktreeResult = wtResult;
+            if (record.worktree.lifecycle === "retained") {
+              record.result = (record.result ?? "") + `\n\nWorkspace retained on branch \`${record.worktree.branch}\` at \`${record.worktree.path}\`. No automatic commit or merge performed.`;
+            } else if (wtResult.hasChanges && wtResult.branch) {
+              // With a caller-supplied cwd the branch lives in THAT repo, not the
+              // parent session's — say so, or the orchestrator merges in the wrong repo.
+              const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
+              // Appended to the prose only. A structured child's caller parses
+              // `structuredJson`, which stays untouched — but `result` is also
+              // what a human reads, so the note still belongs on it.
+              record.result = (record.result ?? "") +
+                `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
+            }
           }
         }
 
@@ -1075,11 +1129,23 @@ export class AgentManager {
         // Best-effort worktree cleanup on error
         if (record.worktree) {
           await this.stopOwnedChildren(id);
-          try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
-          } catch { /* ignore cleanup errors */ }
-          finally { if (record.worktree.lifecycle === "retained") releaseWorktreeLease(record.worktree); }
+          const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
+          if (jobs?.outcome === "failed") {
+            record.worktreeResult = retainedWorktreeResult(record.worktree);
+            releaseWorktreeLease(record.worktree);
+            record.error = (record.error ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
+          } else {
+            // Record confirmed stops before cleanup: a Git failure must not
+            // erase the fact that jobs were terminated from the error report.
+            if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
+              record.error = (record.error ?? "") + stoppedJobsNote(jobs.stopped);
+            }
+            try {
+              const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+              record.worktreeResult = wtResult;
+            } catch { /* ignore cleanup errors */ }
+            finally { if (record.worktree.lifecycle === "retained") releaseWorktreeLease(record.worktree); }
+          }
         }
 
         this.abortOwnedChildren(id);
@@ -1287,6 +1353,9 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
     if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") return undefined;
+    // A runtime may have been installed since the original run. Never turn a
+    // prior true into false; this flag is the record's cleanup safety memory.
+    record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id));
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1412,14 +1481,62 @@ export class AgentManager {
 
   private async finishWorktreeResume(record: AgentRecord): Promise<void> {
     const worktree = record.worktree!;
+    const jobs = await this.stopEphemeralWorktreeJobs(this.worktreeApis.get(record.id), record);
+    if (jobs?.outcome === "failed") {
+      // Same rule as the spawn paths: no confirmed termination, no deletion.
+      record.worktreeResult = retainedWorktreeResult(worktree);
+      releaseWorktreeLease(worktree);
+      const note = worktreeJobsRetainedNote(worktree, jobs.error);
+      if (record.status === "error") record.error = (record.error ?? "") + note;
+      else record.result = (record.result ?? "") + note;
+      return;
+    }
     try {
       record.worktreeResult = await cleanupWorktree(this.worktreeApis.get(record.id)!, worktree.sourceRoot, worktree, record.description);
+      if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
+        const note = stoppedJobsNote(jobs.stopped);
+        if (record.status === "error") record.error = (record.error ?? "") + note;
+        else record.result = (record.result ?? "") + note;
+      }
     } catch (error) {
       record.status = "error";
       record.error = error instanceof Error ? error.message : String(error);
     } finally {
       if (worktree.lifecycle === "retained") releaseWorktreeLease(worktree);
     }
+  }
+
+  /**
+   * Stop the background jobs of an ephemeral worktree before it is removed.
+   *
+   * Undefined when there is nothing to gate: no worktree, a retained tree
+   * (never implicitly stopped), or a record whose parent never exposed the
+   * recognized family. A `failed` result means the caller must skip removal;
+   * `unavailable` is a no-op only for a never-possible record. Once jobs were
+   * possible, an unavailable RPC is converted to `failed` — a runtime that
+   * disappeared after launch must not make a live worktree look safe to delete.
+   */
+  private async stopEphemeralWorktreeJobs(
+    pi: ExtensionAPI | undefined,
+    record: AgentRecord,
+  ): Promise<StopWorktreeResult | undefined> {
+    const worktree = record.worktree;
+    if (!worktree || worktree.lifecycle !== "ephemeral") return undefined;
+
+    // The current registry catches a runtime installed after the original
+    // spawn. The record's true value is intentionally sticky for the opposite
+    // case: a runtime disappearing after launch must retain the tree.
+    record.jobsPossible ||= backgroundJobsPossible(pi);
+    if (!record.jobsPossible) return undefined;
+
+    const result = await stopWorktreeJobs(pi?.events, worktree.path);
+    if (result.outcome === "unavailable") {
+      return {
+        outcome: "failed",
+        error: "background-jobs runtime became unavailable after launch; termination could not be confirmed",
+      };
+    }
+    return result;
   }
 
   private async prepareWorktreeResume(record: AgentRecord): Promise<void> {
@@ -1450,6 +1567,7 @@ export class AgentManager {
     record.status = "running";
     record.startedAt = Date.now();
     this.recordInvocation(record, id);
+    record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id));
     this.activeRuns.add(id);
     if (occupiesPoolSlot(record)) this.runningBackground++;
 

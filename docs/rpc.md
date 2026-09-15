@@ -177,6 +177,29 @@ The consequence is worth stating plainly: **a session that excludes pi-subagents
 
 One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2104`) and detached resume (`:1350`). Your first event for your own agent is `subagents:started` (`:625`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
 
+## Stopping background jobs before worktree cleanup
+
+The one place this extension is an RPC **client** rather than a server: before an ephemeral worktree is removed, it asks `pi-background-jobs` — when one is loaded — to stop that worktree's jobs, so a detached supervisor never survives the tree it was writing in. The caller side is `src/background-jobs-rpc.ts`; `path` is the worktree's path.
+
+```text
+request  background-jobs:rpc:ping          { requestId }
+reply    background-jobs:rpc:ping:reply:<id>          { success: true, data: { version: 1 } }
+request  background-jobs:rpc:stop-worktree { requestId, path }
+reply    background-jobs:rpc:stop-worktree:reply:<id> { success: true, data: { stopped: string[] } }
+```
+
+The protocol version is `1`, checked from the ping reply; a companion answering with anything else is a *failure*, not an unload, because an unconfirmed stop may not be followed by deletion. Availability is probed with a ping on **every** call and never cached — a runtime loaded after pi-subagents, a reload, or no runtime at all resolve correctly at the moment a worktree is cleaned up.
+
+The three outcomes and what cleanup does with them:
+
+| Outcome | Meaning | Cleanup |
+|---|---|---|
+| `unavailable` | No ping reply within 2 s | Proceeds — identical to no runtime installed |
+| `stopped` | The reply's `stopped` ids | Proceeds; ids are appended to the agent's result |
+| `failed` | Ping error, version mismatch, stop error, malformed reply, or no stop reply within 10 s | **Retained**: no removal, failure and path appended to the result (success) or error (failure), worktree lease released |
+
+Retained (`branch`) worktrees are never implicitly stopped and never gated this way. `stop-worktree` is a privileged internal route: the only thing this extension ever passes is the path of a worktree it owns.
+
 ## What the tests pin
 
 This document has no test of its own, so it is worth knowing which claims are actually held in place:
@@ -186,6 +209,8 @@ This document has no test of its own, so it is worth knowing which claims are ac
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings, model resolution and scope enforcement |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
+| `test/background-jobs-rpc.test.ts` | Contract fixture on a test event bus | The outbound ping/`stop-worktree` envelope, per-request reply scoping, and the three cleanup outcomes (`unavailable`, `stopped`, `failed`) |
+| `test/agent-manager.test.ts` | Mocked worktree + real manager | Jobs stopped before ephemeral cleanup, retained-on-failure, retained worktrees untouched |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, `subagents:ready`'s `{}` payload, consume's handle resolution, and its missing `workflowId` check.
 

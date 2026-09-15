@@ -18,6 +18,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { bashOverridePath, resolveBashFamily } from "./bash-family.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -825,13 +826,96 @@ export async function runAgent(
   // Plain canonical names only (case-insensitive). Note: excluded extensions'
   // factories still run once during reload() (see comment above) — exclusion
   // suppresses handler binding and tool registration; it is not a sandbox.
-  const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
-  const hasExcludes = excludeNames.size > 0;
+  //
+  // `excludeNames` can also grow below to remove the background-jobs family from
+  // a child that has no bash. The typo check further down reads
+  // `userExcludeNames` instead, so a name this code added is never reported as
+  // one the user misspelled.
+  const userExcludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
+  const excludeNames = new Set(userExcludeNames);
   // The override filters loaded extensions down to `keepNames` minus `excludeNames`.
   // It's only needed when we're neither loading everything without excludes
   // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
   const loadAll = extensions === true || extensionsSpec?.wildcard === true;
-  const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
+  const additionalExtensionPaths = extensionsSpec?.paths.length ? [...extensionsSpec.paths] : [];
+
+  const disallowedSet = agentConfig?.disallowedTools
+    ? new Set(agentConfig.disallowedTools)
+    : undefined;
+
+  // ─── Bash family (background jobs) ──────────────────────────────────────
+  //
+  // A child whose tool allowlist contains `bash` gets the extension that owns
+  // the parent's bash — the recognized background-jobs family only (see
+  // bash-family.ts), loaded by its exact source path so it works under
+  // `noExtensions`/`isolated` too. Nothing else is propagated: an unrelated
+  // bash override stays home and the child keeps the built-in shell.
+  //
+  // The same recognition also REMOVES the family from a child that has no bash:
+  // denied/bash-less children must not surface job tools just because the family
+  // happens to be discovered normally (`extensions: true`, a `"*"` wildcard, or
+  // an explicit path).
+  const parentTools = options.pi.getAllTools?.();
+  const family = resolveBashFamily(parentTools);
+  const bashAdmitted = toolNames.includes("bash") && !disallowedSet?.has("bash");
+  /** Family tool names this child may use; empty unless the family is admitted. */
+  const bashFamilyToolNames: string[] = [];
+  if (family) {
+    const familyNames = extensionCanonicalNames(family.path);
+    const excludedBy = familyNames.find((name) => excludeNames.has(name));
+    if (!bashAdmitted) {
+      // A noExtensions/isolated child already has a strict registry allowlist;
+      // adding internal excludes there only creates a false user warning. In
+      // extension-loading mode, the family still needs the loader filter so a
+      // discovered or explicitly included family cannot leak job tools.
+      if (!noExtensions) {
+        for (const name of familyNames) excludeNames.add(name);
+      }
+
+      const requestedFamilyNames = familyNames.filter(
+        (name) => keepNames.has(name) || extNames.has(name),
+      );
+      if (requestedFamilyNames.length > 0) {
+        // Do not let the normal "requested ... was not loaded" diagnostics
+        // describe this deliberate admission decision as a typo. Remove both
+        // selector forms and issue one precise diagnostic instead.
+        for (const name of familyNames) {
+          keepNames.delete(name);
+          extNames.delete(name);
+          narrowing.delete(name);
+        }
+        if (noExtensions) {
+          for (let i = additionalExtensionPaths.length - 1; i >= 0; i--) {
+            if (additionalExtensionPaths[i] === family.path) additionalExtensionPaths.splice(i, 1);
+          }
+        }
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:background-jobs family "${requestedFamilyNames[0]}" was requested but withheld for agent "${type}" because bash is not available`,
+        });
+      }
+    } else if (excludedBy) {
+      options.onToolActivity?.({
+        type: "end",
+        toolName: `extension-error:bash family "${excludedBy}" excluded for agent "${type}" — child gets the built-in bash without job tools`,
+      });
+    } else {
+      bashFamilyToolNames.push(...family.toolNames.filter((name) => !disallowedSet?.has(name)));
+      for (const name of familyNames) keepNames.add(name);
+      if (!additionalExtensionPaths.includes(family.path)) additionalExtensionPaths.push(family.path);
+    }
+  } else if (bashAdmitted) {
+    // bash is an override this child cannot get: not the recognized family, so
+    // it is deliberately not propagated. Say so rather than load it silently.
+    const overridePath = bashOverridePath(parentTools);
+    if (overridePath) {
+      options.onToolActivity?.({
+        type: "end",
+        toolName: `extension-error:bash override "${overridePath}" for agent "${type}" is not the background-jobs family — child gets the built-in bash without job tools`,
+      });
+    }
+  }
+  const hasExcludes = excludeNames.size > 0;
   // Pre-filter discovered set, captured by the override — the exclude-typo warning
   // must compare against this, not the surviving set (absence from survivors is
   // an exclude *succeeding*).
@@ -855,7 +939,7 @@ export async function runAgent(
     cwd: configCwd,
     agentDir,
     noExtensions,
-    additionalExtensionPaths,
+    additionalExtensionPaths: additionalExtensionPaths.length > 0 ? additionalExtensionPaths : undefined,
     extensionsOverride,
     noSkills,
     noPromptTemplates: true,
@@ -892,7 +976,7 @@ export async function runAgent(
   //     loading is `extensions:`-authoritative.
   // An exclude_extensions: alongside extensions: false is contradictory — nothing
   // loads, so there is nothing to exclude.
-  if (hasExcludes && noExtensions) {
+  if (userExcludeNames.size > 0 && noExtensions) {
     options.onToolActivity?.({
       type: "end",
       toolName: `extension-error:exclude_extensions has no effect for agent "${type}" — extensions: false loads nothing`,
@@ -901,8 +985,8 @@ export async function runAgent(
   // Exclude typo check: compares against the PRE-filter discovered set (an excluded
   // name absent from the surviving set is the exclude working as intended). Also
   // flags path-like and "*" entries — excludes are plain names only.
-  if (hasExcludes && discoveredNames) {
-    for (const name of excludeNames) {
+  if (userExcludeNames.size > 0 && discoveredNames) {
+    for (const name of userExcludeNames) {
       if (!discoveredNames.has(name)) {
         options.onToolActivity?.({
           type: "end",
@@ -919,7 +1003,7 @@ export async function runAgent(
       if (!survivingNames.has(name)) {
         options.onToolActivity?.({
           type: "end",
-          toolName: excludeNames.has(name)
+          toolName: userExcludeNames.has(name)
             ? `extension-error:extension "${name}" is in both extensions: and exclude_extensions: for agent "${type}" — exclude wins`
             : `extension-error:extension "${name}" requested by agent "${type}" was not loaded`,
         });
@@ -939,10 +1023,6 @@ export async function runAgent(
   const firstCandidate = modelCandidates[0];
   const model = firstCandidate?.model;
   const thinkingLevel = firstCandidate?.thinking ?? options.thinkingLevel ?? agentConfig?.thinking;
-
-  const disallowedSet = agentConfig?.disallowedTools
-    ? new Set(agentConfig.disallowedTools)
-    : undefined;
 
   // Nested delegation tools (opt-in, ownership-scoped). Empty unless the agent
   // set `allowed_subagents` and a nestedRuntime was provided — and never when
@@ -989,6 +1069,9 @@ export async function runAgent(
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
     ...structuredToolNames,
+    // Admitted background-jobs family tools survive the active-set narrowing,
+    // including under an `ext:` allowlist flip that never names the family.
+    ...bashFamilyToolNames,
   ]);
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
@@ -1023,12 +1106,17 @@ export async function runAgent(
   let sessionTools: string[] | undefined;
   let sessionExcludeTools: string[] | undefined;
   if (noExtensions) {
-    // Strict allowlist: built-ins the agent asked for, plus any opt-in nested
-    // tools (whose names would otherwise be dropped as EXCLUDED_TOOL_NAMES).
+    // Strict allowlist: built-ins the agent asked for, the admitted bash family
+    // (explicitly path-loaded — nothing is discovered under noExtensions), plus
+    // any opt-in nested tools (whose names would otherwise be dropped as
+    // EXCLUDED_TOOL_NAMES).
     sessionTools = [
       ...toolNames.filter(
         (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
       ),
+      // The family extension registers these; under `noExtensions` nothing else
+      // can admit them (the loader still loads the explicit family path).
+      ...bashFamilyToolNames.filter((name) => !toolNames.includes(name)),
       ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
       // Not filtered through `disallowedSet`, unlike the nested tools above:
       // the caller asked for a schema, and removing the only tool that can
