@@ -11,7 +11,10 @@
  * The fix: the first activation claims the slot, later activations leave it
  * alone, and only the owner's shutdown releases it.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -70,12 +73,34 @@ async function spawnBackground(tools: Map<string, any>): Promise<string> {
   return /Agent ID: (\S+)/.exec(textOf(r))![1];
 }
 
-// Restore the global slot around every test.
+// The registry spawn resolves its type via global discovery, so the developer's
+// real profile must not leak in: `$PI_CODING_AGENT_DIR/subagents.json` can set
+// `fallbackSubagent`, and a global `agents/*.md` can override a default — a
+// disabled `general-purpose.md` sends every dispatch to the fallback handle.
+// Point global discovery at an empty directory, as the other wiring tests do.
+let hermeticAgentDir: string;
+let priorAgentDir: string | undefined;
+let priorHome: string | undefined;
+
+beforeEach(() => {
+  hermeticAgentDir = mkdtempSync(join(tmpdir(), "pi-registry-guard-agentdir-"));
+  priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  priorHome = process.env.HOME;
+  process.env.PI_CODING_AGENT_DIR = hermeticAgentDir;
+  process.env.HOME = hermeticAgentDir;
+});
+
+// Restore the global slot and the profile environment around every test.
 const priorGlobal = (globalThis as any)[MANAGER_KEY];
 afterEach(() => {
   if (priorGlobal === undefined) delete (globalThis as any)[MANAGER_KEY];
   else (globalThis as any)[MANAGER_KEY] = priorGlobal;
   vi.mocked(runAgent).mockReset();
+  if (priorAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+  if (priorHome == null) delete process.env.HOME;
+  else process.env.HOME = priorHome;
+  rmSync(hermeticAgentDir, { recursive: true, force: true });
 });
 
 describe("Symbol.for manager registry across activations", () => {

@@ -16,6 +16,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BACKGROUND_JOBS_PROTOCOL_VERSION,
   PING_TIMEOUT_MS,
+  PREPARE_SHUTDOWN_CHANNEL,
+  PREPARE_SHUTDOWN_PROTOCOL_VERSION,
+  registerPrepareShutdownEndpoint,
   STOP_TIMEOUT_MS,
   stopWorktreeJobs,
 } from "../src/background-jobs-rpc.js";
@@ -238,5 +241,180 @@ describe("stopWorktreeJobs — a present companion always answers for itself", (
 
     const result = await stopWorktreeJobs(bus, "/wt");
     expect(result).toMatchObject({ outcome: "failed" });
+  });
+});
+
+describe("prepare-shutdown endpoint", () => {
+  const ACCEPTED = (requestId: string): string => `${PREPARE_SHUTDOWN_CHANNEL}:accepted:${requestId}`;
+  const REPLY = (requestId: string): string => `${PREPARE_SHUTDOWN_CHANNEL}:reply:${requestId}`;
+
+  function validRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return { requestId: "req-1", version: 1, sessionId: "s1", reason: "quit", ...overrides };
+  }
+
+  function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void } {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /** Emits all responses other than the request itself. */
+  function responses(bus: TestEventBus): { channel: string; data: Record<string, unknown> }[] {
+    return bus.emitted.filter((entry) => entry.channel !== PREPARE_SHUTDOWN_CHANNEL);
+  }
+
+  it("accepts synchronously, before its first await, and completes on the reply channel", async () => {
+    const bus = createTestEventBus();
+    const cleanup = deferred();
+    const runShutdown = vi.fn(() => cleanup.promise);
+    registerPrepareShutdownEndpoint({ events: bus, getSessionId: () => "s1", runShutdown });
+
+    bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest());
+
+    // `emit` returned: acceptance is already out and cleanup has started —
+    // the requester never has to guess or wait to learn availability.
+    expect(bus.emitted).toEqual([
+      { channel: PREPARE_SHUTDOWN_CHANNEL, data: validRequest() },
+      {
+        channel: ACCEPTED("req-1"),
+        data: { version: PREPARE_SHUTDOWN_PROTOCOL_VERSION, sessionId: "s1" },
+      },
+    ]);
+    expect(runShutdown).toHaveBeenCalledOnce();
+    expect(bus.emitted.some((entry) => entry.channel === REPLY("req-1"))).toBe(false);
+
+    cleanup.resolve();
+    await vi.waitFor(() => expect(bus.emitted.some((entry) => entry.channel === REPLY("req-1"))).toBe(true));
+    expect(bus.emitted.find((entry) => entry.channel === REPLY("req-1"))?.data).toEqual({
+      success: true,
+      data: { prepared: true },
+    });
+  });
+
+  it("accepts and replies to duplicate requests, which join the caller's memoized cleanup", async () => {
+    const bus = createTestEventBus();
+    const cleanup = deferred();
+    const body = vi.fn(() => cleanup.promise);
+    let shared: Promise<void> | undefined;
+    // The activation owns memoization (index.ts publishes its promise before
+    // running the body); the endpoint routes every duplicate to it.
+    const runShutdown = (): Promise<void> => (shared ??= body());
+    registerPrepareShutdownEndpoint({ events: bus, getSessionId: () => "s1", runShutdown });
+
+    bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest({ requestId: "req-a" }));
+    bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest({ requestId: "req-b" }));
+
+    expect(body).toHaveBeenCalledOnce();
+    for (const requestId of ["req-a", "req-b"]) {
+      expect(bus.emitted.some((entry) => entry.channel === ACCEPTED(requestId))).toBe(true);
+    }
+
+    cleanup.resolve();
+    await vi.waitFor(() =>
+      expect(
+        responses(bus).filter((entry) => entry.channel.startsWith(`${PREPARE_SHUTDOWN_CHANNEL}:reply:`)),
+      ).toHaveLength(2),
+    );
+  });
+
+  it("reports a cleanup rejection as an error envelope", async () => {
+    const bus = createTestEventBus();
+    const cleanup = deferred();
+    const runShutdown = vi.fn(() => cleanup.promise);
+    registerPrepareShutdownEndpoint({ events: bus, getSessionId: () => "s1", runShutdown });
+
+    bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest());
+    cleanup.reject(new Error("teardown failed"));
+
+    await vi.waitFor(() => expect(bus.emitted.some((entry) => entry.channel === REPLY("req-1"))).toBe(true));
+    expect(bus.emitted.find((entry) => entry.channel === REPLY("req-1"))?.data).toEqual({
+      success: false,
+      error: "teardown failed",
+    });
+  });
+
+  it("ignores requests that are not this session's valid v1 request", () => {
+    const cases: unknown[] = [
+      validRequest({ sessionId: "other" }),
+      validRequest({ version: 2 }),
+      validRequest({ requestId: "" }),
+      validRequest({ reason: "reboot" }),
+      validRequest({ targetSessionFile: 42 }),
+      null,
+      [],
+      "prepare",
+    ];
+    for (const raw of cases) {
+      const bus = createTestEventBus();
+      const runShutdown = vi.fn(async () => {});
+      registerPrepareShutdownEndpoint({ events: bus, getSessionId: () => "s1", runShutdown });
+
+      bus.emit(PREPARE_SHUTDOWN_CHANNEL, raw);
+
+      expect(responses(bus), JSON.stringify(raw)).toEqual([]);
+      expect(runShutdown).not.toHaveBeenCalled();
+    }
+  });
+
+  it("answers nothing before the activation is bound to a session", () => {
+    const bus = createTestEventBus();
+    const runShutdown = vi.fn(async () => {});
+    registerPrepareShutdownEndpoint({ events: bus, getSessionId: () => undefined, runShutdown });
+
+    bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest());
+
+    expect(responses(bus)).toEqual([]);
+    expect(runShutdown).not.toHaveBeenCalled();
+  });
+
+  it("stops answering once the returned unsubscribe runs", () => {
+    const bus = createTestEventBus();
+    const runShutdown = vi.fn(async () => {});
+    const unsubscribe = registerPrepareShutdownEndpoint({
+      events: bus,
+      getSessionId: () => "s1",
+      runShutdown,
+    });
+
+    unsubscribe();
+    bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest());
+
+    expect(responses(bus)).toEqual([]);
+    expect(bus.listenerCount(PREPARE_SHUTDOWN_CHANNEL)).toBe(0);
+    expect(runShutdown).not.toHaveBeenCalled();
+  });
+
+  it("contains reply emission failures", async () => {
+    const bus = createTestEventBus();
+    const realEmit = bus.emit.bind(bus);
+    bus.emit = (channel: string, data: unknown): void => {
+      if (channel.includes(":reply:")) throw new Error("stale event bus");
+      realEmit(channel, data);
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const cleanup = deferred();
+      registerPrepareShutdownEndpoint({
+        events: bus,
+        getSessionId: () => "s1",
+        runShutdown: () => cleanup.promise,
+      });
+
+      bus.emit(PREPARE_SHUTDOWN_CHANNEL, validRequest());
+      cleanup.resolve();
+
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith(
+          "[pi-subagents] prepare-shutdown reply emission failed:",
+          expect.any(Error),
+        ),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

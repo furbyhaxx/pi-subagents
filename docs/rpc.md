@@ -1,6 +1,6 @@
 # Driving subagents from another extension
 
-Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Four request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
+Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Four public request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`), one internal inbound channel (`subagents:rpc:prepare-shutdown`, sent by pi-background-jobs at shutdown), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
 
 The thing worth understanding up front is that **the bus is in-process.** Every "RPC" call here is a synchronous `pi.events.emit` into the same event loop, and every reply comes back the same way. That single fact explains most of what follows: why `signal` and the `on*` callbacks work on a spawn payload at all, why a `consume` fired inside a `subagents:completed` handler lands *before* the notification decision has been made, and why none of this survives a real process boundary.
 
@@ -167,7 +167,7 @@ Everything added since shipped **without a bump**, because all of it is additive
 
 > A `ping` that answers `2` does not tell you whether `consume` exists, whether model scope is enforced, or whether stop checks ownership.
 
-So: send `consume` unconditionally and ignore the outcome — an older build has no handler and simply keeps notifying, which is exactly why it was left outside the handshake. And treat every error envelope as authoritative rather than trying to predict which checks are in force.
+So: send `consume` unconditionally and ignore the outcome — an older build has no handler and simply keeps notifying, which is exactly why it was left outside the handshake. And treat every error envelope as authoritative rather than trying to predict which checks are in force. The internal `subagents:rpc:prepare-shutdown` channel is versioned separately at `1` and is never probed through `ping`.
 
 ## Availability
 
@@ -188,17 +188,29 @@ request  background-jobs:rpc:stop-worktree { requestId, path }
 reply    background-jobs:rpc:stop-worktree:reply:<id> { success: true, data: { stopped: string[] } }
 ```
 
-The protocol version is `1`, checked from the ping reply; a companion answering with anything else is a *failure*, not an unload, because an unconfirmed stop may not be followed by deletion. Availability is probed with a ping on **every** call and never cached — a runtime loaded after pi-subagents, a reload, or no runtime at all resolve correctly at the moment a worktree is cleaned up.
+The protocol version is `1`, checked from the ping reply; a companion answering with anything else is a *failure*, not an unload, because an unconfirmed stop may not be followed by deletion. Availability is probed with a ping on **every** call and never cached — a runtime loaded after pi-subagents, a reload, or no runtime at all resolve correctly at the moment a worktree is cleaned up. Once a runtime has answered for a record, though, an unavailable RPC is a failure for that record: a runtime that disappeared after launch must not make a live tree look safe to delete.
 
 The three outcomes and what cleanup does with them:
 
 | Outcome | Meaning | Cleanup |
 |---|---|---|
-| `unavailable` | No ping reply within 2 s | Proceeds — identical to no runtime installed |
+| `unavailable` | No ping reply within 2 s | Proceeds only for a record whose spawn never exposed the job family (`jobsPossible` unset). Once a runtime was possible for that record, unavailability is converted to `failed` and the worktree is **retained** |
 | `stopped` | The reply's `stopped` ids | Proceeds; ids are appended to the agent's result |
 | `failed` | Ping error, version mismatch, stop error, malformed reply, or no stop reply within 10 s | **Retained**: no removal, failure and path appended to the result (success) or error (failure), worktree lease released |
 
-Retained (`branch`) worktrees are never implicitly stopped and never gated this way. `stop-worktree` is a privileged internal route: the only thing this extension ever passes is the path of a worktree it owns.
+Retained (`branch`) worktrees are never implicitly stopped and never gated this way. `stop-worktree` is a privileged internal route: the only thing this extension ever passes is the path of a worktree it owns. A record that later resolves to a recovered failure does not remove an already-retained tree either — retention is final for that pass and nothing re-scans old worktrees.
+
+### Shutdown coordination
+
+Pi awaits every extension's `session_shutdown` handler sequentially in load order, so pi-background-jobs disposed its `stop-worktree` responder before this extension's cleanup ran when it was loaded first. It now sends this extension one session-scoped request before its own disposal:
+
+```text
+request  subagents:rpc:prepare-shutdown              { requestId, version: 1, sessionId, reason, targetSessionFile? }
+accepted subagents:rpc:prepare-shutdown:accepted:<id> { version: 1, sessionId }
+reply    subagents:rpc:prepare-shutdown:reply:<id>     { success: true, data: { prepared: true } } | { success: false, error }
+```
+
+The endpoint is registered at `session_start`, answers only for its bound session, and is unsubscribed when the cleanup it starts finishes. A request naming another session, with an unknown version or reason, or with a malformed payload is ignored, so a child or independent activation is never driven by a parent-scoped request. Acceptance is emitted synchronously, before the first await: a requester that sees none in the same tick treats the companion as unavailable and proceeds with local disposal, with no absence timer. Duplicate valid requests join one memoized cleanup — the same promise this extension's own Pi handler awaits — and each gets its own scoped reply. The channel is versioned independently at `1`, outside the `subagents:rpc:ping` handshake, and it never authorizes worktree removal. The provider's 10-second deadline contains a failure — a timeout warns and disposes its RPC anyway — so a slow or unfinished cleanup is never reported as successful. The existing bounded settlement policy is unchanged: fixing the responder order does not extend how long the manager joins a TERM-resistant child.
 
 ## What the tests pin
 
@@ -207,9 +219,9 @@ This document has no test of its own, so it is worth knowing which claims are ac
 | Test | Level | Pins |
 |---|---|---|
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings, model resolution and scope enforcement |
-| `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
+| `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, the `prepare-shutdown` channel included, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
-| `test/background-jobs-rpc.test.ts` | Contract fixture on a test event bus | The outbound ping/`stop-worktree` envelope, per-request reply scoping, and the three cleanup outcomes (`unavailable`, `stopped`, `failed`) |
+| `test/background-jobs-rpc.test.ts` | Contract fixture on a test event bus | The outbound ping/`stop-worktree` envelope, per-request reply scoping, the three cleanup outcomes (`unavailable`, `stopped`, `failed`), and the `prepare-shutdown` endpoint's synchronous acceptance, session scoping and duplicate joining |
 | `test/agent-manager.test.ts` | Mocked worktree + real manager | Jobs stopped before ephemeral cleanup, retained-on-failure, retained worktrees untouched |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, `subagents:ready`'s `{}` payload, consume's handle resolution, and its missing `workflowId` check.

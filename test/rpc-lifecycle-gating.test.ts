@@ -25,10 +25,16 @@ vi.mock("../src/agent-runner.js", async () => {
   return { ...actual, runAgent: vi.fn() };
 });
 
+import { AgentManager } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
-const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
+const RPC_CHANNELS = [
+  "subagents:rpc:ping",
+  "subagents:rpc:spawn",
+  "subagents:rpc:stop",
+  "subagents:rpc:prepare-shutdown",
+] as const;
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -233,5 +239,42 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     for (const channel of RPC_CHANNELS) {
       expect(onCallsFor(pi, channel), `${channel} registered exactly once`).toHaveLength(1);
     }
+  });
+
+  it("runs one shutdown cleanup whichever path starts it, and joins duplicates", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    let releaseCleanup!: () => void;
+    const dispose = vi
+      .spyOn(AgentManager.prototype, "dispose")
+      .mockImplementation(() => new Promise<void>(resolve => { releaseCleanup = resolve; }));
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+
+    const prepare = busHandlers.get("subagents:rpc:prepare-shutdown")!;
+    prepare({ requestId: "req-a", version: 1, sessionId: "s1", reason: "quit" });
+    prepare({ requestId: "req-b", version: 1, sessionId: "s1", reason: "quit" });
+
+    for (const requestId of ["req-a", "req-b"]) {
+      const accepted = pi.events.emit.mock.calls.find(
+        (c: any[]) => c[0] === `subagents:rpc:prepare-shutdown:accepted:${requestId}`,
+      );
+      expect(accepted, `acceptance for ${requestId} goes out synchronously`).toBeTruthy();
+    }
+    // Two requests, one memoized cleanup (its body starts on a microtask).
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledTimes(1));
+
+    releaseCleanup();
+    await vi.waitFor(() => {
+      for (const requestId of ["req-a", "req-b"]) {
+        const reply = pi.events.emit.mock.calls.find(
+          (c: any[]) => c[0] === `subagents:rpc:prepare-shutdown:reply:${requestId}`,
+        );
+        expect(reply?.[1]).toEqual({ success: true, data: { prepared: true } });
+      }
+    });
+
+    // The activation's own Pi handler joins the same resolved cleanup.
+    await lifecycle.get("session_shutdown")();
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 });

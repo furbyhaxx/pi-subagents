@@ -22,6 +22,7 @@ import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, loca
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getMaxModelWraparounds, getMaxRetries, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setMaxModelWraparounds, setMaxRetries, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { registerPrepareShutdownEndpoint } from "./background-jobs-rpc.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -993,6 +994,10 @@ export default function (pi: ExtensionAPI) {
   // (currentCtx would stay undefined → spawn always "No active session"). Gating
   // here makes a filtered session behave like an absent one (#142).
   let rpcHandle: RpcHandle | undefined;
+  /** The session the prepare-shutdown endpoint answers for; unset before session_start. */
+  let shutdownBoundSessionId: string | undefined;
+  /** The prepare-shutdown endpoint's unsubscribe, dropped when cleanup finishes. */
+  let prepareShutdownUnsubscribe: (() => void) | undefined;
   /** Whether the `@handle` autocomplete wrapper has been stacked on pi's provider. */
   let mentionProviderRegistered = false;
 
@@ -1022,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    shutdownBoundSessionId = ctx.sessionManager?.getSessionId?.();
     void jobsRpc.checkBackgroundJobs();
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -1089,6 +1095,11 @@ export default function (pi: ExtensionAPI) {
             return true;
           },
         },
+      });
+      prepareShutdownUnsubscribe = registerPrepareShutdownEndpoint({
+        events: pi.events,
+        getSessionId: () => shutdownBoundSessionId,
+        runShutdown: runShutdownCleanup,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -1367,35 +1378,64 @@ export default function (pi: ExtensionAPI) {
     scheduler.stop();
   });
 
+  // Shutdown cleanup runs exactly once per activation, whichever path starts
+  // it: this activation's own Pi `session_shutdown` handler, or the
+  // `subagents:rpc:prepare-shutdown` request pi-background-jobs sends before it
+  // disposes its own responder. Pi awaits handlers sequentially in load order,
+  // so a provider loaded first that waited for this activation's later handler
+  // would deadlock; the RPC invokes the same cleanup directly instead.
+  let shutdownCleanup: Promise<void> | undefined;
+
+  async function runShutdownCleanupBody(): Promise<void> {
+    try {
+      jobsRpc.dispose();
+      rpcHandle?.unsubSpawn();
+      rpcHandle?.unsubStop();
+      rpcHandle?.unsubPing();
+      rpcHandle?.unsubConsume();
+      rpcHandle = undefined;
+      currentCtx = undefined;
+      // Only release the global slot if this activation claimed it — a child
+      // session's shutdown must not delete the root session's registry entry.
+      if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
+        delete (globalThis as any)[MANAGER_KEY];
+      }
+      scheduler.stop();
+      // Before abortAll, and not folded into it: a workflow owns a worker thread
+      // as well as its children, and only its own signal terminates that.
+      for (const task of workflowTasks.values()) task.abortController.abort();
+      workflowTasks.clear();
+      manager.abortAll();
+      for (const timer of pendingNudges.values()) clearTimeout(timer);
+      pendingNudges.clear();
+      fleet.dispose();
+      // Awaited: it emits `session_shutdown` into every retained child session so
+      // extensions bound there can release what they armed in `session_start` (#242).
+      // pi awaits this handler, and the process exits right after — unawaited, those
+      // handlers would never run. Internally bounded, so a hung one can't strand quit.
+      await manager.dispose(pi);
+    } finally {
+      // No request after cleanup gets an acceptance or a reply. Duplicates that
+      // arrive while cleanup is still running simply join this same promise.
+      prepareShutdownUnsubscribe?.();
+      prepareShutdownUnsubscribe = undefined;
+    }
+  }
+
+  const runShutdownCleanup = (): Promise<void> => {
+    if (!shutdownCleanup) {
+      // Published before the body runs: a reentrant caller — a duplicate
+      // prepare request, or the Pi handler arriving mid-cleanup — must join
+      // this promise rather than start a second teardown.
+      shutdownCleanup = Promise.resolve().then(() => runShutdownCleanupBody());
+    }
+    return shutdownCleanup;
+  };
+
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
-    jobsRpc.dispose();
-    rpcHandle?.unsubSpawn();
-    rpcHandle?.unsubStop();
-    rpcHandle?.unsubPing();
-    rpcHandle?.unsubConsume();
-    rpcHandle = undefined;
-    currentCtx = undefined;
-    // Only release the global slot if this activation claimed it — a child
-    // session's shutdown must not delete the root session's registry entry.
-    if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
-      delete (globalThis as any)[MANAGER_KEY];
-    }
-    scheduler.stop();
-    // Before abortAll, and not folded into it: a workflow owns a worker thread
-    // as well as its children, and only its own signal terminates that.
-    for (const task of workflowTasks.values()) task.abortController.abort();
-    workflowTasks.clear();
-    manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
-    fleet.dispose();
-    // Awaited: it emits `session_shutdown` into every retained child session so
-    // extensions bound there can release what they armed in `session_start` (#242).
-    // pi awaits this handler, and the process exits right after — unawaited, those
-    // handlers would never run. Internally bounded, so a hung one can't strand quit.
-    await manager.dispose(pi);
+    await runShutdownCleanup();
   });
 
   // Live widget: show running agents above editor.

@@ -870,6 +870,8 @@ This is the bus-side half of what `get_subagent_result` does when it returns a r
 
 Reply channels are scoped per `requestId`, so concurrent requests don't interfere.
 
+One more channel is inbound and internal: `subagents:rpc:prepare-shutdown` (protocol version 1) is sent by `pi-background-jobs` at session shutdown so the worktree cleanup above runs before that extension disposes its own RPC responder. It is session-scoped, answers with a synchronous acceptance and a request-scoped reply, and is deliberately outside the public `subagents:rpc:ping` handshake; the full contract is in [`docs/rpc.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md).
+
 ## Persistent Agent Memory
 
 Agents can have persistent memory across sessions. Set `memory` in frontmatter to enable:
@@ -911,7 +913,7 @@ The automatic preservation commit uses `--no-verify`, so local pre-commit hooks 
 
 If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` call fails with a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. The call is reported as a failed tool call, not as a subagent that ran and returned that message, so the model doesn't retry it as if the agent had merely reported a problem. Initialize git and commit at least once, or omit `isolation`.
 
-When a background-jobs runtime answers on the event bus, the copy is only removed after that worktree's background jobs are stopped, and the result lists what was stopped (`Stopped 2 background job(s) still running in the worktree: …`). If termination cannot be confirmed — the runtime errored, timed out, or speaks a protocol this build does not know — the worktree is **retained**, the failure is reported in the result (or error), and no removal is attempted: a tree a live job may still be writing is never deleted. With no runtime loaded the step is a no-op and cleanup is unchanged. Named (`branch`) worktrees are never implicitly stopped and keep their jobs.
+When a background-jobs runtime answers on the event bus, the copy is only removed after that worktree's background jobs are stopped, and the result lists what was stopped (`Stopped 2 background job(s) still running in the worktree: …`). If termination cannot be confirmed — the runtime errored, timed out, or speaks a protocol this build does not know — the worktree is **retained**, the failure is reported in the result (or error), and no removal is attempted: a tree a live job may still be writing is never deleted. With no runtime loaded and no job-capable record the step is a no-op and cleanup is unchanged; once a runtime was possible for that agent, an unavailable RPC retains the tree instead, because a runtime that disappeared after launch must not make a live tree look safe to delete. Shutdown coordination removes the load-order question: pi-background-jobs asks this extension to run that same cleanup over `subagents:rpc:prepare-shutdown` before it disposes its own RPC responder. Named (`branch`) worktrees are never implicitly stopped and keep their jobs.
 
 A newly created worktree does not copy uncommitted or staged changes from the caller. Never use a fresh copy to review the caller's working-tree or staged diff: the agent sees committed files, not that diff. Reusing a named worktree, below, does expose **that worktree's** existing changes.
 

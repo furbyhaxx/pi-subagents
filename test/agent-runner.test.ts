@@ -209,6 +209,11 @@ const ctx = {
 const pi = {} as any;
 
 beforeEach(() => {
+  // The runner reads PI_CODING_AGENT_SESSION_DIR ahead of
+  // SettingsManager.getSessionDir() (src/agent-runner.ts). An inherited value
+  // would silently outrank every session-location mock below, so remove it for
+  // each test; the afterEach restores whatever the environment actually had.
+  vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", undefined);
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
@@ -227,6 +232,12 @@ beforeEach(() => {
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
+});
+
+afterEach(() => {
+  // Undo the per-test env isolation so the deleted (or test-stubbed) var never
+  // leaks into the next test or the next file sharing this worker.
+  vi.unstubAllEnvs();
 });
 
 describe("agent-runner final output capture", () => {
@@ -992,6 +1003,25 @@ describe("agent-runner session persistence", () => {
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       sessionManager: { kind: "persistent-session-manager" },
     }));
+  });
+
+  it("prefers PI_CODING_AGENT_SESSION_DIR over SettingsManager.getSessionDir()", async () => {
+    // The precedence this file's env isolation deliberately hides: the runner
+    // consults the env var before pi's configured session dir. Keep it covered
+    // here so the isolation cannot mask a regression in that chain.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
+    settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", "/env/pi/sessions");
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(sessionManagerCreate).toHaveBeenCalledWith(
+      "/tmp",
+      "/env/pi/sessions",
+      { parentSession: "/sessions/parent.jsonl" },
+    );
   });
 
   it("uses a frontmatter sessionDir when persistSession is true and sessionDir is configured", async () => {

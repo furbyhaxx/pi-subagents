@@ -4,7 +4,10 @@
  * a string. Drives the registered `Agent` / `get_subagent_result` tools and
  * inspects the text delivered back, for a turn-limit abort and a user stop.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -61,6 +64,31 @@ function ctx() {
 }
 
 const textOf = (r: any): string => r.content[0].text;
+
+// Extension activation loads `subagents.json` from getAgentDir() and overlays
+// global `agents/*.md` onto the defaults, so the developer's real profile must
+// not leak in: it can set `fallbackSubagent`, and it can override a default with
+// a disabled file — either turns the dispatch asserted below into the fallback.
+// Point global discovery at an empty directory, as the other wiring tests do.
+let hermeticAgentDir: string;
+let priorAgentDir: string | undefined;
+let priorHome: string | undefined;
+
+beforeEach(() => {
+  hermeticAgentDir = mkdtempSync(join(tmpdir(), "pi-status-note-agentdir-"));
+  priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  priorHome = process.env.HOME;
+  process.env.PI_CODING_AGENT_DIR = hermeticAgentDir;
+  process.env.HOME = hermeticAgentDir;
+});
+
+afterEach(() => {
+  if (priorAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+  if (priorHome == null) delete process.env.HOME;
+  else process.env.HOME = priorHome;
+  rmSync(hermeticAgentDir, { recursive: true, force: true });
+});
 
 describe("status note reaches the parent through the real handlers", () => {
   afterEach(() => {
