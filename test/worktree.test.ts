@@ -69,6 +69,8 @@ let artifactDir: string;
 beforeEach(() => {
   artifactDir = mkdtempSync(join(tmpdir(), "pi-wt-artifacts-"));
   vi.stubEnv("PI_CODING_AGENT_DIR", artifactDir);
+  // Sandboxed: an inherited session root would move the default artifact container.
+  vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", undefined);
 });
 afterEach(() => {
   vi.unstubAllEnvs();

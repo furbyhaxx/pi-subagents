@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
-import { restoredRecordFromSession } from "../src/index.js";
+import subagentsExtension, { restoredRecordFromSession } from "../src/index.js";
+import { createOutputFilePath } from "../src/output-file.js";
+import { resolveSubagentSessionDir } from "../src/session-dir.js";
 
 const dirs: string[] = [];
 
@@ -214,5 +216,171 @@ describe("persisted subagent session restore", () => {
     } finally {
       await manager.dispose();
     }
+  });
+});
+
+/**
+ * The session container the runner hands to SessionManager, exercised against
+ * the real SessionManager and real files: a child that ran in a different cwd
+ * (an isolated worktree) must still be discovered from its parent's context,
+ * and its default artifacts must not land in the agent dir.
+ */
+describe("persisted subagent restore under the session-root override", () => {
+  let root: string;
+  let agentDir: string;
+  let sessionRoot: string;
+  let parentCwd: string;
+  let worktreeCwd: string;
+  let previousCwd: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "pi-subagents-env-restore-"));
+    agentDir = join(root, "agent");
+    sessionRoot = join(root, "env-sessions");
+    parentCwd = join(root, "parent-project");
+    worktreeCwd = join(root, "worktree-copy");
+    mkdirSync(parentCwd, { recursive: true });
+    mkdirSync(worktreeCwd, { recursive: true });
+    mkdirSync(join(parentCwd, ".pi"), { recursive: true });
+    writeFileSync(join(parentCwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, workflowsEnabled: false }));
+    previousCwd = process.cwd();
+    process.chdir(parentCwd);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    vi.stubEnv("HOME", agentDir);
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", sessionRoot);
+  });
+
+  afterEach(() => {
+    process.chdir(previousCwd);
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function persistedChild(opts: { dir: string; cwd: string; parentSession: string; agentId: string; task: string }) {
+    const child = SessionManager.create(opts.cwd, opts.dir, { parentSession: opts.parentSession });
+    child.appendModelChange("openai", "gpt-test");
+    child.appendSessionInfo(`explorer#${opts.agentId.slice(0, 8)}`);
+    child.appendCustomEntry("subagents:task", { prompt: opts.task });
+    child.appendCustomEntry("subagents:invocation", { agentId: opts.agentId, startedAt: 1 });
+    child.appendMessage({ role: "user", content: [{ type: "text", text: opts.task }], timestamp: 1 } as never);
+    child.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      api: "test",
+      provider: "openai",
+      model: "gpt-test",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: 2,
+    } as never);
+    return child;
+  }
+
+  /** Boot the real extension against a parent session and expose its tool registry. */
+  function boot(sessionManager: SessionManager) {
+    const tools = new Map<string, any>();
+    const lifecycle = new Map<string, any>();
+    const pi = {
+      registerMessageRenderer: vi.fn(),
+      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+      registerCommand: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+      registerFlag: vi.fn(),
+      getFlag: vi.fn(),
+      on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
+      events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
+      appendEntry: vi.fn((customType: string, data: unknown) => { sessionManager.appendCustomEntry(customType, data); }),
+      sendMessage: vi.fn(),
+      getAllTools: () => [],
+    } as any;
+    subagentsExtension(pi);
+    const ctx = {
+      hasUI: false,
+      ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
+      cwd: parentCwd,
+      model: undefined,
+      modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+      sessionManager,
+      getSystemPrompt: vi.fn(() => "parent"),
+    } as any;
+    return { tools, lifecycle, ctx };
+  }
+
+  it("discovers worktree children from the session container and keeps artifacts out of the agent dir", async () => {
+    // The container the runner resolves for a persisted child.
+    const container = resolveSubagentSessionDir()!;
+    expect(container).toBe(join(sessionRoot, "subagents"));
+    const parent = SessionManager.create(parentCwd, sessionRoot);
+    const parentSession = parent.getSessionFile()!;
+    parent.appendCustomEntry("subagents:record", { id: "child-agent-id", status: "completed", result: "RESTORED-RESULT", startedAt: 1 });
+    parent.appendCustomEntry("subagents:record", { id: "legacy-agent-id", status: "completed", result: "LEGACY-RESULT", startedAt: 1 });
+    parent.appendMessage({ role: "user", content: [{ type: "text", text: "parent turn" }], timestamp: 1 } as never);
+
+    // New layout: the child of this parent, persisted in a different cwd.
+    const child = persistedChild({ dir: container, cwd: worktreeCwd, parentSession, agentId: "child-agent-id", task: "child task" });
+    // Legacy layout: a child persisted directly in the parent's session dir.
+    const legacy = persistedChild({ dir: sessionRoot, cwd: parentCwd, parentSession, agentId: "legacy-agent-id", task: "legacy task" });
+    // Another parent's child in the same container — must not be claimed.
+    const stranger = persistedChild({
+      dir: container,
+      cwd: worktreeCwd,
+      parentSession: join(sessionRoot, "other-parent.jsonl"),
+      agentId: "stranger-id",
+      task: "stranger task",
+    });
+
+    const childFile = child.getSessionFile()!;
+    expect(childFile.startsWith(container)).toBe(true);
+    expect(existsSync(childFile)).toBe(true);
+
+    const { tools, lifecycle, ctx } = boot(parent);
+
+    await lifecycle.get("session_start")?.({}, ctx);
+
+    const read = tools.get("get_subagent_result");
+    const childInfo = (await SessionManager.listAll(container)).find(info => info.path === childFile)!;
+    const restoredChild = await read.execute("tc-1", { agent_id: `restored-${childInfo.id}` }, undefined, undefined, ctx);
+    expect(restoredChild.content[0].text).toContain("RESTORED-RESULT");
+
+    const legacyInfo = (await SessionManager.listAll(sessionRoot)).find(info => info.path === legacy.getSessionFile())!;
+    const restoredLegacy = await read.execute("tc-2", { agent_id: `restored-${legacyInfo.id}` }, undefined, undefined, ctx);
+    expect(restoredLegacy.content[0].text).toContain("LEGACY-RESULT");
+
+    const strangerInfo = (await SessionManager.listAll(container)).find(info => info.path === stranger.getSessionFile())!;
+    const restoredStranger = await read.execute("tc-3", { agent_id: `restored-${strangerInfo.id}` }, undefined, undefined, ctx);
+    expect(restoredStranger.content[0].text).toContain("Agent not found");
+
+    // Default artifacts follow the same container, not the agent dir.
+    const binding = parent.getEntries().find(entry => entry.type === "custom" && entry.customType === "subagents:artifacts")!;
+    expect((binding as { data?: { artifactRoot?: string } }).data?.artifactRoot?.startsWith(container)).toBe(true);
+    expect(createOutputFilePath(parentCwd, "agent-1", "session-1").startsWith(container)).toBe(true);
+    expect(existsSync(join(agentDir, "sessions"))).toBe(false);
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("lists the child container once when it is also the parent's session directory", async () => {
+    const container = join(sessionRoot, "subagents");
+    // A parent whose session dir IS the container: the helper and
+    // getSessionDir() resolve to the same path, so it must be read once.
+    const parent = SessionManager.create(parentCwd, container);
+    const parentSession = parent.getSessionFile()!;
+    parent.appendCustomEntry("subagents:record", { id: "child-agent-id", status: "completed", result: "RESTORED-ONCE", startedAt: 1 });
+    const child = persistedChild({ dir: container, cwd: worktreeCwd, parentSession, agentId: "child-agent-id", task: "child task" });
+
+    const { tools, lifecycle, ctx } = boot(parent);
+    const listAll = vi.spyOn(SessionManager, "listAll");
+    try {
+      await lifecycle.get("session_start")?.({}, ctx);
+      expect(listAll).toHaveBeenCalledTimes(1);
+    } finally {
+      listAll.mockRestore();
+    }
+
+    const childInfo = (await SessionManager.listAll(container)).find(info => info.path === child.getSessionFile())!;
+    const restored = await tools.get("get_subagent_result").execute("tc-1", { agent_id: `restored-${childInfo.id}` }, undefined, undefined, ctx);
+    expect(restored.content[0].text).toContain("RESTORED-ONCE");
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
   });
 });

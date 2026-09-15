@@ -37,6 +37,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, get
 import type { RetryModelCandidate } from "./pi-retry-adapter.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { resolveSubagentSessionDir } from "./session-dir.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type ViewerViewMode, type WidgetMode } from "./types.js";
@@ -1055,8 +1056,26 @@ export default function (pi: ExtensionAPI) {
     if (parentSessionFile) {
       try {
         const parentEntries = ctx.sessionManager?.getEntries?.() ?? [];
-        const sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager?.getSessionDir?.());
+        // Children live below pi's session root: the new
+        // `<PI_CODING_AGENT_SESSION_DIR>/subagents` container, plus the
+        // parent's own session directory for children persisted before that
+        // container existed. Both are explicit directories, and
+        // `SessionManager.list` filters an explicit directory by the parent
+        // cwd — hiding a child that ran in an isolated worktree — so each is
+        // listed with `listAll`, which scans only that directory. Without any
+        // explicit directory the original default-directory listing is kept.
+        const dirs = [...new Set(
+          [resolveSubagentSessionDir(), ctx.sessionManager?.getSessionDir?.()].filter(
+            (dir): dir is string => typeof dir === "string" && dir.length > 0,
+          ),
+        )];
+        const sessions = dirs.length > 0
+          ? (await Promise.all(dirs.map(dir => SessionManager.listAll(dir)))).flat()
+          : await SessionManager.list(ctx.cwd);
+        const seenFiles = new Set<string>();
         for (const info of sessions) {
+          if (seenFiles.has(info.path)) continue;
+          seenFiles.add(info.path);
           if (info.parentSessionPath !== parentSessionFile) continue;
           const record = restoredRecordFromSession(info, ctx.sessionManager?.getSessionId?.() ?? "standalone", parentEntries);
           if (!record) continue;
@@ -3954,7 +3973,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
     const placement = getWorktreeDirectory();
     const binding = sessionArtifacts(ctx);
     const artifactDirectory = getSessionArtifactDirectory();
-    const artifactDirectoryLabel = artifactDirectory === undefined || artifactDirectory === join(getAgentDir(), "sessions") ? "Default" : artifactDirectory;
+    const defaultArtifactDirectory = resolveSubagentSessionDir() ?? join(getAgentDir(), "sessions");
+    const artifactDirectoryLabel = artifactDirectory === undefined || artifactDirectory === defaultArtifactDirectory ? "Default" : artifactDirectory;
     let worktreeContainer = placement.mode === "session" ? join(binding.artifactRoot, "worktrees")
       : placement.mode === "project" ? join(binding.originCwd, ".worktrees") : resolve(binding.originCwd, placement.path);
     if (placement.mode === "custom") {
@@ -4422,7 +4442,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         if (choice === "Default") {
           // An explicit path also overrides a custom global default; omission
           // would restore that global value on the next load.
-          setSessionArtifactDirectory(join(getAgentDir(), "sessions"));
+          setSessionArtifactDirectory(defaultArtifactDirectory);
           notifyApplied(ctx, "Session artifact directory reset. Applies to new sessions only.");
         } else if (choice === "Custom path") {
           const input = await ctx.ui.input("Artifact container (absolute or relative to origin project)", getSessionArtifactDirectory());

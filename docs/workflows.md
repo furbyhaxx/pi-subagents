@@ -309,15 +309,15 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 
 | What | Where |
 |---|---|
-| An inline script, as run | `<agent dir>/sessions/<project>/<session>/tasks/<run id>.workflow.js` by default |
+| An inline script, as run | `<default artifact container>/<project>/<session>/tasks/<run id>.workflow.js` |
 | The resume journal | the same directory, `<run id>.workflow.jsonl` |
 | Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins |
 
-Scripts, journals and transcripts use `sessionArtifactDirectory`: default `join(getAgentDir(), 'sessions')`, where `getAgentDir()` respects `PI_CODING_AGENT_DIR` and otherwise is `~/.pi/agent`. A custom absolute path is used directly; a relative one is anchored to the origin project. The resolved per-session root is saved and reused on session resume; setting changes affect new sessions only. No automatic migration, deletion, expiration, interrupted-agent restart or cross-session workflow replay is added. Existing temporary artifacts are not migrated or deleted. An unwritable root reports an error rather than silently falling back to `/tmp`. Explicitly choosing temporary storage gives up default durability.
+Scripts, journals and transcripts use `sessionArtifactDirectory`: default `join(getAgentDir(), 'sessions')`, or `<PI_CODING_AGENT_SESSION_DIR>/subagents` when that session-root override is set, where `getAgentDir()` respects `PI_CODING_AGENT_DIR` and otherwise is `~/.pi/agent`. An explicit `sessionArtifactDirectory` always wins. A custom absolute path is used directly; a relative one is anchored to the origin project. The resolved per-session root is saved and reused on session resume; setting changes affect new sessions only. No automatic migration, deletion, expiration, interrupted-agent restart or cross-session workflow replay is added. Existing temporary artifacts are not migrated or deleted. An unwritable root reports an error rather than silently falling back to `/tmp`. Explicitly choosing temporary storage gives up default durability.
 
 Default worktrees live under `<project>/<session>/worktrees/`, sibling to `tasks/`. `worktreeDirectory` independently chooses `{ mode: 'session' }` (default), `{ mode: 'project' }` (`<origin-repository>/.worktrees/`) or `{ mode: 'custom', path: '...' }`. Relative custom paths resolve against the origin repository, never a nested child's worktree. Changes apply to future acquisitions, not existing worktrees; registered branch paths take precedence. A container inside the repository must already be ignored: acquisition fails with an actionable error otherwise, without editing `.gitignore`. Configure both directories in `/agents → Settings`; see [storage settings](../README.md#persistent-settings).
 
-This is extension-artifact storage, independent of pi session JSONL placement (`session_dir` / `PI_CODING_AGENT_SESSION_DIR`). Persistent storage does not change anonymous-worktree cleanup; only named worktrees are retained.
+This is extension-artifact storage, independent of an agent's `session_dir`; without an explicit `sessionArtifactDirectory` it follows `PI_CODING_AGENT_SESSION_DIR` into the same `subagents/` container as the child's own session file. Persistent storage does not change anonymous-worktree cleanup; only named worktrees are retained.
 
 ### Limits and caps
 

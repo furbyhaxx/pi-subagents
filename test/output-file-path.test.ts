@@ -13,6 +13,8 @@ describe("createOutputFilePath", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "pi-outpath-"));
     vi.stubEnv("PI_CODING_AGENT_DIR", dir);
+    // Sandboxed: an inherited session root would move the default container.
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", undefined);
     setSessionArtifactDirectory(undefined);
   });
   afterEach(() => {
@@ -23,6 +25,22 @@ describe("createOutputFilePath", () => {
   it("builds <agent-dir>/sessions/<project-key>/<session>/tasks/<agent>.output", () => {
     const path = createOutputFilePath("/home/user/project", AGENT, SESSION);
     expect(path).toBe(join(sessionArtifactRoot("/home/user/project", SESSION), "tasks", `${AGENT}.output`));
+    expect(path.startsWith(join(dir, "sessions", "project-"))).toBe(true);
+  });
+
+  it("defaults to <session-root>/subagents without touching the agent dir", () => {
+    const sessionRoot = join(dir, "env-sessions");
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", sessionRoot);
+    const path = createOutputFilePath("/home/user/project", AGENT, SESSION);
+    expect(sessionArtifactRoot("/home/user/project", SESSION).startsWith(join(sessionRoot, "subagents", "project-"))).toBe(true);
+    expect(path.startsWith(join(sessionRoot, "subagents"))).toBe(true);
+    expect(existsSync(dirname(path))).toBe(true);
+    expect(existsSync(join(dir, "sessions"))).toBe(false);
+  });
+
+  it("treats an empty session root as unset", () => {
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", "");
+    const path = createOutputFilePath("/home/user/project", AGENT, SESSION);
     expect(path.startsWith(join(dir, "sessions", "project-"))).toBe(true);
   });
 

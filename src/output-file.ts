@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { type AgentSession, type AgentSessionEvent, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { resolveSubagentSessionDir } from "./session-dir.js";
 import type { WorktreeDirectory } from "./worktree.js";
 
 let sessionArtifactDirectory: string | undefined;
@@ -35,8 +36,12 @@ export function sessionArtifactRoot(cwd: string, sessionId: string): string {
   }
   const origin = resolve(cwd);
   const project = `${basename(origin).replace(/[^a-zA-Z0-9_-]/g, "-") || "project"}-${createHash("sha256").update(origin).digest("hex").slice(0, 16)}`;
+  // Explicit setting wins; otherwise the container under pi's session-root
+  // override, so a child's artifacts sit beside its own session, not the
+  // parent's; then the agent-dir default when no override is set.
   const container = sessionArtifactDirectory === undefined
-    ? join(getAgentDir(), "sessions") : resolve(origin, sessionArtifactDirectory);
+    ? resolveSubagentSessionDir() ?? join(getAgentDir(), "sessions")
+    : resolve(origin, sessionArtifactDirectory);
   return privateDirectory(join(privateDirectory(join(container, project)), sessionId));
 }
 

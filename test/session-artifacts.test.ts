@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "../src/index.js";
@@ -13,6 +13,8 @@ describe("persistent session artifacts", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "pi-artifacts-test-"));
     vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "agent"));
+    // Sandboxed: an inherited session root would move the default container.
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", undefined);
     setSessionArtifactDirectory(undefined);
     setWorktreeDirectory({ mode: "session" });
   });
@@ -31,6 +33,13 @@ describe("persistent session artifacts", () => {
     if (process.platform !== "win32") expect(statSync(root).mode & 0o777).toBe(0o700);
   });
 
+  it("keeps an explicit artifact directory ahead of the session-root override", () => {
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", join(dir, "env-sessions"));
+    setSessionArtifactDirectory(join(dir, "explicit"));
+    const root = sessionArtifactRoot(join(dir, "origin"), "session");
+    expect(root.startsWith(join(dir, "explicit"))).toBe(true);
+  });
+
   it("anchors relative settings to origin and preserves explicit roots after settings change", () => {
     const origin = join(dir, "origin");
     setSessionArtifactDirectory("artifacts");
@@ -45,6 +54,26 @@ describe("persistent session artifacts", () => {
     expect(readFileSync(output, "utf8")).toBe("transcript");
     expect(readFileSync(journal, "utf8")).toBe("journal");
     expect(sessionArtifactRoot(origin, "new-session").startsWith(join(dir, "different"))).toBe(true);
+  });
+
+  it("anchors a relative session root to the process cwd and reuses the recorded absolute root", () => {
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", "relative-sessions");
+    const origin = join(dir, "origin");
+    const restore = process.cwd();
+    process.chdir(dir);
+    try {
+      const cwd = process.cwd();
+      const root = sessionArtifactRoot(origin, "session");
+      expect(isAbsolute(root)).toBe(true);
+      expect(root.startsWith(join(cwd, "relative-sessions", "subagents"))).toBe(true);
+      expect(sessionArtifactRoot(origin, "session")).toBe(root);
+      // A persisted binding replays the recorded root from any cwd.
+      const output = createOutputFilePath(cwd, "child", "session", root);
+      expect(output).toBe(join(root, "tasks", "child.output"));
+      expect(createOutputFilePath("/nested/worktree", "child", "session", root)).toBe(output);
+    } finally {
+      process.chdir(restore);
+    }
   });
 
   it("fails rather than falling back when persistent storage cannot be created", () => {

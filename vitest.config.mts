@@ -12,6 +12,12 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
+    // Sandbox `PI_CODING_AGENT_SESSION_DIR` per test file, before any test
+    // imports — the fixtures isolate the agent dir and HOME, but an inherited
+    // session-root override sends real child sessions into the live session
+    // store. See test/setup-env.ts for the lifetime and the direct-assignment
+    // requirement (vi.stubEnv here would be undone by unstubAllEnvs).
+    setupFiles: ["./test/setup-env.ts"],
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
     // Local reporting only — deliberately no `thresholds`, and not wired into
     // CI. src/index.ts is mostly the /agents wizard, which is TUI flow with

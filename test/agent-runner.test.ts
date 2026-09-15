@@ -1005,10 +1005,12 @@ describe("agent-runner session persistence", () => {
     }));
   });
 
-  it("prefers PI_CODING_AGENT_SESSION_DIR over SettingsManager.getSessionDir()", async () => {
+  it("nests PI_CODING_AGENT_SESSION_DIR children in a subagents container, ahead of SettingsManager.getSessionDir()", async () => {
     // The precedence this file's env isolation deliberately hides: the runner
-    // consults the env var before pi's configured session dir. Keep it covered
-    // here so the isolation cannot mask a regression in that chain.
+    // consults the env var before pi's configured session dir, and writes the
+    // child into a container of its own rather than beside the parent's
+    // session. Keep it covered here so the isolation cannot mask a regression
+    // in that chain.
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
     settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
     vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", "/env/pi/sessions");
@@ -1019,16 +1021,17 @@ describe("agent-runner session persistence", () => {
 
     expect(sessionManagerCreate).toHaveBeenCalledWith(
       "/tmp",
-      "/env/pi/sessions",
+      "/env/pi/sessions/subagents",
       { parentSession: "/sessions/parent.jsonl" },
     );
   });
 
-  it("uses a frontmatter sessionDir when persistSession is true and sessionDir is configured", async () => {
+  it("uses a frontmatter sessionDir ahead of the env container and SettingsManager.getSessionDir()", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(
       makeAgentConfig({ persistSession: true, sessionDir: ".seams/pi-sessions/seam-plan-reviewer" }),
     );
     settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
+    vi.stubEnv("PI_CODING_AGENT_SESSION_DIR", "/env/pi/sessions");
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
 

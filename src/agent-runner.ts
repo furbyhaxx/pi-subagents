@@ -36,6 +36,7 @@ import {
   replaceSessionModelCandidates,
 } from "./pi-retry-adapter.js";
 import { buildAgentPrompt, buildWorktreeScope, type PromptExtras } from "./prompts.js";
+import { resolveSubagentSessionDir } from "./session-dir.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -1152,7 +1153,11 @@ export async function runAgent(
     });
   }
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
-  const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
+  // The frontmatter session_dir above outranks this. The default is the
+  // container under pi's session-root override — a child must not land in the
+  // parent's session directory — and pi's own configured session dir, then
+  // SessionManager's default, when that override is unset.
+  const defaultSessionDir = resolveSubagentSessionDir() ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,
   // which `rememberAgents` supplies for top-level agents only. Same precedence
   // as `outputTranscript`.
