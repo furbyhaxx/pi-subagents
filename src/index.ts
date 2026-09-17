@@ -30,6 +30,16 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
+import { MessagingCardFeed } from "./messaging/cards.js";
+import { AgentManagerDeliveryBridge } from "./messaging/delivery-bridge.js";
+import { isSqliteAvailable } from "./messaging/driver.js";
+import { MESSAGING_ENTRY_TYPE, type MessagingCardData } from "./messaging/entry.js";
+import { resolveMessagingLocation } from "./messaging/scope.js";
+import { AgentMessagingService } from "./messaging/service.js";
+import { SocketNotifyBus } from "./messaging/socket-notify-bus.js";
+import { SqliteStore } from "./messaging/store.js";
+import { createMessagingTools } from "./messaging/tool.js";
+import type { MessagingSurface } from "./messaging/types.js";
 import { describeModel, type ModelRegistry, parseCanonicalModelId, type ResolvedModelCandidate, resolveCanonicalModel, resolveModel, resolveModelCandidates } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -61,8 +71,11 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { createBackgroundJobsMenuRpc } from "./ui/background-jobs-rpc.js";
+import { showBlackboardPanel } from "./ui/blackboard-panel.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
+import { renderMessagingCard } from "./ui/messaging-card.js";
+import { showPeersPanel } from "./ui/peers-panel.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
@@ -572,6 +585,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerEntryRenderer<WorkflowEntryData>(WORKFLOW_ENTRY_TYPE, (entry, _options, theme) =>
     renderWorkflowEntryCard(entry.data, theme));
 
+  // ---- Bus traffic rendered as display-only transcript cards ----
+  // Registered unconditionally, like the workflow renderer above: messaging may
+  // start later (or not at all in this session), and an entry written by an
+  // earlier session still has to draw when the transcript is reloaded.
+  pi.registerEntryRenderer<MessagingCardData>(MESSAGING_ENTRY_TYPE, (entry, _options, theme) =>
+    renderMessagingCard(entry.data, theme));
+
   // Registered at activation; READ from session_start. The host applies CLI
   // values after every extension factory has run, so `getFlag` here would only
   // ever hand back the registered default (see the read site below).
@@ -584,7 +604,9 @@ export default function (pi: ExtensionAPI) {
 
   // Read directly rather than waiting for applyAndEmitLoaded below: this decides
   // the initial load, which happens hundreds of lines before settings are applied.
-  let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+  const initialSettings = loadSettings(process.cwd());
+  let strictAgentFiles = initialSettings.strictAgentFiles === true;
+  const messagingSettings = initialSettings.messaging ?? {};
 
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
@@ -770,6 +792,31 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  let messagingService: AgentMessagingService | undefined;
+  let messagingCards: MessagingCardFeed | undefined;
+  let mainMessagingCaller: { agentId: string; sessionId: string } | undefined;
+  if (messagingSettings.enabled !== false && isSqliteAvailable()) {
+    for (const tool of createMessagingTools(() => messagingService, () => mainMessagingCaller)) {
+      pi.registerTool(tool);
+    }
+  }
+
+  function registerMessagingRecord(record: AgentRecord, status: "queued" | "running" | "settled" | "gone"): void {
+    if (!messagingService || !isTopLevelAgent(record)) return;
+    messagingService.registerAgent({
+      agentId: record.id,
+      handle: record.handle,
+      alias: record.alias,
+      type: record.type,
+      description: record.description,
+      sessionId: record.rootSessionId ?? "standalone",
+      kind: "sub",
+      status,
+      pid: process.pid,
+      sessionFile: record.sessionFile,
+    });
+  }
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
@@ -777,6 +824,10 @@ export default function (pi: ExtensionAPI) {
     // and dialog. Keep them out of top-level lifecycle, transcript,
     // notification, and UI channels.
     if (!isTopLevelAgent(record)) return;
+    registerMessagingRecord(
+      record,
+      record.status === "aborted" || record.status === "stopped" || record.status === "error" ? "gone" : "settled",
+    );
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -821,6 +872,7 @@ export default function (pi: ExtensionAPI) {
     widget.update();
   }, undefined, (record) => {
     if (!isTopLevelAgent(record)) return;
+    registerMessagingRecord(record, "running");
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -856,6 +908,10 @@ export default function (pi: ExtensionAPI) {
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
   });
+  if (messagingSettings.enabled !== false && isSqliteAvailable()) {
+    manager.setMessagingToolFactory(caller =>
+      createMessagingTools(() => messagingService, () => caller));
+  }
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -1050,8 +1106,96 @@ export default function (pi: ExtensionAPI) {
       }
       origin = top.stdout.trim();
     }
-    sessionArtifacts({ ...ctx, cwd: origin });
+    const artifacts = sessionArtifacts({ ...ctx, cwd: origin });
     manager.clearCompleted(true);
+
+    if (messagingSettings.enabled !== false && !messagingService) {
+      if (!isSqliteAvailable()) {
+        console.warn("[pi-subagents] Agent messaging unavailable: this Node runtime has no node:sqlite");
+      } else {
+        try {
+          const rootSessionId = ctx.sessionManager.getSessionId();
+          const location = resolveMessagingLocation({
+            originProjectRoot: artifacts.originCwd,
+            mode: messagingSettings.scope ?? "project",
+            rootSessionId,
+            artifactRoot: artifacts.artifactRoot,
+            directory: messagingSettings.directory,
+          });
+          const mainAgentId = `main:${rootSessionId}`;
+          mainMessagingCaller = { agentId: mainAgentId, sessionId: rootSessionId };
+          const store = new SqliteStore({
+            filePath: location.databasePath,
+            scopeKey: location.scopeKey,
+            scopeMode: location.mode,
+            clock: Date.now,
+            maxHopCount: messagingSettings.maxHops ?? 4,
+            messageTtlMs: messagingSettings.messageTtlMs ?? 3_600_000,
+            mailboxLimit: messagingSettings.mailboxLimit ?? 200,
+            operatorTopicPrefix: messagingSettings.operatorTopicPrefix,
+          });
+          const bridge = new AgentManagerDeliveryBridge({
+            manager,
+            pi,
+            mainAgentId,
+            mainSessionId: rootSessionId,
+            mainSurface: () => messagingSettings.surface ?? "ui",
+          });
+          messagingCards = new MessagingCardFeed({
+            mainAgentId,
+            mainSessionId: rootSessionId,
+            append: data => { pi.appendEntry<MessagingCardData>(MESSAGING_ENTRY_TYPE, data); },
+          });
+          const notifyBus = messagingSettings.notifySocket === false
+            ? undefined
+            : new SocketNotifyBus({
+              scopeKey: location.scopeKey,
+              socketPath: messagingSettings.notifySocket,
+              onBump: () => {
+                void messagingService?.pollOwnedMailboxes().catch(error => {
+                  console.warn("[pi-subagents] Agent messaging socket poll failed:", error);
+                });
+              },
+            });
+          messagingService = new AgentMessagingService({
+            store,
+            bridge,
+            operatorSessionId: rootSessionId,
+            notifyBus,
+            onActivity: activity => messagingCards?.record(activity),
+            maxWakesPerMinute: messagingSettings.maxWakesPerMinute ?? 6,
+            maxHops: messagingSettings.maxHops ?? 4,
+            maxWaitMs: messagingSettings.maxWaitMs ?? 120_000,
+            allowForeignMainWake: messagingSettings.allowForeignMainWake ?? true,
+          });
+          const aliasValue = ctx.sessionManager.getSessionName?.()?.trim().toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || undefined;
+          messagingService.registerAgent({
+            agentId: mainAgentId,
+            handle: `main-${rootSessionId.slice(0, 6)}`,
+            alias: aliasValue,
+            type: "main",
+            description: "Main session",
+            sessionId: rootSessionId,
+            kind: "main",
+            status: "running",
+            pid: process.pid,
+            sessionFile: ctx.sessionManager.getSessionFile?.(),
+          });
+          for (const record of manager.listAgents()) {
+            registerMessagingRecord(
+              record,
+              record.status === "running" ? "running"
+                : record.status === "queued" ? "queued"
+                : record.status === "completed" || record.status === "steered" ? "settled" : "gone",
+            );
+          }
+          messagingService.start();
+        } catch (error) {
+          console.warn(`[pi-subagents] Failed to start agent messaging: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
     const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
     if (parentSessionFile) {
       try {
@@ -1335,6 +1479,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", () => {
     manager.clearCompleted(true);
     scheduler.stop();
+    messagingService?.close();
+    messagingService = undefined;
+    messagingCards?.close();
+    messagingCards = undefined;
+    mainMessagingCaller = undefined;
   });
 
   // Shutdown cleanup runs exactly once per activation, whichever path starts
@@ -1373,6 +1522,11 @@ export default function (pi: ExtensionAPI) {
       // pi awaits this handler, and the process exits right after — unawaited, those
       // handlers would never run. Internally bounded, so a hung one can't strand quit.
       await manager.dispose(pi);
+      messagingService?.close();
+      messagingService = undefined;
+      messagingCards?.close();
+      messagingCards = undefined;
+      mainMessagingCaller = undefined;
     } finally {
       // No request after cleanup gets an acceptance or a reply. Duplicates that
       // arrive while cleanup is still running simply join this same promise.
@@ -3368,6 +3522,20 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Workflows (${workflowTasks.size})`);
     }
 
+    if (messagingService) {
+      try {
+        const topicCount = new Set(messagingService.boardList().map(entry => entry.topic)).size;
+        options.push(`Blackboard (${topicCount} topic${topicCount === 1 ? "" : "s"})`);
+      } catch {
+        options.push("Blackboard");
+      }
+      try {
+        options.push(`Peers (${messagingService.panelPeers().length})`);
+      } catch {
+        options.push("Peers");
+      }
+    }
+
     if (jobsRpc.available) {
       try {
         if (await jobsRpc.checkBackgroundJobs()) {
@@ -3407,6 +3575,25 @@ Terse command-style prompts produce shallow, generic work.
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Workflows (")) {
       await showWorkflowsMenu(ctx, workflowMenuDeps);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Blackboard" || choice.startsWith("Blackboard (")) {
+      if (messagingService) await showBlackboardPanel(ctx.ui, messagingService);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Peers" || choice.startsWith("Peers (")) {
+      const service = messagingService;
+      if (!service) return;
+      const result = await showPeersPanel(ctx.ui, service, {
+        openLocal: async agentId => {
+          const peer = service.panelPeers().find(candidate => candidate.agentId === agentId);
+          if (!peer || peer.access !== "local") return "missing";
+          const record = manager.getRecord(agentId);
+          if (!record || !isTopLevelAgent(record)) return "missing";
+          if (!record.session) return "no-session";
+          await viewAgentConversation(ctx, record);
+          return "opened";
+        },
+      });
+      if (result === "main") return;
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Jobs (")) {
       try {
@@ -3949,6 +4136,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
    */
   function snapshotSettings() {
     return {
+      messaging: messagingSettings,
       maxConcurrent: manager.getMaxConcurrent(),
       // 0 = unlimited, and the default — see SubagentsSettings.
       maxConcurrentForeground: manager.getMaxConcurrentForeground(),
@@ -4233,6 +4421,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["model", "direct", "off"],
         },
         {
+          id: "messagingEnabled",
+          label: "Peer messaging",
+          description: "Let agents in this project message each other and share a blackboard. Applies on the next pi session.",
+          currentValue: messagingSettings.enabled !== false ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "messagingSurface",
+          label: "Message surface",
+          description: "Incoming peer messages for the main session: off = mailbox only; ui = unread-count notice; context = full attributed body. Per-agent messaging_surface frontmatter overrides the project default for subagents.",
+          currentValue: messagingSettings.surface ?? "ui",
+          values: ["off", "ui", "context"],
+        },
+        {
           id: "rememberAgents",
           label: "Remember agents",
           description: "Persist subagent sessions so `@handle` can resume one long after it finished (they also appear in /resume)",
@@ -4422,6 +4624,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
               ? "Agent mentions on — a conversation clone starts a mentioned agent off-screen"
               : "Agent mentions on — a mentioned agent starts here, with no model call",
         );
+      } else if (id === "messagingEnabled") {
+        const enabled = value === "on";
+        messagingSettings.enabled = enabled;
+        notifyApplied(ctx, `Peer messaging ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
+      } else if (id === "messagingSurface") {
+        messagingSettings.surface = value as MessagingSurface;
+        notifyApplied(ctx, `Message surface set to ${value}. Applies immediately.`);
       } else if (id === "rememberAgents") {
         const enabled = value === "on";
         setRememberAgents(enabled);

@@ -6,10 +6,28 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import type { MessagingScopeMode } from "./messaging/scope.js";
+import type { MessagingSurface } from "./messaging/types.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, ViewerViewMode, WidgetMode } from "./types.js";
 import type { WorktreeDirectory } from "./worktree.js";
 
+export interface MessagingSettings {
+  enabled?: boolean;
+  scope?: MessagingScopeMode;
+  directory?: string;
+  operatorTopicPrefix?: string;
+  notifySocket?: string | false;
+  maxWakesPerMinute?: number;
+  maxHops?: number;
+  messageTtlMs?: number;
+  maxWaitMs?: number;
+  mailboxLimit?: number;
+  surface?: MessagingSurface;
+  allowForeignMainWake?: boolean;
+}
+
 export interface SubagentsSettings {
+  messaging?: MessagingSettings;
   /** Persistent artifact container; relative paths anchor to the origin project. New sessions only. */
   sessionArtifactDirectory?: string;
   /** Placement for future worktree acquisitions, independently of transcripts. */
@@ -361,6 +379,8 @@ const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "bac
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_VIEWER_VIEW_MODES: ReadonlySet<string> = new Set<ViewerViewMode>(["steps", "raw"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
+const VALID_MESSAGING_SCOPES: ReadonlySet<string> = new Set<MessagingScopeMode>(["project", "session"]);
+const VALID_MESSAGING_SURFACES: ReadonlySet<string> = new Set<MessagingSurface>(["off", "ui", "context"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -377,6 +397,35 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
   const r = raw as Record<string, unknown>;
   const out: SubagentsSettings = {};
+  if (r.messaging && typeof r.messaging === "object") {
+    const rawMessaging = r.messaging as Record<string, unknown>;
+    const messaging: MessagingSettings = {};
+    if (typeof rawMessaging.enabled === "boolean") messaging.enabled = rawMessaging.enabled;
+    if (typeof rawMessaging.scope === "string" && VALID_MESSAGING_SCOPES.has(rawMessaging.scope)) {
+      messaging.scope = rawMessaging.scope as MessagingScopeMode;
+    }
+    if (typeof rawMessaging.directory === "string" && rawMessaging.directory.trim()) {
+      messaging.directory = rawMessaging.directory.trim();
+    }
+    if (typeof rawMessaging.operatorTopicPrefix === "string" && rawMessaging.operatorTopicPrefix.trim()) {
+      messaging.operatorTopicPrefix = rawMessaging.operatorTopicPrefix.trim();
+    }
+    if (rawMessaging.notifySocket === false) messaging.notifySocket = false;
+    else if (typeof rawMessaging.notifySocket === "string" && rawMessaging.notifySocket.trim()) {
+      messaging.notifySocket = rawMessaging.notifySocket.trim();
+    }
+    for (const key of ["maxWakesPerMinute", "maxHops", "messageTtlMs", "maxWaitMs", "mailboxLimit"] as const) {
+      const value = rawMessaging[key];
+      if (Number.isInteger(value) && (value as number) >= 0) messaging[key] = value as number;
+    }
+    if (typeof rawMessaging.surface === "string" && VALID_MESSAGING_SURFACES.has(rawMessaging.surface)) {
+      messaging.surface = rawMessaging.surface as MessagingSurface;
+    }
+    if (typeof rawMessaging.allowForeignMainWake === "boolean") {
+      messaging.allowForeignMainWake = rawMessaging.allowForeignMainWake;
+    }
+    out.messaging = messaging;
+  }
   if (typeof r.sessionArtifactDirectory === "string" && r.sessionArtifactDirectory.trim()) {
     out.sessionArtifactDirectory = r.sessionArtifactDirectory;
   }
