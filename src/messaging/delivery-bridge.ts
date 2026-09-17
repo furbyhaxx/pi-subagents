@@ -29,7 +29,7 @@ export interface AgentManagerDeliveryBridgeOptions {
   pi: ExtensionAPI;
   mainAgentId: string;
   mainSessionId: string;
-  mainSurface: MessagingSurface;
+  mainSurface: () => MessagingSurface;
 }
 
 /** The only adapter allowed to translate mailbox delivery into manager actions. */
@@ -55,7 +55,7 @@ export class AgentManagerDeliveryBridge implements DeliveryBridge {
       return {
         ownership: "local",
         state: agent.status === "gone" ? "gone" : agent.status === "settled" ? "settled" : "running",
-        surface: this.options.mainSurface,
+        surface: this.options.mainSurface(),
         kind: "main",
         sessionId: this.options.mainSessionId,
       };
@@ -69,7 +69,7 @@ export class AgentManagerDeliveryBridge implements DeliveryBridge {
     return {
       ownership: "local",
       state,
-      surface: getAgentConfig(record?.type ?? agent.type)?.messagingSurface ?? this.options.mainSurface,
+      surface: getAgentConfig(record?.type ?? agent.type)?.messagingSurface ?? this.options.mainSurface(),
       kind: "sub",
       sessionId: agent.sessionId,
     };

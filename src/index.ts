@@ -39,6 +39,7 @@ import { AgentMessagingService } from "./messaging/service.js";
 import { SocketNotifyBus } from "./messaging/socket-notify-bus.js";
 import { SqliteStore } from "./messaging/store.js";
 import { createMessagingTools } from "./messaging/tool.js";
+import type { MessagingSurface } from "./messaging/types.js";
 import { describeModel, type ModelRegistry, parseCanonicalModelId, type ResolvedModelCandidate, resolveCanonicalModel, resolveModel, resolveModelCandidates } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -1121,7 +1122,6 @@ export default function (pi: ExtensionAPI) {
           });
           const mainAgentId = `main:${rootSessionId}`;
           mainMessagingCaller = { agentId: mainAgentId, sessionId: rootSessionId };
-          const mainSurface = messagingSettings.surface ?? "ui";
           const store = new SqliteStore({
             filePath: location.databasePath,
             scopeKey: location.scopeKey,
@@ -1130,13 +1130,14 @@ export default function (pi: ExtensionAPI) {
             maxHopCount: messagingSettings.maxHops ?? 4,
             messageTtlMs: messagingSettings.messageTtlMs ?? 3_600_000,
             mailboxLimit: messagingSettings.mailboxLimit ?? 200,
+            operatorTopicPrefix: messagingSettings.operatorTopicPrefix,
           });
           const bridge = new AgentManagerDeliveryBridge({
             manager,
             pi,
             mainAgentId,
             mainSessionId: rootSessionId,
-            mainSurface,
+            mainSurface: () => messagingSettings.surface ?? "ui",
           });
           messagingCards = new MessagingCardFeed({
             mainAgentId,
@@ -4339,6 +4340,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["model", "direct", "off"],
         },
         {
+          id: "messagingEnabled",
+          label: "Peer messaging",
+          description: "Let agents in this project message each other and share a blackboard. Applies on the next pi session.",
+          currentValue: messagingSettings.enabled !== false ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "messagingSurface",
+          label: "Message surface",
+          description: "Incoming peer messages for the main session: off = mailbox only; ui = unread-count notice; context = full attributed body. Per-agent messaging_surface frontmatter overrides the project default for subagents.",
+          currentValue: messagingSettings.surface ?? "ui",
+          values: ["off", "ui", "context"],
+        },
+        {
           id: "rememberAgents",
           label: "Remember agents",
           description: "Persist subagent sessions so `@handle` can resume one long after it finished (they also appear in /resume)",
@@ -4528,6 +4543,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
               ? "Agent mentions on — a conversation clone starts a mentioned agent off-screen"
               : "Agent mentions on — a mentioned agent starts here, with no model call",
         );
+      } else if (id === "messagingEnabled") {
+        const enabled = value === "on";
+        messagingSettings.enabled = enabled;
+        notifyApplied(ctx, `Peer messaging ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
+      } else if (id === "messagingSurface") {
+        messagingSettings.surface = value as MessagingSurface;
+        notifyApplied(ctx, `Message surface set to ${value}. Applies immediately.`);
       } else if (id === "rememberAgents") {
         const enabled = value === "on";
         setRememberAgents(enabled);

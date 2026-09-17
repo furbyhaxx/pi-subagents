@@ -162,6 +162,71 @@ describe("agent messaging e2e", () => {
     expect(reply.message.correlationId).toBe(requestReceipt.receipt.correlationId);
   });
 
+  it("passes the configured operator topic prefix into the store", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "messaging-operator-prefix-e2e-"));
+    directories.push(cwd);
+    mkdirSync(join(cwd, ".pi"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".pi", "subagents.json"),
+      JSON.stringify({ messaging: { operatorTopicPrefix: "human/" } }),
+    );
+
+    run = await runPrintMode({
+      cwd,
+      prompt: "Try to overwrite the operator constraint.",
+      live: false,
+      respond: (context: Context) => {
+        const results = toolResults(context, "Blackboard");
+        if (results.length === 0) {
+          return fauxToolCall("Blackboard", {
+            op: "put",
+            topic: "human/constraints",
+            key: "rule",
+            value: "overwrite",
+          });
+        }
+        return results[0]!;
+      },
+    });
+
+    expect(run.responseText).toContain('"reason": "read-only-namespace"');
+  });
+
+  it("keeps messaging tools out of an isolated top-level agent", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "messaging-isolated-e2e-"));
+    directories.push(cwd);
+    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".pi", "agents", "isolated-peer.md"),
+      "---\ndescription: isolated messaging probe\nisolated: true\n---\nInspect your tools.\n",
+    );
+    let isolatedTools: string[] | undefined;
+
+    run = await runPrintMode({
+      cwd,
+      prompt: "Run the isolated messaging probe.",
+      live: false,
+      respond: (context: Context) => {
+        if (promptText(context).includes("isolated-child")) {
+          isolatedTools = (context.tools ?? []).map(tool => tool.name);
+          return "ISOLATED_DONE";
+        }
+        if (toolResults(context, "Agent").length > 0) return "PROBE_DONE";
+        return agentCall({
+          subagent_type: "isolated-peer",
+          prompt: "isolated-child",
+          description: "isolated messaging probe",
+          run_in_background: false,
+        });
+      },
+    });
+
+    expect(isolatedTools).toBeDefined();
+    expect(isolatedTools).not.toContain("AgentMessage");
+    expect(isolatedTools).not.toContain("Blackboard");
+    expect(run.responseText).toBe("PROBE_DONE");
+  });
+
   it("refuses a parent-owned nested child through a real peer AgentMessage call", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "messaging-nested-e2e-"));
     directories.push(cwd);

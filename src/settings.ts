@@ -15,6 +15,7 @@ export interface MessagingSettings {
   enabled?: boolean;
   scope?: MessagingScopeMode;
   directory?: string;
+  operatorTopicPrefix?: string;
   notifySocket?: string | false;
   maxWakesPerMinute?: number;
   maxHops?: number;
@@ -405,6 +406,9 @@ function sanitize(raw: unknown): SubagentsSettings {
     }
     if (typeof rawMessaging.directory === "string" && rawMessaging.directory.trim()) {
       messaging.directory = rawMessaging.directory.trim();
+    }
+    if (typeof rawMessaging.operatorTopicPrefix === "string" && rawMessaging.operatorTopicPrefix.trim()) {
+      messaging.operatorTopicPrefix = rawMessaging.operatorTopicPrefix.trim();
     }
     if (rawMessaging.notifySocket === false) messaging.notifySocket = false;
     else if (typeof rawMessaging.notifySocket === "string" && rawMessaging.notifySocket.trim()) {
