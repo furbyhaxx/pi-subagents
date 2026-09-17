@@ -1,0 +1,10 @@
+{
+  "packages": [
+    "..",
+    {
+      "source": "git:https://github.com/furbyhaxx/pi-subagents",
+      "autoload": false,
+      "extensions": ["!src/index.ts"]
+    }
+  ]
+}
