@@ -13,6 +13,7 @@ import type {
   DeliveryReceipt,
   MessageKind,
   MessageRow,
+  MessagingActivity,
   MessagingCaller,
   ResolveTargetResult,
 } from "./types.js";
@@ -25,6 +26,14 @@ const DEFAULT_MAX_WAIT_MS = 120_000;
  * write under the operator namespace.
  */
 const OPERATOR_AUTHOR = "operator";
+/**
+ * How many bodies one `context`-surface injection may carry. A notice coalesces
+ * for free — it is one line whatever the count — but bodies do not, and a
+ * backlog of 200 messages at the 16 KiB cap would spend more of the recipient's
+ * context than the rest of its turn. The remainder stays undelivered and rides
+ * the next boundary.
+ */
+const MAX_BODIES_PER_INJECTION = 10;
 
 export interface AgentMessagingServiceOptions {
   store: SqliteStore;
@@ -35,6 +44,8 @@ export interface AgentMessagingServiceOptions {
   maxWaitMs?: number;
   allowForeignMainWake?: boolean;
   clock?: () => number;
+  /** Bus traffic worth showing a human. Never on the delivery path's critical section. */
+  onActivity?: (activity: MessagingActivity) => void;
 }
 
 export interface SendMessageInput {
@@ -91,9 +102,20 @@ ${message.body}
 </peer_message:${nonce}>`;
 }
 
-function notice(sender: AgentRow | undefined, message: MessageRow, count: number): string {
-  const from = sender ? displayHandle(sender) : message.fromAgent;
-  return `[Peer mailbox notice] ${from} sent ${message.kind}; ${count} unread. Use AgentMessage with op:"inbox" to fetch it.`;
+/**
+ * One line for the whole batch, not one line per message: the point of the
+ * default surface is that a sender cannot spend an unbounded amount of the
+ * recipient's context, and N notices for N messages is exactly that (§6.1).
+ */
+function notice(senders: string[], messages: MessageRow[], unread: number): string {
+  const from = senders.length <= 3
+    ? senders.join(", ")
+    : `${senders.slice(0, 3).join(", ")} and ${senders.length - 3} more`;
+  const what = messages.length === 1
+    ? `sent ${messages[0]!.kind}`
+    : `sent ${messages.length} messages`;
+  const fetch = messages.length === 1 ? "it" : "them";
+  return `[Peer mailbox notice] ${from} ${what}; ${unread} unread. Use AgentMessage with op:"inbox" to fetch ${fetch}.`;
 }
 
 export class AgentMessagingService {
@@ -105,6 +127,7 @@ export class AgentMessagingService {
   private readonly maxWaitMs: number;
   private readonly allowForeignMainWake: boolean;
   private readonly clock: () => number;
+  private readonly onActivity: ((activity: MessagingActivity) => void) | undefined;
   private readonly wakeTimes = new Map<string, number[]>();
   private readonly inheritedHops = new Map<string, number>();
   private idleTimer: ReturnType<typeof setInterval> | undefined;
@@ -118,6 +141,7 @@ export class AgentMessagingService {
     this.maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     this.allowForeignMainWake = options.allowForeignMainWake ?? true;
     this.clock = options.clock ?? Date.now;
+    this.onActivity = options.onActivity;
   }
 
   start(): void {
@@ -212,7 +236,23 @@ export class AgentMessagingService {
     const row = enqueued.messages.find(message => message.id === id);
     if (!row) return { ok: false, reason: "duplicate-message-id" };
     this.notifyBus.bump([target.agent.agentId]);
-    return { ok: true, receipt: await this.deliver(row, target.agent) };
+    this.emitMessage(caller, target.agent, row);
+
+    // Deliver the recipient's whole backlog, not just this row: anything still
+    // undelivered belongs in the same notice, and the count is what makes one
+    // line an honest summary of the mailbox.
+    const pending = this.store.listUndelivered(target.agent.agentId);
+    const receipts = await this.deliver(pending.length > 0 ? pending : [row], target.agent);
+    const own = receipts.find(receipt => receipt.messageId === row.id);
+    return {
+      ok: true,
+      receipt: own ?? {
+        messageId: row.id,
+        toAgent: target.agent.agentId,
+        status: "queued",
+        correlationId: row.correlationId ?? undefined,
+      },
+    };
   }
 
   async broadcast(caller: MessagingCaller, message: string): Promise<BroadcastResult> {
@@ -228,15 +268,21 @@ export class AgentMessagingService {
     });
     this.notifyBus.bump(result.messages.map(row => row.toAgent));
     const peers = new Map(this.store.listPeers().map(peer => [peer.agentId, peer]));
-    const receipts = await Promise.all(result.messages.map(async row => {
+    if (result.messages[0]) {
+      this.emitMessage(caller, undefined, result.messages[0], result.messages.length);
+    }
+    const delivered = await Promise.all(result.messages.map(async row => {
       const peer = peers.get(row.toAgent);
-      return peer ? this.deliver(row, peer, false) : {
+      // One fan-out row per recipient, so each delivery is already a batch of
+      // one; the recipient's own backlog rides its next poll rather than being
+      // swept into a broadcast that is explicitly not allowed to wake anyone.
+      return peer ? await this.deliver([row], peer, false) : [{
         messageId: row.id,
         toAgent: row.toAgent,
         status: "queued" as const,
-      };
+      }];
     }));
-    return { ok: true, receipts };
+    return { ok: true, receipts: delivered.flat() };
   }
 
   inbox(caller: MessagingCaller, peek = false): MessageRow[] {
@@ -287,13 +333,18 @@ export class AgentMessagingService {
   }
 
   boardPut(caller: MessagingCaller, input: BoardPutInput): BlackboardPutResult {
-    return this.store.put({
+    const author = this.authorOf(caller);
+    const result = this.store.put({
       topic: input.topic,
       key: input.key,
       value: input.value,
-      author: this.authorOf(caller),
+      author,
       ifRevision: input.ifRevision,
     });
+    if (result.ok) {
+      this.emitBoard(caller, author, "put", result.entry.topic, result.entry.key, result.entry.revision, result.entry.value);
+    }
+    return result;
   }
 
   boardGet(topic: string, key: string): BlackboardEntry | undefined {
@@ -305,7 +356,10 @@ export class AgentMessagingService {
   }
 
   boardDelete(caller: MessagingCaller, topic: string, key: string): BlackboardDeleteResult {
-    return this.store.delete(topic, key, this.authorOf(caller));
+    const author = this.authorOf(caller);
+    const result = this.store.delete(topic, key, author);
+    if (result.ok && result.deleted) this.emitBoard(caller, author, "delete", topic, key);
+    return result;
   }
 
   /** Where a watcher that wants only future changes should start. */
@@ -372,9 +426,59 @@ export class AgentMessagingService {
     for (const peer of this.store.listPeers()) {
       const info = this.bridge.recipientInfo(peer);
       if (info.ownership !== "local") continue;
-      const message = this.store.peekNextUndelivered(peer.agentId);
-      if (message) await this.deliver(message, peer);
+      const pending = this.store.listUndelivered(peer.agentId);
+      if (pending.length > 0) await this.deliver(pending, peer);
     }
+  }
+
+  private sessionOf(agentId: string): string | undefined {
+    return this.store.listPeers().find(peer => peer.agentId === agentId)?.sessionId;
+  }
+
+  private emitMessage(
+    caller: MessagingCaller,
+    recipient: AgentRow | undefined,
+    message: MessageRow,
+    recipients?: number,
+  ): void {
+    if (!this.onActivity) return;
+    const sender = this.store.listPeers().find(peer => peer.agentId === caller.agentId);
+    this.onActivity({
+      type: "message",
+      fromAgent: caller.agentId,
+      fromLabel: sender ? displayHandle(sender) : caller.agentId,
+      fromSession: sender?.sessionId ?? caller.sessionId,
+      toAgent: recipient?.agentId,
+      toLabel: recipient ? displayHandle(recipient) : undefined,
+      kind: message.kind,
+      body: message.body,
+      recipients,
+      at: message.createdAt,
+    });
+  }
+
+  private emitBoard(
+    caller: MessagingCaller,
+    author: string,
+    op: "put" | "delete",
+    topic: string,
+    key: string,
+    revision?: number,
+    value?: unknown,
+  ): void {
+    if (!this.onActivity) return;
+    this.onActivity({
+      type: "board",
+      op,
+      topic,
+      key,
+      author,
+      authorAgent: caller.agentId,
+      authorSession: this.sessionOf(caller.agentId) ?? caller.sessionId,
+      revision,
+      value,
+      at: this.clock(),
+    });
   }
 
   private canWake(agentId: string): boolean {
@@ -386,50 +490,75 @@ export class AgentMessagingService {
     return true;
   }
 
-  private async deliver(message: MessageRow, recipient: AgentRow, allowWake = true): Promise<DeliveryReceipt> {
+  /**
+   * Put a batch in front of one recipient. The batch is the unit throughout:
+   * one notice, one wake charge, one injection — five messages that arrived
+   * between two turn boundaries must not cost the recipient five interruptions.
+   */
+  private async deliver(
+    messages: MessageRow[],
+    recipient: AgentRow,
+    allowWake = true,
+  ): Promise<DeliveryReceipt[]> {
     const info = this.bridge.recipientInfo(recipient);
-    if (info.ownership === "foreign") {
-      return { messageId: message.id, toAgent: recipient.agentId, status: "accepted", correlationId: message.correlationId ?? undefined };
-    }
+    const receipt = (
+      message: MessageRow,
+      status: DeliveryReceipt["status"],
+      extra: Partial<DeliveryReceipt> = {},
+    ): DeliveryReceipt => ({
+      messageId: message.id,
+      toAgent: recipient.agentId,
+      status,
+      correlationId: message.correlationId ?? undefined,
+      ...extra,
+    });
+
+    if (info.ownership === "foreign") return messages.map(message => receipt(message, "accepted"));
     if (info.state === "gone") {
-      this.store.markUndeliverable(message.id);
-      return { messageId: message.id, toAgent: recipient.agentId, status: "failed", reason: "recipient-gone", correlationId: message.correlationId ?? undefined };
+      return messages.map(message => {
+        this.store.markUndeliverable(message.id);
+        return receipt(message, "failed", { reason: "recipient-gone" });
+      });
     }
     if (info.surface === "off") {
-      return { messageId: message.id, toAgent: recipient.agentId, status: "queued", reason: "surface-off", correlationId: message.correlationId ?? undefined };
+      return messages.map(message => receipt(message, "queued", { reason: "surface-off" }));
     }
 
-    const sender = this.store.listPeers().find(peer => peer.agentId === message.fromAgent);
+    const peers = this.store.listPeers();
     const surface = info.surface === "context" ? "body" as const : "notice" as const;
+    const batch = surface === "body" ? messages.slice(0, MAX_BODIES_PER_INJECTION) : messages;
+    const senders = batch.map(message => peers.find(peer => peer.agentId === message.fromAgent));
     const content = surface === "body"
-      ? peerBlock(sender, message)
-      : notice(sender, message, this.store.pendingCount(recipient.agentId));
+      ? batch.map((message, index) => peerBlock(senders[index], message)).join("\n\n")
+      : notice(
+        [...new Set(batch.map((message, index) => senders[index] ? displayHandle(senders[index]) : message.fromAgent))],
+        batch,
+        this.store.pendingCount(recipient.agentId),
+      );
+    const deferred = messages.slice(batch.length)
+      .map(message => receipt(message, "queued", { reason: "batch-deferred" }));
+
+    // A foreign main is the one recipient a wake can reach across sessions, so
+    // the check is per-sender: a batch mixing local and foreign senders still
+    // wakes, because at least one sender was entitled to.
     const foreignMainWakeBlocked = info.kind === "main"
-      && sender?.sessionId !== info.sessionId
-      && !this.allowForeignMainWake;
+      && !this.allowForeignMainWake
+      && senders.every(sender => sender?.sessionId !== info.sessionId);
     const wantsWake = allowWake && info.state === "settled" && !foreignMainWakeBlocked;
     if (info.state === "settled" && (!wantsWake || !this.canWake(recipient.agentId))) {
-      return {
-        messageId: message.id,
-        toAgent: recipient.agentId,
-        status: "queued",
-        reason: foreignMainWakeBlocked ? "foreign-main-wake-disabled" : "wake-budget-exhausted",
-        correlationId: message.correlationId ?? undefined,
-      };
+      const reason = foreignMainWakeBlocked ? "foreign-main-wake-disabled" : "wake-budget-exhausted";
+      return messages.map(message => receipt(message, "queued", { reason }));
     }
 
     const delivered = await this.bridge.deliver(recipient, content, wantsWake);
-    if (!delivered.delivered) {
-      return { messageId: message.id, toAgent: recipient.agentId, status: "queued", correlationId: message.correlationId ?? undefined };
-    }
-    this.store.markDelivered(message.id);
-    if (delivered.woken) this.inheritedHops.set(recipient.agentId, message.hopCount + 1);
-    return {
-      messageId: message.id,
-      toAgent: recipient.agentId,
-      status: delivered.woken ? "woken" : "injected",
-      surface,
-      correlationId: message.correlationId ?? undefined,
-    };
+    if (!delivered.delivered) return messages.map(message => receipt(message, "queued"));
+    const highestHop = Math.max(...batch.map(message => message.hopCount));
+    for (const message of batch) this.store.markDelivered(message.id);
+    if (delivered.woken) this.inheritedHops.set(recipient.agentId, highestHop + 1);
+    return [
+      ...batch.map(message =>
+        receipt(message, delivered.woken ? "woken" : "injected", { surface })),
+      ...deferred,
+    ];
   }
 }

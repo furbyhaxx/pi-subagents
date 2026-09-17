@@ -299,13 +299,19 @@ export class SqliteStore {
     return row ? messageFromRow(row) : undefined;
   }
 
-  peekNextUndelivered(agentId: string): MessageRow | undefined {
-    const row = this.driver.prepare(`
+  /**
+   * Everything waiting to be put in front of one recipient, oldest first.
+   *
+   * Delivery works on the whole backlog rather than one row at a time so that
+   * several messages arriving between two turn boundaries become one notice
+   * with a count instead of one interruption each (§6.1).
+   */
+  listUndelivered(agentId: string, limit = 200): MessageRow[] {
+    return this.driver.prepare(`
       SELECT * FROM messages
       WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL AND delivered_at IS NULL
-      ORDER BY seq LIMIT 1
-    `).get({ $agentId: agentId });
-    return row ? messageFromRow(row) : undefined;
+      ORDER BY seq LIMIT $limit
+    `).all({ $agentId: agentId, $limit: limit }).map(messageFromRow);
   }
 
   consumeNext(agentId: string, options: { from?: string } = {}): MessageRow | undefined {

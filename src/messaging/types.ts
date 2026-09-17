@@ -165,3 +165,40 @@ export interface ResolveTargetFailure {
 }
 
 export type ResolveTargetResult = ResolveTargetSuccess | ResolveTargetFailure;
+
+/**
+ * Bus traffic as it happens, for the human-facing surfaces only. Delivery does
+ * not depend on anyone listening, and a listener never decides whether a
+ * message is delivered — it only decides what a human is shown.
+ */
+export interface MessageActivity {
+  type: "message";
+  fromAgent: string;
+  fromLabel: string;
+  fromSession: string;
+  /** Absent for a broadcast, which has no single recipient. */
+  toAgent?: string;
+  toLabel?: string;
+  kind: MessageKind;
+  body: string;
+  /** Fan-out size of a broadcast. */
+  recipients?: number;
+  at: number;
+}
+
+export interface BoardActivity {
+  type: "board";
+  op: "put" | "delete";
+  topic: string;
+  key: string;
+  /** The recorded author — a display name, which is what the board stores. */
+  author: string;
+  /** The writer's agent id, which is what identity checks use. */
+  authorAgent: string;
+  authorSession: string;
+  revision?: number;
+  value?: unknown;
+  at: number;
+}
+
+export type MessagingActivity = MessageActivity | BoardActivity;

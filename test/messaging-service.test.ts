@@ -195,6 +195,108 @@ describe("AgentMessagingService", () => {
     expect(Date.now() - started).toBeLessThan(250);
   });
 
+  it("coalesces a backlog into one notice carrying the count", async () => {
+    // Five messages between two turn boundaries must cost the recipient one
+    // interruption, not five (§6.1) — the count is what makes one line honest.
+    service.registerAgent(registration("one", "session-a", "one"));
+    service.registerAgent(registration("two", "session-a", "two"));
+    service.registerAgent(registration("recipient", "session-a", "recipient"));
+    store.enqueue({ id: "m1", fromAgent: "one", toAgent: "recipient", kind: "message", body: "a" });
+    store.enqueue({ id: "m2", fromAgent: "two", toAgent: "recipient", kind: "request", body: "b" });
+
+    await service.pollOwnedMailboxes();
+
+    expect(bridge.deliveries).toHaveLength(1);
+    expect(bridge.deliveries[0]?.content).toContain("one, two sent 2 messages; 2 unread");
+    expect(store.listUndelivered("recipient")).toHaveLength(0);
+  });
+
+  it("sweeps the recipient's backlog into the send it was triggered by", async () => {
+    service.registerAgent(registration("recipient", "session-a", "recipient"));
+    store.enqueue({ id: "waiting", fromAgent: "caller", toAgent: "recipient", kind: "message", body: "older" });
+
+    const sent = await service.send(caller, { to: "recipient", message: "newer" });
+
+    expect(bridge.deliveries).toHaveLength(1);
+    expect(bridge.deliveries[0]?.content).toContain("2 unread");
+    expect(sent.receipt).toMatchObject({ status: "injected", surface: "notice" });
+  });
+
+  it("spends one wake on a whole batch", async () => {
+    service.registerAgent(registration("idle", "session-a", "idle", { status: "settled" }));
+    setInfo("idle", "ui", "settled");
+    store.enqueue({ id: "w1", fromAgent: "caller", toAgent: "idle", kind: "message", body: "a" });
+    store.enqueue({ id: "w2", fromAgent: "caller", toAgent: "idle", kind: "message", body: "b" });
+
+    await service.pollOwnedMailboxes();
+
+    expect(bridge.deliveries).toMatchObject([{ agentId: "idle", wake: true }]);
+    expect(store.listUndelivered("idle")).toHaveLength(0);
+  });
+
+  it("caps how many bodies one context injection carries and defers the rest", async () => {
+    // A notice coalesces for free; bodies do not, and a backlog at the 16 KiB
+    // cap would spend more context than the recipient's own turn.
+    service.registerAgent(registration("body", "session-a", "body"));
+    setInfo("body", "context");
+    for (let index = 0; index < 12; index++) {
+      store.enqueue({ id: `b${index}`, fromAgent: "caller", toAgent: "body", kind: "message", body: `body-${index}` });
+    }
+
+    await service.pollOwnedMailboxes();
+    const first = bridge.deliveries[0]!.content;
+    await service.pollOwnedMailboxes();
+
+    expect(first.match(/<peer_message:/g)).toHaveLength(10);
+    expect(first).toContain("body-9");
+    expect(first).not.toContain("body-10");
+    expect(bridge.deliveries[1]?.content).toContain("body-11");
+    expect(store.listUndelivered("body")).toHaveLength(0);
+  });
+
+  it("reports a deferred message as queued rather than delivered", async () => {
+    service.registerAgent(registration("body", "session-a", "body"));
+    setInfo("body", "context");
+    for (let index = 0; index < 10; index++) {
+      store.enqueue({ id: `q${index}`, fromAgent: "caller", toAgent: "body", kind: "message", body: `queued-${index}` });
+    }
+
+    const sent = await service.send(caller, { to: "body", message: "eleventh" });
+
+    expect(sent.receipt).toMatchObject({ status: "queued", reason: "batch-deferred" });
+  });
+
+  it("reports bus traffic to a listener without letting it affect delivery", async () => {
+    const activity: unknown[] = [];
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "activity.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: () => now,
+    });
+    bridge = new FakeBridge();
+    service = new AgentMessagingService({
+      store,
+      bridge,
+      clock: () => now,
+      onActivity: event => activity.push(event),
+    });
+    service.registerAgent(registration("caller", "session-a", "caller"));
+    service.registerAgent(registration("recipient", "session-a", "recipient"));
+
+    await service.send(caller, { to: "recipient", message: "hello" });
+    service.boardPut(caller, { topic: "findings", key: "k", value: 1 });
+    service.boardDelete(caller, "findings", "k");
+    service.boardDelete(caller, "findings", "gone");
+
+    expect(activity).toMatchObject([
+      { type: "message", fromLabel: "caller", toLabel: "recipient", kind: "message", body: "hello" },
+      { type: "board", op: "put", topic: "findings", key: "k", author: "caller", revision: 1 },
+      { type: "board", op: "delete", topic: "findings", key: "k" },
+    ]);
+  });
+
   it("does not redeliver rows already marked delivered", async () => {
     service.registerAgent(registration("recipient", "session-a", "recipient"));
     await service.send(caller, { to: "recipient", message: "once" });
