@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, LoadExtensionsResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
@@ -252,10 +252,8 @@ export function installExtensionToolScope(
     /**
      * Injected `customTools` to keep active regardless of the built-in list.
      *
-     * Two kinds arrive here and they are blocked for different reasons: opt-in
-     * nested-delegation tools share EXCLUDED_TOOL_NAMES' names, and
-     * StructuredOutput is simply not a built-in, so neither survives a `keep`
-     * seeded from `toolNames`.
+     * Injected tools do not come from the built-in or extension registries, so
+     * they must be re-admitted after the ordinary scope is derived.
      */
     readmitToolNames: Set<string>;
   },
@@ -489,6 +487,8 @@ export interface RunOptions {
    * fails at the call that wrote it rather than inside the child.
    */
   structuredOutput?: CompiledSchema;
+  /** Trusted mailbox tool for an addressable top-level peer. */
+  agentMessageTool?: ToolDefinition;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -1049,6 +1049,11 @@ export async function runAgent(
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
+  const messagingTools = options.agentMessageTool && !options.nested && !options.isolated
+    && !disallowedSet?.has(options.agentMessageTool.name)
+    ? [options.agentMessageTool]
+    : [];
+  const messagingToolNames = new Set(messagingTools.map(tool => tool.name));
 
   // The `agent({ schema })` contract: this child reports its answer by calling
   // StructuredOutput, and `structuredJson` below is what the caller reads. The
@@ -1069,6 +1074,7 @@ export async function runAgent(
   // unsatisfiable by construction rather than merely restricted.
   const readmitToolNames = new Set([
     ...[...nestedToolNames].filter(name => !disallowedSet?.has(name)),
+    ...messagingToolNames,
     ...structuredToolNames,
     // Admitted background-jobs family tools survive the active-set narrowing,
     // including under an `ext:` allowlist flip that never names the family.
@@ -1109,8 +1115,8 @@ export async function runAgent(
   if (noExtensions) {
     // Strict allowlist: built-ins the agent asked for, the admitted bash family
     // (explicitly path-loaded — nothing is discovered under noExtensions), plus
-    // any opt-in nested tools (whose names would otherwise be dropped as
-    // EXCLUDED_TOOL_NAMES).
+    // injected tools whose names would otherwise be dropped as
+    // EXCLUDED_TOOL_NAMES (nested delegation) or never appear at all (messaging).
     sessionTools = [
       ...toolNames.filter(
         (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
@@ -1119,6 +1125,7 @@ export async function runAgent(
       // can admit them (the loader still loads the explicit family path).
       ...bashFamilyToolNames.filter((name) => !toolNames.includes(name)),
       ...[...nestedToolNames].filter((t) => !disallowedSet?.has(t)),
+      ...messagingToolNames,
       // Not filtered through `disallowedSet`, unlike the nested tools above:
       // the caller asked for a schema, and removing the only tool that can
       // satisfy it would make the request unsatisfiable by construction rather
@@ -1198,7 +1205,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,
-    customTools: [...nestedTools, ...structuredTools],
+    customTools: [...nestedTools, ...messagingTools, ...structuredTools],
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {

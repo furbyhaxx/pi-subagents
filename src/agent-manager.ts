@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { buildAgentRegistry, getAgentConfig, getAgentConfigIn } from "./agent-types.js";
 import { type StopWorktreeResult, stopWorktreeJobs } from "./background-jobs-rpc.js";
@@ -484,6 +484,7 @@ export class AgentManager {
   private runningBackground = 0;
   /** Number of currently running foreground (blocking) agents. */
   private runningForeground = 0;
+  private agentMessageToolFactory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition) | undefined;
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -500,6 +501,12 @@ export class AgentManager {
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
+  }
+
+  setAgentMessageToolFactory(
+    factory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition) | undefined,
+  ): void {
+    this.agentMessageToolFactory = factory;
   }
 
   /** Update the max concurrent background agents limit. */
@@ -921,6 +928,9 @@ export class AgentManager {
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
       structuredOutput: options.structuredOutput,
+      agentMessageTool: isTopLevelAgent(record) && this.agentMessageToolFactory
+        ? this.agentMessageToolFactory({ agentId: id, sessionId: record.rootSessionId ?? "standalone" })
+        : undefined,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,
       workflow: options.workflowId !== undefined,

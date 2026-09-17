@@ -1,0 +1,205 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { agentCall, type PrintModeRun, runPrintMode } from "./helpers/print-mode-runner.js";
+
+vi.setConfig({ testTimeout: 30_000 });
+
+function toolResults(context: Context, name: string): string[] {
+  return context.messages
+    .filter(message => message.role === "toolResult" && (message as { toolName?: string }).toolName === name)
+    .flatMap(message => message.content)
+    .map(content => content.type === "text" ? content.text : "");
+}
+
+function promptText(context: Context): string {
+  return context.messages
+    .filter(message => message.role === "user")
+    .flatMap(message => typeof message.content === "string" ? [message.content] : message.content)
+    .map(content => typeof content === "string" ? content : content.type === "text" ? content.text : "")
+    .join("\n");
+}
+
+function sessionToolResults(session: AgentSession, name: string): string[] {
+  return session.messages
+    .filter(message => message.role === "toolResult" && message.toolName === name)
+    .flatMap(message => message.content)
+    .map(content => content.type === "text" ? content.text : "");
+}
+
+describe("agent messaging e2e", () => {
+  let run: PrintModeRun | undefined;
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    await run?.dispose();
+    run = undefined;
+    for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("registers AgentMessage for a peer-capable main session and exposes its main roster entry", async () => {
+    run = await runPrintMode({
+      prompt: "Inspect messaging peers.",
+      live: false,
+      respond: (context: Context) => {
+        const result = toolResults(context, "AgentMessage")[0];
+        if (result) return "MESSAGING_ROSTER_OK";
+        return fauxToolCall("AgentMessage", { op: "peers" });
+      },
+    });
+
+    const tools = run.parentSession.getAllTools().map(tool => tool.name);
+    const resultText = sessionToolResults(run.parentSession, "AgentMessage").join("\n");
+    expect(tools).toContain("AgentMessage");
+    expect(resultText).toContain('"kind": "main"');
+    expect(run.responseText).toBe("MESSAGING_ROSTER_OK");
+  });
+
+  it("lets two live top-level subagents exchange a correlated request and reply", async () => {
+    run = await runPrintMode({
+      prompt: "Start both messaging peers.",
+      live: false,
+      maxModelCalls: 24,
+      respond: async (context: Context) => {
+        const prompt = promptText(context);
+        if (prompt.includes("receiver-peer")) {
+          const waits = toolResults(context, "AgentMessage");
+          if (waits.length === 0) {
+            return fauxToolCall("AgentMessage", {
+              op: "wait",
+              from: "general-purpose-2",
+              timeout_ms: 5_000,
+            });
+          }
+          const request = JSON.parse(waits[0]!) as { message: { id: string } };
+          if (waits.length === 1) {
+            return fauxToolCall("AgentMessage", {
+              op: "send",
+              to: "general-purpose-2",
+              message: "correlated-answer",
+              reply_to: request.message.id,
+            });
+          }
+          return "RECEIVER_DONE";
+        }
+        if (prompt.includes("sender-peer")) {
+          const results = toolResults(context, "AgentMessage");
+          if (results.length === 0) {
+            return fauxToolCall("AgentMessage", {
+              op: "send",
+              to: "general-purpose",
+              message: "correlated-question",
+              expect_reply: true,
+            });
+          }
+          if (results.length === 1) {
+            return fauxToolCall("AgentMessage", {
+              op: "wait",
+              from: "general-purpose",
+              timeout_ms: 5_000,
+            });
+          }
+          return "SENDER_DONE";
+        }
+        if (toolResults(context, "Agent").length > 0) return "PEERS_DONE";
+        return [
+          agentCall({ prompt: "receiver-peer", description: "message receiver", run_in_background: true }),
+          agentCall({ prompt: "sender-peer", description: "message sender", run_in_background: true }),
+        ];
+      },
+    });
+
+    const records = sessionToolResults(run.parentSession, "Agent")
+      .map(text => /Agent ID: (\S+)/.exec(text)?.[1])
+      .filter((id): id is string => id !== undefined)
+      .map(id => run?.manager?.getRecord(id) as { session?: AgentSession });
+    const messagingResults = records.flatMap(record => record.session ? sessionToolResults(record.session, "AgentMessage") : []);
+    const requestReceipt = JSON.parse(messagingResults.find(text => text.includes('"status": "injected"') && text.includes('"correlationId"'))!) as {
+      receipt: { correlationId: string };
+    };
+    const reply = JSON.parse(messagingResults.find(text => text.includes('"kind": "reply"'))!) as {
+      message: { correlationId: string; body: string };
+    };
+
+    expect(records.every(record => record.session?.getAllTools().some(tool => tool.name === "AgentMessage"))).toBe(true);
+    expect(reply.message.body).toBe("correlated-answer");
+    expect(reply.message.correlationId).toBe(requestReceipt.receipt.correlationId);
+  });
+
+  it("refuses a parent-owned nested child through a real peer AgentMessage call", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "messaging-nested-e2e-"));
+    directories.push(cwd);
+    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".pi", "agents", "owner.md"),
+      "---\ndescription: nested owner\nallowed_subagents: all\n---\nOwn a nested child.\n",
+    );
+
+    let nestedId: string | undefined;
+    let nestedTools: string[] | undefined;
+    let publishNested: (() => void) | undefined;
+    const nestedPublished = new Promise<void>(resolve => { publishNested = resolve; });
+    let markNestedEntered: (() => void) | undefined;
+    const nestedEntered = new Promise<void>(resolve => { markNestedEntered = resolve; });
+    let releaseNested: (() => void) | undefined;
+    const nestedRelease = new Promise<void>(resolve => { releaseNested = resolve; });
+
+    run = await runPrintMode({
+      cwd,
+      prompt: "Run owner and probe.",
+      live: false,
+      maxModelCalls: 24,
+      respond: async (context: Context) => {
+        const prompt = promptText(context);
+        if (prompt.includes("nested-child")) {
+          nestedTools = (context.tools ?? []).map(tool => tool.name);
+          markNestedEntered?.();
+          await nestedRelease;
+          return "NESTED_DONE";
+        }
+        if (prompt.includes("owner-peer")) {
+          const spawned = toolResults(context, "Agent");
+          if (spawned.length === 0) {
+            return agentCall({
+              prompt: "nested-child",
+              description: "owned nested child",
+              run_in_background: true,
+            });
+          }
+          nestedId = /Agent ID: (\S+)/.exec(spawned[0]!)?.[1];
+          publishNested?.();
+          await nestedEntered;
+          await nestedRelease;
+          return "OWNER_DONE";
+        }
+        if (prompt.includes("probe-peer")) {
+          await nestedPublished;
+          const results = toolResults(context, "AgentMessage");
+          if (results.length === 0) {
+            return fauxToolCall("AgentMessage", { op: "send", to: nestedId, message: "forbidden" });
+          }
+          releaseNested?.();
+          return results[0]!;
+        }
+        if (toolResults(context, "Agent").length > 0) return "PROBE_DONE";
+        return [
+          agentCall({ subagent_type: "owner", prompt: "owner-peer", description: "nested owner", run_in_background: true }),
+          agentCall({ prompt: "probe-peer", description: "nested target probe", run_in_background: true }),
+        ];
+      },
+    });
+
+    const probeRecord = sessionToolResults(run.parentSession, "Agent")
+      .map(text => /Agent ID: (\S+)/.exec(text)?.[1])
+      .filter((id): id is string => id !== undefined)
+      .map(id => run?.manager?.getRecord(id) as { description?: string; session?: AgentSession })
+      .find(record => record.description === "nested target probe");
+    const refusal = probeRecord?.session ? sessionToolResults(probeRecord.session, "AgentMessage").join("\n") : "";
+    expect(nestedTools).toBeDefined();
+    expect(nestedTools).not.toContain("AgentMessage");
+    expect(refusal).toContain('"reason": "nested-child"');
+  });
+});
