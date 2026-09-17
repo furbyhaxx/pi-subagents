@@ -44,7 +44,7 @@ interface PendingBoard {
   topic: string;
   author: string;
   session?: string;
-  op: "put" | "delete";
+  op: "put" | "delete" | "expire";
   keys: Set<string>;
   revision?: number;
   preview?: string;
@@ -96,7 +96,7 @@ export class MessagingCardFeed {
     }
 
     if (activity.authorAgent === this.mainAgentId) return;
-    const key = `${activity.topic}\u0000${activity.author}\u0000${activity.op}`;
+    const key = `${activity.topic}\u0000${activity.author}\u0000${activity.authorAgent ?? ""}\u0000${activity.authorSession ?? ""}\u0000${activity.op}`;
     const held = this.pending.get(key);
     if (held) {
       held.keys.add(activity.key);
@@ -129,8 +129,8 @@ export class MessagingCardFeed {
     this.flush();
   }
 
-  private foreignSession(sessionId: string): string | undefined {
-    return sessionId === this.mainSessionId ? undefined : sessionId.slice(0, 6);
+  private foreignSession(sessionId: string | null): string | undefined {
+    return sessionId === null || sessionId === this.mainSessionId ? undefined : sessionId.slice(0, 6);
   }
 
   private arm(): void {

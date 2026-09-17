@@ -21,6 +21,7 @@ import type { AgentRegistration, AgentRow } from "../src/messaging/types.js";
 
 /** The board never delivers anything, so an inert bridge is the whole seam. */
 class InertBridge implements DeliveryBridge {
+  peerAccess(): "local" { return "local"; }
   recipientInfo(agent: AgentRow): RecipientDeliveryInfo {
     return { ownership: "local", state: "running", surface: "ui", kind: agent.kind, sessionId: agent.sessionId };
   }
@@ -69,7 +70,7 @@ describe("Blackboard", () => {
       scopeMode: "project",
       clock: Date.now,
     });
-    service = new AgentMessagingService({ store, bridge: new InertBridge() });
+    service = new AgentMessagingService({ store, bridge: new InertBridge(), operatorSessionId: "session-a" });
     service.registerAgent(registration("agent-1", "explore"));
   });
 

@@ -59,7 +59,8 @@ export function layoutMessagingCard(data: MessagingCardData, width = DEFAULT_WID
       { text: "  · ", color: "dim" },
       { text: data.author, color: "dim" },
     );
-    if (data.op === "delete") head.push({ text: " · ", color: "dim" }, { text: "deleted", color: "warning" });
+    if (data.op === "expire") head.push({ text: " · ", color: "dim" }, { text: "expired", color: "warning" });
+    else if (data.op === "delete") head.push({ text: " · ", color: "dim" }, { text: "deleted", color: "warning" });
     else if (data.keys !== undefined) head.push({ text: " · ", color: "dim" }, { text: `${data.keys} keys`, color: "dim" });
     else if (data.revision !== undefined) head.push({ text: " · ", color: "dim" }, { text: `rev ${data.revision}`, color: "dim" });
     body = data.preview;

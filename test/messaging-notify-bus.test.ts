@@ -61,7 +61,9 @@ describe("SocketNotifyBus", () => {
     const clientBumps: string[][] = [];
     const broker = new SocketNotifyBus({ scopeKey: "/project", socketPath: path, onBump: value => brokerBumps.push([...value]) });
     buses.push(broker);
+    expect(broker.mode).toBe("starting");
     await broker.ready;
+    expect(broker.mode).toBe("socket");
     const client = new SocketNotifyBus({ scopeKey: "/project", socketPath: path, onBump: value => clientBumps.push([...value]) });
     buses.push(client);
     await client.ready;
@@ -124,6 +126,7 @@ describe("SocketNotifyBus", () => {
     await bus.ready;
 
     expect(bus.degraded).toBe(true);
+    expect(bus.mode).toBe("degraded");
     expect(() => bus.bump(["agent"])).not.toThrow();
   });
 
@@ -171,6 +174,7 @@ describe("SocketNotifyBus", () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
     bus.close();
 
+    expect(bus.mode).toBe("off");
     expect(existsSync(path)).toBe(false);
   });
 });

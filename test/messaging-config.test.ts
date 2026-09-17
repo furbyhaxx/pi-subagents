@@ -49,9 +49,12 @@ describe("messaging configuration", () => {
       seenAt: 1,
     };
 
+    expect(bridge.peerAccess(main)).toBe("main");
     expect(bridge.recipientInfo(main).surface).toBe("ui");
     surface = "context";
     expect(bridge.recipientInfo(main).surface).toBe("context");
+    expect(bridge.peerAccess({ ...main, agentId: "missing-record", kind: "sub" })).toBe("read-only");
+    expect(bridge.peerAccess({ ...main, agentId: "main:s1", sessionId: "foreign" })).toBe("read-only");
   });
 
   it("sanitizes every Phase 2 messaging setting", () => {

@@ -35,7 +35,7 @@ export interface BoardCardData {
   /** The key, when the card stands for a single write. */
   key?: string;
   author: string;
-  op: "put" | "delete";
+  op: "put" | "delete" | "expire";
   revision?: number;
   /** Number of keys a coalesced card stands for, when more than one. */
   keys?: number;

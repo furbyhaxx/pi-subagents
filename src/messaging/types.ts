@@ -4,6 +4,8 @@ export type AgentStatus = "queued" | "running" | "idle" | "settled" | "gone";
 export type AgentKind = "main" | "sub";
 export type MessageKind = "message" | "request" | "reply" | "event";
 export type MessagingSurface = "off" | "ui" | "context";
+export type MessagingTransportMode = "off" | "starting" | "socket" | "degraded";
+export type PeerAccess = "main" | "local" | "read-only";
 
 export interface AgentRegistration {
   agentId: string;
@@ -70,6 +72,9 @@ export interface BlackboardEntry {
   key: string;
   value: unknown;
   author: string;
+  authorAgentId: string | null;
+  authorSessionId: string | null;
+  entryToken: number | null;
   revision: number;
   createdAt: number;
   updatedAt: number;
@@ -82,6 +87,8 @@ export interface BlackboardLogEntry {
   key: string;
   op: "put" | "delete" | "expire";
   author: string;
+  authorAgentId: string | null;
+  authorSessionId: string | null;
   revision: number;
   value: unknown | null;
   createdAt: number;
@@ -92,6 +99,8 @@ export interface BlackboardPut {
   key: string;
   value: unknown;
   author: string;
+  authorAgentId?: string | null;
+  authorSessionId?: string | null;
   ifRevision?: number;
   expiresAt?: number | null;
 }
@@ -118,6 +127,24 @@ export interface BlackboardDeleteSuccess {
 }
 
 export type BlackboardDeleteResult = BlackboardDeleteSuccess | BlackboardConflict;
+
+export interface OperatorBoardFailure {
+  ok: false;
+  reason: "entry-changed" | "not-found" | "read-only-namespace" | "not-operator-authored";
+  current: BlackboardEntry | null;
+}
+
+export type OperatorPutResult = BlackboardPutSuccess | OperatorBoardFailure;
+export type OperatorDeleteResult =
+  | { ok: true; op: "delete" | "expire"; entry: BlackboardEntry }
+  | OperatorBoardFailure;
+
+export interface MessagingStoreMetadata {
+  readonly scopeKey: string;
+  readonly scopeMode: MessagingScopeMode;
+  readonly databasePath: string;
+  readonly operatorTopicPrefix: string;
+}
 
 export interface SqliteStoreOptions {
   filePath: string;
@@ -188,14 +215,14 @@ export interface MessageActivity {
 
 export interface BoardActivity {
   type: "board";
-  op: "put" | "delete";
+  op: "put" | "delete" | "expire";
   topic: string;
   key: string;
   /** The recorded author — a display name, which is what the board stores. */
   author: string;
   /** The writer's agent id, which is what identity checks use. */
-  authorAgent: string;
-  authorSession: string;
+  authorAgent: string | null;
+  authorSession: string | null;
   revision?: number;
   value?: unknown;
   at: number;

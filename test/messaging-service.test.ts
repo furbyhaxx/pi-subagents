@@ -8,15 +8,21 @@ import type {
   DeliveryBridge,
   RecipientDeliveryInfo,
 } from "../src/messaging/delivery-bridge.js";
+import { NullNotifyBus } from "../src/messaging/notify-bus.js";
 import { AgentMessagingService } from "../src/messaging/service.js";
 import { SqliteStore } from "../src/messaging/store.js";
 import { createAgentMessageTool } from "../src/messaging/tool.js";
-import type { AgentRegistration, AgentRow, MessagingSurface } from "../src/messaging/types.js";
+import type { AgentRegistration, AgentRow, MessagingSurface, PeerAccess } from "../src/messaging/types.js";
 
 class FakeBridge implements DeliveryBridge {
+  access = new Map<string, PeerAccess>();
   nested = new Set<string>();
   info = new Map<string, RecipientDeliveryInfo>();
   deliveries: Array<{ agentId: string; content: string; wake: boolean }> = [];
+
+  peerAccess(agent: AgentRow): PeerAccess {
+    return this.access.get(agent.agentId) ?? "local";
+  }
 
   recipientInfo(agent: AgentRow): RecipientDeliveryInfo {
     return this.info.get(agent.agentId) ?? {
@@ -80,12 +86,13 @@ describe("AgentMessagingService", () => {
       clock: () => now,
     });
     bridge = new FakeBridge();
-    service = new AgentMessagingService({ store, bridge, clock: () => now });
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", clock: () => now });
     service.registerAgent(registration("caller", "session-a", "caller"));
   });
 
   afterEach(() => {
     service.close();
+    vi.useRealTimers();
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -176,7 +183,7 @@ describe("AgentMessagingService", () => {
       clock: Date.now,
     });
     bridge = new FakeBridge();
-    service = new AgentMessagingService({ store, bridge, maxWaitMs: 25 });
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", maxWaitMs: 25 });
     service.registerAgent(registration("caller", "session-a", "caller"));
     service.registerAgent(registration("wanted", "session-a", "wanted"));
     service.registerAgent(registration("other", "session-a", "other"));
@@ -193,6 +200,155 @@ describe("AgentMessagingService", () => {
     const started = Date.now();
     await service.wait(caller, 10_000, "wanted");
     expect(Date.now() - started).toBeLessThan(250);
+  });
+
+  it("jitters each wait and watch delay, clamps deadlines, and never sleeps for zero", async () => {
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "jitter.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: () => now,
+    });
+    const random = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0.999)
+      .mockReturnValueOnce(0.999);
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", clock: () => now, random });
+    service.registerAgent(registration("caller", "session-a", "caller"));
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    expect(await service.wait(caller, 0)).toBeUndefined();
+    expect(random).not.toHaveBeenCalled();
+
+    const waitAbort = new AbortController();
+    const waiting = service.wait(caller, 1_000, undefined, waitAbort.signal);
+    expect(setTimeoutSpy.mock.calls.at(-1)?.[1]).toBe(225);
+    waitAbort.abort();
+    await expect(waiting).rejects.toThrow();
+
+    const watchAbort = new AbortController();
+    const watching = service.boardWatch(0, 1_000, undefined, watchAbort.signal);
+    expect(setTimeoutSpy.mock.calls.at(-1)?.[1]).toBeCloseTo(274.95);
+    watchAbort.abort();
+    await expect(watching).rejects.toThrow();
+
+    const deadlineAbort = new AbortController();
+    const deadlineWait = service.wait(caller, 200, undefined, deadlineAbort.signal);
+    expect(setTimeoutSpy.mock.calls.at(-1)?.[1]).toBe(200);
+    deadlineAbort.abort();
+    await expect(deadlineWait).rejects.toThrow();
+    expect(random).toHaveBeenCalledTimes(3);
+  });
+
+  it("self-schedules independently jittered idle polls and starts once", async () => {
+    vi.useFakeTimers();
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "idle-jitter.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    const random = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(0.999);
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", random });
+    const poll = vi.spyOn(service, "pollOwnedMailboxes").mockResolvedValue();
+
+    service.start();
+    service.start();
+    expect(random).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_499);
+    expect(poll).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(random).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5_498);
+    expect(poll).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(poll).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not start another idle chain while its poll is still running", async () => {
+    vi.useFakeTimers();
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "idle-running.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", random: () => 0 });
+    let releasePoll: (() => void) | undefined;
+    const poll = vi.spyOn(service, "pollOwnedMailboxes")
+      .mockImplementationOnce(() => new Promise<void>(resolve => { releasePoll = resolve; }))
+      .mockResolvedValue();
+
+    service.start();
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(poll).toHaveBeenCalledTimes(1);
+    service.start();
+    await vi.advanceTimersByTimeAsync(5_500);
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+
+    releasePoll?.();
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(1));
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(poll).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a rejected idle poll and keeps polling", async () => {
+    vi.useFakeTimers();
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "idle-rejection.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", random: () => 0 });
+    const failure = new Error("poll failed");
+    const poll = vi.spyOn(service, "pollOwnedMailboxes")
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    service.start();
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(warn).toHaveBeenCalledWith("[pi-subagents] Agent messaging idle poll failed:", failure);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(poll).toHaveBeenCalledTimes(2);
+  });
+
+  it("defers store close until an active idle poll settles and does not reschedule", async () => {
+    vi.useFakeTimers();
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "idle-close.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", random: () => 0 });
+    service.registerAgent(registration("caller", "session-a", "caller"));
+    service.registerAgent(registration("recipient", "session-a", "recipient"));
+    store.enqueue({ id: "pending", fromAgent: "caller", toAgent: "recipient", kind: "message", body: "queued" });
+    let releaseDelivery: (() => void) | undefined;
+    bridge.deliver = vi.fn(async () => {
+      await new Promise<void>(resolve => { releaseDelivery = resolve; });
+      return { delivered: true, woken: false };
+    });
+    const closeStore = vi.spyOn(store, "close");
+
+    service.start();
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(releaseDelivery).toBeTypeOf("function");
+    service.close();
+    expect(closeStore).not.toHaveBeenCalled();
+    releaseDelivery?.();
+    await vi.waitFor(() => expect(closeStore).toHaveBeenCalledOnce());
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("coalesces a backlog into one notice carrying the count", async () => {
@@ -279,6 +435,7 @@ describe("AgentMessagingService", () => {
     service = new AgentMessagingService({
       store,
       bridge,
+      operatorSessionId: "session-a",
       clock: () => now,
       onActivity: event => activity.push(event),
     });
@@ -289,12 +446,124 @@ describe("AgentMessagingService", () => {
     service.boardPut(caller, { topic: "findings", key: "k", value: 1 });
     service.boardDelete(caller, "findings", "k");
     service.boardDelete(caller, "findings", "gone");
+    const operator = service.operatorPut({ topic: "operator/rules", key: "limit", value: 1, expectedToken: null });
+    if (operator.ok && operator.entry.entryToken !== null) {
+      service.operatorExpire({
+        topic: operator.entry.topic,
+        key: operator.entry.key,
+        expectedToken: operator.entry.entryToken,
+      });
+    }
 
     expect(activity).toMatchObject([
       { type: "message", fromLabel: "caller", toLabel: "recipient", kind: "message", body: "hello" },
       { type: "board", op: "put", topic: "findings", key: "k", author: "caller", revision: 1 },
       { type: "board", op: "delete", topic: "findings", key: "k" },
+      {
+        type: "board",
+        op: "put",
+        topic: "operator/rules",
+        key: "limit",
+        author: "operator",
+        authorAgent: null,
+        authorSession: "session-a",
+      },
+      { type: "board", op: "expire", topic: "operator/rules", key: "limit", authorAgent: null },
     ]);
+  });
+
+  it("exposes panel metadata and operator mutations with trusted provenance", () => {
+    expect(service.getPanelInfo()).toMatchObject({
+      scopeKey: "/project",
+      scopeMode: "project",
+      operatorTopicPrefix: "operator/",
+      sessionId: "session-a",
+      transport: "off",
+    });
+    expect(new NullNotifyBus().mode).toBe("off");
+
+    const created = service.operatorPut({ topic: "operator/rules", key: "limit", value: 3, expectedToken: null });
+    expect(created).toMatchObject({
+      ok: true,
+      entry: { author: "operator", authorAgentId: null, authorSessionId: "session-a" },
+    });
+    if (!created.ok || created.entry.entryToken === null) return;
+    expect(service.operatorExpire({
+      topic: created.entry.topic,
+      key: created.entry.key,
+      expectedToken: created.entry.entryToken,
+    })).toMatchObject({ ok: true, op: "expire" });
+    expect(service.boardRecentLog({ limit: 2 }).map(item => [item.op, item.authorSessionId])).toEqual([
+      ["expire", "session-a"],
+      ["put", "session-a"],
+    ]);
+  });
+
+  it("keeps committed operator success when the activity listener throws", () => {
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "listener.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: () => now,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    service = new AgentMessagingService({
+      store,
+      bridge,
+      operatorSessionId: "session-a",
+      clock: () => now,
+      onActivity: () => { throw new Error("listener failed"); },
+    });
+
+    const result = service.operatorPut({ topic: "operator/rules", key: "k", value: 1, expectedToken: null });
+
+    expect(result.ok).toBe(true);
+    expect(store.get("operator/rules", "k")?.value).toBe(1);
+    expect(warn).toHaveBeenCalledWith(
+      "[pi-subagents] Agent messaging activity listener failed:",
+      expect.objectContaining({ message: "listener failed" }),
+    );
+  });
+
+  it("filters expired data before maintenance and refreshes only owned presence before reaping", async () => {
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "maintenance.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: () => now,
+      heartbeatTimeoutMs: 100,
+      isProcessAlive: () => true,
+    });
+    bridge = new FakeBridge();
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", clock: () => now });
+    service.registerAgent(registration("owned", "session-a", "owned"));
+    service.registerAgent(registration("foreign", "session-b", "foreign"));
+    bridge.access.set("foreign", "read-only");
+    store.enqueue({ id: "expired-message", fromAgent: "foreign", toAgent: "owned", kind: "message", body: "old", expiresAt: 1_050 });
+    store.put({
+      topic: "facts",
+      key: "expired-entry",
+      value: 1,
+      author: "owned",
+      authorAgentId: "owned",
+      authorSessionId: "session-a",
+      expiresAt: 1_050,
+    });
+    now = 1_101;
+
+    expect(store.pendingCount("owned")).toBe(0);
+    expect(service.boardGet("facts", "expired-entry")).toBeUndefined();
+    await service.pollOwnedMailboxes();
+
+    expect(store.listPeers().find(peer => peer.agentId === "owned")?.status).toBe("running");
+    expect(store.listPeers().find(peer => peer.agentId === "foreign")?.status).toBe("gone");
+    expect(store.readLog(0).at(-1)).toMatchObject({
+      op: "expire",
+      authorAgentId: "owned",
+      authorSessionId: "session-a",
+    });
   });
 
   it("does not redeliver rows already marked delivered", async () => {
@@ -316,7 +585,7 @@ describe("AgentMessagingService", () => {
       maxHopCount: 1,
     });
     bridge = new FakeBridge();
-    service = new AgentMessagingService({ store, bridge, clock: () => now, maxWakesPerMinute: 1, maxHops: 1 });
+    service = new AgentMessagingService({ store, bridge, operatorSessionId: "session-a", clock: () => now, maxWakesPerMinute: 1, maxHops: 1 });
     service.registerAgent(registration("caller", "session-a", "caller"));
     service.registerAgent(registration("idle", "session-a", "idle", { status: "settled" }));
     setInfo("idle", "ui", "settled");

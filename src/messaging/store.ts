@@ -1,5 +1,5 @@
 import { NodeSqliteDriver, type SqliteDriver, type SqlRow } from "./driver.js";
-import { SCHEMA_V1, SCHEMA_VERSION, STORE_PRAGMAS } from "./schema.js";
+import { SCHEMA_V1, SCHEMA_V2, SCHEMA_VERSION, STORE_PRAGMAS } from "./schema.js";
 import type {
   AgentRegistration,
   AgentRow,
@@ -15,10 +15,17 @@ import type {
   MailboxDrop,
   MessageKind,
   MessageRow,
+  MessagingStoreMetadata,
+  OperatorDeleteResult,
+  OperatorPutResult,
   SqliteStoreOptions,
 } from "./types.js";
 
 const EMPTY_PARAMS = {};
+const ENTRY_COLUMNS = `entries.*,
+  (SELECT seq FROM entry_log
+   WHERE entry_log.topic=entries.topic AND entry_log.key=entries.key AND op='put'
+   ORDER BY seq DESC LIMIT 1) AS entry_token`;
 
 function text(row: SqlRow, key: string): string {
   return row[key] as string;
@@ -81,6 +88,9 @@ function entryFromRow(row: SqlRow): BlackboardEntry {
     key: text(row, "key"),
     value: JSON.parse(text(row, "value")) as unknown,
     author: text(row, "author"),
+    authorAgentId: nullableText(row, "author_agent_id"),
+    authorSessionId: nullableText(row, "author_session_id"),
+    entryToken: nullableNumber(row, "entry_token"),
     revision: number(row, "revision"),
     createdAt: number(row, "created_at"),
     updatedAt: number(row, "updated_at"),
@@ -110,6 +120,7 @@ export class SqliteStore {
   private readonly maxHopCount: number;
   private readonly operatorTopicPrefix: string;
   private readonly isProcessAlive: (pid: number) => boolean;
+  private readonly metadata: MessagingStoreMetadata;
 
   constructor(options: SqliteStoreOptions, driver?: SqliteDriver) {
     this.driver = driver ?? new NodeSqliteDriver(options.filePath);
@@ -124,6 +135,12 @@ export class SqliteStore {
     this.maxHopCount = options.maxHopCount ?? 4;
     this.operatorTopicPrefix = options.operatorTopicPrefix ?? "operator/";
     this.isProcessAlive = options.isProcessAlive ?? processIsAlive;
+    this.metadata = Object.freeze({
+      scopeKey: options.scopeKey,
+      scopeMode: options.scopeMode,
+      databasePath: options.filePath,
+      operatorTopicPrefix: this.operatorTopicPrefix,
+    });
 
     try {
       this.driver.exec(STORE_PRAGMAS);
@@ -140,28 +157,36 @@ export class SqliteStore {
     this.driver.close();
   }
 
+  getMetadata(): MessagingStoreMetadata {
+    return this.metadata;
+  }
+
   private initializeMeta(scopeKey: string, scopeMode: string): void {
-    const rows = this.driver.prepare("SELECT key, value FROM meta").all(EMPTY_PARAMS);
-    if (rows.length === 0) {
-      this.driver.transaction(() => {
+    this.driver.transaction(() => {
+      const rows = this.driver.prepare("SELECT key, value FROM meta").all(EMPTY_PARAMS);
+      if (rows.length === 0) {
         const insert = this.driver.prepare("INSERT INTO meta(key, value) VALUES ($key, $value)");
-        insert.run({ $key: "schema_version", $value: SCHEMA_VERSION });
+        insert.run({ $key: "schema_version", $value: "1" });
         insert.run({ $key: "scope_key", $value: scopeKey });
         insert.run({ $key: "scope_mode", $value: scopeMode });
-      });
-      return;
-    }
+      }
 
-    const meta = new Map(rows.map(row => [text(row, "key"), text(row, "value")]));
-    if (meta.get("schema_version") !== SCHEMA_VERSION) {
-      throw new Error(`Unsupported messaging schema version: ${meta.get("schema_version") ?? "missing"}`);
-    }
-    if (meta.get("scope_mode") !== scopeMode) {
-      throw new Error(`Messaging scope mode mismatch: stored ${meta.get("scope_mode")}, requested ${scopeMode}`);
-    }
-    if (meta.get("scope_key") !== scopeKey) {
-      throw new Error("Messaging scope key does not match the requested scope");
-    }
+      const reread = this.driver.prepare("SELECT key, value FROM meta").all(EMPTY_PARAMS);
+      const meta = new Map(reread.map(row => [text(row, "key"), text(row, "value")]));
+      if (meta.get("scope_mode") !== scopeMode) {
+        throw new Error(`Messaging scope mode mismatch: stored ${meta.get("scope_mode")}, requested ${scopeMode}`);
+      }
+      if (meta.get("scope_key") !== scopeKey) {
+        throw new Error("Messaging scope key does not match the requested scope");
+      }
+      const version = meta.get("schema_version");
+      if (version === "1") {
+        this.driver.exec(SCHEMA_V2);
+        this.driver.prepare("UPDATE meta SET value=$version WHERE key='schema_version'").run({ $version: SCHEMA_VERSION });
+      } else if (version !== SCHEMA_VERSION) {
+        throw new Error(`Unsupported messaging schema version: ${version ?? "missing"}`);
+      }
+    });
   }
 
   registerAgent(agent: AgentRegistration): AgentRow {
@@ -285,8 +310,9 @@ export class SqliteStore {
     const rows = this.driver.prepare(`
       SELECT id, to_agent FROM messages
       WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL
+        AND (expires_at IS NULL OR expires_at>$now)
       ORDER BY seq DESC LIMIT -1 OFFSET $limit
-    `).all({ $agentId: agentId, $limit: this.mailboxLimit });
+    `).all({ $agentId: agentId, $limit: this.mailboxLimit, $now: now });
     const drop = this.driver.prepare(`
       UPDATE messages SET dropped_at=$now WHERE id=$id AND consumed_at IS NULL AND dropped_at IS NULL
     `);
@@ -310,8 +336,9 @@ export class SqliteStore {
     return this.driver.prepare(`
       SELECT * FROM messages
       WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL AND delivered_at IS NULL
+        AND (expires_at IS NULL OR expires_at>$now)
       ORDER BY seq LIMIT $limit
-    `).all({ $agentId: agentId, $limit: limit }).map(messageFromRow);
+    `).all({ $agentId: agentId, $limit: limit, $now: this.clock() }).map(messageFromRow);
   }
 
   consumeNext(agentId: string, options: { from?: string } = {}): MessageRow | undefined {
@@ -320,6 +347,7 @@ export class SqliteStore {
       WHERE id = (
         SELECT id FROM messages
         WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL
+          AND (expires_at IS NULL OR expires_at>$now)
           AND ($fromAgent IS NULL OR from_agent=$fromAgent)
         ORDER BY seq LIMIT 1
       ) AND consumed_at IS NULL AND dropped_at IS NULL
@@ -332,8 +360,9 @@ export class SqliteStore {
     if (options.peek) {
       return this.driver.prepare(`
         SELECT * FROM messages
-        WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL ORDER BY seq
-      `).all({ $agentId: agentId }).map(messageFromRow);
+        WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL
+          AND (expires_at IS NULL OR expires_at>$now) ORDER BY seq
+      `).all({ $agentId: agentId, $now: this.clock() }).map(messageFromRow);
     }
     const messages: MessageRow[] = [];
     while (true) {
@@ -359,7 +388,8 @@ export class SqliteStore {
     const row = this.driver.prepare(`
       SELECT COUNT(*) AS count FROM messages
       WHERE to_agent=$agentId AND consumed_at IS NULL AND dropped_at IS NULL
-    `).get({ $agentId: agentId });
+        AND (expires_at IS NULL OR expires_at>$now)
+    `).get({ $agentId: agentId, $now: this.clock() });
     return row ? number(row, "count") : 0;
   }
 
@@ -371,10 +401,12 @@ export class SqliteStore {
     }
 
     return this.driver.transaction(() => {
-      const currentRow = this.driver.prepare("SELECT * FROM entries WHERE topic=$topic AND key=$key").get({
+      const storedRow = this.driver.prepare(`SELECT ${ENTRY_COLUMNS} FROM entries WHERE topic=$topic AND key=$key`).get({
         $topic: input.topic,
         $key: input.key,
       });
+      const currentRow = storedRow && (nullableNumber(storedRow, "expires_at") === null
+        || nullableNumber(storedRow, "expires_at")! > this.clock()) ? storedRow : undefined;
       if (input.topic.startsWith(this.operatorTopicPrefix) && input.author !== "operator") {
         return this.conflict("read-only-namespace", currentRow);
       }
@@ -383,33 +415,53 @@ export class SqliteStore {
         return this.conflict("revision-conflict", currentRow);
       }
       if (!currentRow) {
-        const countRow = this.driver.prepare("SELECT COUNT(*) AS count FROM entries WHERE topic=$topic").get({
-          $topic: input.topic,
-        });
+        const countRow = this.driver.prepare(`
+          SELECT COUNT(*) AS count FROM entries
+          WHERE topic=$topic AND (expires_at IS NULL OR expires_at>$now)
+        `).get({ $topic: input.topic, $now: this.clock() });
         if (countRow && number(countRow, "count") >= this.blackboardKeysPerTopic) {
           throw new Error(`Blackboard topic exceeds ${this.blackboardKeysPerTopic} keys`);
         }
       }
 
       const now = this.clock();
+      if (storedRow && !currentRow) this.expireEntryRow(storedRow, now);
       const revision = currentRevision + 1;
       this.driver.prepare(`
-        INSERT INTO entries(topic, key, value, author, revision, created_at, updated_at, expires_at)
-        VALUES ($topic, $key, $value, $author, $revision, $now, $now, $expiresAt)
+        INSERT INTO entries(
+          topic, key, value, author, author_agent_id, author_session_id,
+          revision, created_at, updated_at, expires_at
+        ) VALUES (
+          $topic, $key, $value, $author, $authorAgentId, $authorSessionId,
+          $revision, $now, $now, $expiresAt
+        )
         ON CONFLICT(topic, key) DO UPDATE SET
-          value=excluded.value, author=excluded.author, revision=excluded.revision,
-          updated_at=excluded.updated_at, expires_at=excluded.expires_at
+          value=excluded.value, author=excluded.author,
+          author_agent_id=excluded.author_agent_id, author_session_id=excluded.author_session_id,
+          revision=excluded.revision, updated_at=excluded.updated_at, expires_at=excluded.expires_at
       `).run({
         $topic: input.topic,
         $key: input.key,
         $value: encoded,
         $author: input.author,
+        $authorAgentId: input.authorAgentId ?? null,
+        $authorSessionId: input.authorSessionId ?? null,
         $revision: revision,
         $now: now,
         $expiresAt: input.expiresAt ?? null,
       });
-      this.appendLog(input.topic, input.key, "put", input.author, revision, encoded, now);
-      const saved = this.driver.prepare("SELECT * FROM entries WHERE topic=$topic AND key=$key").get({
+      this.appendLog(
+        input.topic,
+        input.key,
+        "put",
+        input.author,
+        input.authorAgentId ?? null,
+        input.authorSessionId ?? null,
+        revision,
+        encoded,
+        now,
+      );
+      const saved = this.driver.prepare(`SELECT ${ENTRY_COLUMNS} FROM entries WHERE topic=$topic AND key=$key`).get({
         $topic: input.topic,
         $key: input.key,
       });
@@ -430,47 +482,228 @@ export class SqliteStore {
   }
 
   get(topic: string, key: string): BlackboardEntry | undefined {
-    const row = this.driver.prepare("SELECT * FROM entries WHERE topic=$topic AND key=$key").get({
-      $topic: topic,
-      $key: key,
-    });
+    const row = this.driver.prepare(`
+      SELECT ${ENTRY_COLUMNS} FROM entries
+      WHERE topic=$topic AND key=$key AND (expires_at IS NULL OR expires_at>$now)
+    `).get({ $topic: topic, $key: key, $now: this.clock() });
     return row ? entryFromRow(row) : undefined;
   }
 
   list(topic?: string): BlackboardEntry[] {
+    const now = this.clock();
     const rows = topic === undefined
-      ? this.driver.prepare("SELECT * FROM entries ORDER BY topic, updated_at, key").all(EMPTY_PARAMS)
-      : this.driver.prepare("SELECT * FROM entries WHERE topic=$topic ORDER BY updated_at, key").all({ $topic: topic });
+      ? this.driver.prepare(`
+          SELECT ${ENTRY_COLUMNS} FROM entries
+          WHERE expires_at IS NULL OR expires_at>$now ORDER BY topic, updated_at, key
+        `).all({ $now: now })
+      : this.driver.prepare(`
+          SELECT ${ENTRY_COLUMNS} FROM entries
+          WHERE topic=$topic AND (expires_at IS NULL OR expires_at>$now) ORDER BY updated_at, key
+        `).all({ $topic: topic, $now: now });
     return rows.map(entryFromRow);
   }
 
-  delete(topic: string, key: string, author: string): BlackboardDeleteResult {
+  delete(
+    topic: string,
+    key: string,
+    author: string,
+    authorAgentId: string | null = null,
+    authorSessionId: string | null = null,
+  ): BlackboardDeleteResult {
     return this.driver.transaction(() => {
-      const row = this.driver.prepare("SELECT * FROM entries WHERE topic=$topic AND key=$key").get({
-        $topic: topic,
-        $key: key,
-      });
+      const row = this.driver.prepare(`
+        SELECT * FROM entries
+        WHERE topic=$topic AND key=$key AND (expires_at IS NULL OR expires_at>$now)
+      `).get({ $topic: topic, $key: key, $now: this.clock() });
       if (topic.startsWith(this.operatorTopicPrefix) && author !== "operator") {
         return this.conflict("read-only-namespace", row);
       }
       if (!row) return { ok: true, deleted: false };
       this.driver.prepare("DELETE FROM entries WHERE topic=$topic AND key=$key").run({ $topic: topic, $key: key });
-      this.appendLog(topic, key, "delete", author, number(row, "revision"), null, this.clock());
+      this.appendLog(
+        topic,
+        key,
+        "delete",
+        author,
+        authorAgentId,
+        authorSessionId,
+        number(row, "revision"),
+        null,
+        this.clock(),
+      );
       return { ok: true, deleted: true };
     });
   }
 
+  operatorPut(input: {
+    topic: string;
+    key: string;
+    value: unknown;
+    expectedToken: number | null;
+    operatorSessionId: string;
+  }): OperatorPutResult {
+    const encoded = JSON.stringify(input.value);
+    if (encoded === undefined) throw new Error("Blackboard value must be JSON-serializable");
+    if (Buffer.byteLength(encoded, "utf8") > this.blackboardValueLimitBytes) {
+      throw new Error(`Blackboard value exceeds ${this.blackboardValueLimitBytes} bytes`);
+    }
+
+    return this.driver.transaction(() => {
+      const row = this.driver.prepare(`SELECT ${ENTRY_COLUMNS} FROM entries WHERE topic=$topic AND key=$key`).get({
+        $topic: input.topic,
+        $key: input.key,
+      });
+      const live = row && (nullableNumber(row, "expires_at") === null
+        || Number(row.expires_at) > this.clock()) ? row : undefined;
+      const current = live ? entryFromRow(live) : null;
+      if (!input.topic.startsWith(this.operatorTopicPrefix)) {
+        return { ok: false, reason: "read-only-namespace", current };
+      }
+      if (input.expectedToken === null) {
+        if (live) return { ok: false, reason: "entry-changed", current };
+      } else {
+        if (!live) return { ok: false, reason: "not-found", current: null };
+        if (current?.entryToken !== input.expectedToken) {
+          return { ok: false, reason: "entry-changed", current };
+        }
+        if (text(live, "author") !== "operator"
+          || nullableText(live, "author_agent_id") !== null
+          || nullableText(live, "author_session_id") !== input.operatorSessionId) {
+          return { ok: false, reason: "not-operator-authored", current };
+        }
+      }
+
+      const now = this.clock();
+      if (row && !live) this.expireEntryRow(row, now);
+      const revision = live ? number(live, "revision") + 1 : 1;
+      const createdAt = live ? number(live, "created_at") : now;
+      const expiresAt = live ? nullableNumber(live, "expires_at") : null;
+      this.driver.prepare(`
+        INSERT INTO entries(
+          topic, key, value, author, author_agent_id, author_session_id,
+          revision, created_at, updated_at, expires_at
+        ) VALUES (
+          $topic, $key, $value, 'operator', NULL, $operatorSessionId,
+          $revision, $createdAt, $now, $expiresAt
+        )
+        ON CONFLICT(topic, key) DO UPDATE SET
+          value=excluded.value, author=excluded.author,
+          author_agent_id=NULL, author_session_id=excluded.author_session_id,
+          revision=excluded.revision, created_at=excluded.created_at,
+          updated_at=excluded.updated_at, expires_at=excluded.expires_at
+      `).run({
+        $topic: input.topic,
+        $key: input.key,
+        $value: encoded,
+        $operatorSessionId: input.operatorSessionId,
+        $revision: revision,
+        $createdAt: createdAt,
+        $now: now,
+        $expiresAt: expiresAt,
+      });
+      this.appendLog(
+        input.topic,
+        input.key,
+        "put",
+        "operator",
+        null,
+        input.operatorSessionId,
+        revision,
+        encoded,
+        now,
+      );
+      const saved = this.driver.prepare(`SELECT ${ENTRY_COLUMNS} FROM entries WHERE topic=$topic AND key=$key`).get({
+        $topic: input.topic,
+        $key: input.key,
+      });
+      if (!saved) throw new Error("Failed to save operator blackboard entry");
+      return { ok: true, entry: entryFromRow(saved) };
+    });
+  }
+
+  operatorDelete(input: {
+    topic: string;
+    key: string;
+    expectedToken: number;
+    operatorSessionId: string;
+  }): OperatorDeleteResult {
+    return this.operatorRemove({ ...input, op: "delete" });
+  }
+
+  operatorExpire(input: {
+    topic: string;
+    key: string;
+    expectedToken: number;
+    operatorSessionId: string;
+  }): OperatorDeleteResult {
+    return this.operatorRemove({ ...input, op: "expire" });
+  }
+
+  private operatorRemove(input: {
+    topic: string;
+    key: string;
+    expectedToken: number;
+    operatorSessionId: string;
+    op: "delete" | "expire";
+  }): OperatorDeleteResult {
+    return this.driver.transaction(() => {
+      const row = this.driver.prepare(`
+        SELECT ${ENTRY_COLUMNS} FROM entries
+        WHERE topic=$topic AND key=$key AND (expires_at IS NULL OR expires_at>$now)
+      `).get({ $topic: input.topic, $key: input.key, $now: this.clock() });
+      if (!row) return { ok: false, reason: "not-found", current: null };
+      const entry = entryFromRow(row);
+      if (entry.entryToken !== input.expectedToken) {
+        return { ok: false, reason: "entry-changed", current: entry };
+      }
+      this.driver.prepare("DELETE FROM entries WHERE topic=$topic AND key=$key").run({
+        $topic: input.topic,
+        $key: input.key,
+      });
+      this.appendLog(
+        input.topic,
+        input.key,
+        input.op,
+        "operator",
+        null,
+        input.operatorSessionId,
+        entry.revision,
+        null,
+        this.clock(),
+      );
+      return { ok: true, op: input.op, entry };
+    });
+  }
+
+  boardRecentLog(options: { topic?: string; limit?: number } = {}): BlackboardLogEntry[] {
+    const requested = Number.isFinite(options.limit) ? Math.trunc(options.limit ?? 100) : 100;
+    const limit = Math.min(200, Math.max(1, requested));
+    const rows = options.topic === undefined
+      ? this.driver.prepare("SELECT * FROM entry_log ORDER BY seq DESC LIMIT $limit").all({ $limit: limit })
+      : this.driver.prepare(`
+          SELECT * FROM entry_log WHERE topic=$topic ORDER BY seq DESC LIMIT $limit
+        `).all({ $topic: options.topic, $limit: limit });
+    return rows.map(row => this.logFromRow(row));
+  }
+
   readLog(since: number): BlackboardLogEntry[] {
-    return this.driver.prepare("SELECT * FROM entry_log WHERE seq>$since ORDER BY seq").all({ $since: since }).map(row => ({
+    return this.driver.prepare("SELECT * FROM entry_log WHERE seq>$since ORDER BY seq").all({ $since: since })
+      .map(row => this.logFromRow(row));
+  }
+
+  private logFromRow(row: SqlRow): BlackboardLogEntry {
+    return {
       seq: number(row, "seq"),
       topic: text(row, "topic"),
       key: text(row, "key"),
       op: text(row, "op") as BlackboardLogEntry["op"],
       author: text(row, "author"),
+      authorAgentId: nullableText(row, "author_agent_id"),
+      authorSessionId: nullableText(row, "author_session_id"),
       revision: number(row, "revision"),
       value: nullableText(row, "value") === null ? null : JSON.parse(text(row, "value")) as unknown,
       createdAt: number(row, "created_at"),
-    }));
+    };
   }
 
   /**
@@ -489,22 +722,47 @@ export class SqliteStore {
     key: string,
     op: BlackboardLogEntry["op"],
     author: string,
+    authorAgentId: string | null,
+    authorSessionId: string | null,
     revision: number,
     value: string | null,
     createdAt: number,
   ): void {
     this.driver.prepare(`
-      INSERT INTO entry_log(topic, key, op, author, revision, value, created_at)
-      VALUES ($topic, $key, $op, $author, $revision, $value, $createdAt)
+      INSERT INTO entry_log(
+        topic, key, op, author, author_agent_id, author_session_id, revision, value, created_at
+      ) VALUES (
+        $topic, $key, $op, $author, $authorAgentId, $authorSessionId, $revision, $value, $createdAt
+      )
     `).run({
       $topic: topic,
       $key: key,
       $op: op,
       $author: author,
+      $authorAgentId: authorAgentId,
+      $authorSessionId: authorSessionId,
       $revision: revision,
       $value: value,
       $createdAt: createdAt,
     });
+  }
+
+  private expireEntryRow(row: SqlRow, now: number): void {
+    this.driver.prepare("DELETE FROM entries WHERE topic=$topic AND key=$key").run({
+      $topic: text(row, "topic"),
+      $key: text(row, "key"),
+    });
+    this.appendLog(
+      text(row, "topic"),
+      text(row, "key"),
+      "expire",
+      text(row, "author"),
+      nullableText(row, "author_agent_id"),
+      nullableText(row, "author_session_id"),
+      number(row, "revision"),
+      null,
+      now,
+    );
   }
 
   sweep(): { expiredMessages: number; expiredEntries: number; prunedMessages: number } {
@@ -512,19 +770,7 @@ export class SqliteStore {
     return this.driver.transaction(() => {
       const expiredEntries = this.driver.prepare("SELECT * FROM entries WHERE expires_at IS NOT NULL AND expires_at<=$now")
         .all({ $now: now });
-      const deleteEntry = this.driver.prepare("DELETE FROM entries WHERE topic=$topic AND key=$key");
-      for (const row of expiredEntries) {
-        deleteEntry.run({ $topic: text(row, "topic"), $key: text(row, "key") });
-        this.appendLog(
-          text(row, "topic"),
-          text(row, "key"),
-          "expire",
-          text(row, "author"),
-          number(row, "revision"),
-          null,
-          now,
-        );
-      }
+      for (const row of expiredEntries) this.expireEntryRow(row, now);
       const expiredMessages = this.driver.prepare("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at<=$now")
         .run({ $now: now });
       const prunedMessages = this.driver.prepare(`

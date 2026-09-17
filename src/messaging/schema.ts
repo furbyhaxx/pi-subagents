@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = "1";
+export const SCHEMA_VERSION = "2";
 
 export const SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS entry_log (
   value      TEXT,
   created_at INTEGER NOT NULL
 );
+`;
+
+export const SCHEMA_V2 = `
+ALTER TABLE entries ADD COLUMN author_agent_id TEXT;
+ALTER TABLE entries ADD COLUMN author_session_id TEXT;
+ALTER TABLE entry_log ADD COLUMN author_agent_id TEXT;
+ALTER TABLE entry_log ADD COLUMN author_session_id TEXT;
+CREATE INDEX entry_log_identity ON entry_log(topic, key, op, seq);
 `;
 
 export const STORE_PRAGMAS = `

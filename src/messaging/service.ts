@@ -15,6 +15,11 @@ import type {
   MessageRow,
   MessagingActivity,
   MessagingCaller,
+  MessagingStoreMetadata,
+  MessagingTransportMode,
+  OperatorDeleteResult,
+  OperatorPutResult,
+  PeerAccess,
   ResolveTargetResult,
 } from "./types.js";
 
@@ -38,12 +43,14 @@ const MAX_BODIES_PER_INJECTION = 10;
 export interface AgentMessagingServiceOptions {
   store: SqliteStore;
   bridge: DeliveryBridge;
+  operatorSessionId: string;
   notifyBus?: NotifyBus;
   maxWakesPerMinute?: number;
   maxHops?: number;
   maxWaitMs?: number;
   allowForeignMainWake?: boolean;
   clock?: () => number;
+  random?: () => number;
   /** Bus traffic worth showing a human. Never on the delivery path's critical section. */
   onActivity?: (activity: MessagingActivity) => void;
 }
@@ -122,39 +129,79 @@ export class AgentMessagingService {
   private readonly store: SqliteStore;
   private readonly bridge: DeliveryBridge;
   private readonly notifyBus: NotifyBus;
+  private readonly operatorSessionId: string;
   private readonly maxWakesPerMinute: number;
   private readonly maxHops: number;
   private readonly maxWaitMs: number;
   private readonly allowForeignMainWake: boolean;
   private readonly clock: () => number;
+  private readonly random: () => number;
   private readonly onActivity: ((activity: MessagingActivity) => void) | undefined;
   private readonly wakeTimes = new Map<string, number[]>();
   private readonly inheritedHops = new Map<string, number>();
-  private idleTimer: ReturnType<typeof setInterval> | undefined;
+  private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  private idleLoopStarted = false;
+  private activePolls = 0;
+  private closed = false;
+  private storeClosed = false;
 
   constructor(options: AgentMessagingServiceOptions) {
     this.store = options.store;
     this.bridge = options.bridge;
     this.notifyBus = options.notifyBus ?? new NullNotifyBus();
+    this.operatorSessionId = options.operatorSessionId;
     this.maxWakesPerMinute = options.maxWakesPerMinute ?? 6;
     this.maxHops = options.maxHops ?? 4;
     this.maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     this.allowForeignMainWake = options.allowForeignMainWake ?? true;
     this.clock = options.clock ?? Date.now;
+    this.random = options.random ?? Math.random;
     this.onActivity = options.onActivity;
   }
 
   start(): void {
-    if (this.idleTimer) return;
-    this.idleTimer = setInterval(() => { void this.pollOwnedMailboxes(); }, IDLE_POLL_MS);
-    this.idleTimer.unref();
+    if (this.closed || this.idleLoopStarted) return;
+    this.idleLoopStarted = true;
+    this.scheduleIdlePoll();
   }
 
   close(): void {
-    if (this.idleTimer) clearInterval(this.idleTimer);
+    if (this.closed) return;
+    this.closed = true;
+    this.idleLoopStarted = false;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = undefined;
     this.notifyBus.close();
+    if (this.activePolls === 0) this.closeStore();
+  }
+
+  private closeStore(): void {
+    if (this.storeClosed) return;
+    this.storeClosed = true;
     this.store.close();
+  }
+
+  private scheduleIdlePoll(): void {
+    if (this.closed || !this.idleLoopStarted || this.idleTimer) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = undefined;
+      void this.runIdlePoll();
+    }, this.jitter(IDLE_POLL_MS));
+    this.idleTimer.unref();
+  }
+
+  private async runIdlePoll(): Promise<void> {
+    try {
+      await this.pollOwnedMailboxes();
+    } catch (error) {
+      console.warn("[pi-subagents] Agent messaging idle poll failed:", error);
+    } finally {
+      this.scheduleIdlePoll();
+    }
+  }
+
+  private jitter(ms: number): number {
+    return ms * (0.9 + this.random() * 0.2);
   }
 
   registerAgent(agent: AgentRegistration): AgentRow {
@@ -293,6 +340,22 @@ export class AgentMessagingService {
     return this.store.listPeers().map(peer => ({ ...peer, unread: this.store.pendingCount(peer.agentId) }));
   }
 
+  panelPeers(): Array<AgentRow & { unread: number; access: PeerAccess }> {
+    return this.store.listPeers().map(peer => ({
+      ...peer,
+      unread: this.store.pendingCount(peer.agentId),
+      access: this.bridge.peerAccess(peer),
+    }));
+  }
+
+  getPanelInfo(): MessagingStoreMetadata & { sessionId: string; transport: MessagingTransportMode } {
+    return {
+      ...this.store.getMetadata(),
+      sessionId: this.operatorSessionId,
+      transport: this.notifyBus.mode,
+    };
+  }
+
   async wait(
     caller: MessagingCaller,
     timeoutMs: number,
@@ -314,7 +377,7 @@ export class AgentMessagingService {
       if (message) return message;
       const remaining = deadline - this.clock();
       if (remaining <= 0) return undefined;
-      await this.sleep(Math.min(WAIT_POLL_MS, remaining), signal);
+      await this.sleep(Math.min(this.jitter(WAIT_POLL_MS), remaining), signal);
     }
   }
 
@@ -339,6 +402,8 @@ export class AgentMessagingService {
       key: input.key,
       value: input.value,
       author,
+      authorAgentId: caller.agentId,
+      authorSessionId: caller.sessionId,
       ifRevision: input.ifRevision,
     });
     if (result.ok) {
@@ -357,8 +422,37 @@ export class AgentMessagingService {
 
   boardDelete(caller: MessagingCaller, topic: string, key: string): BlackboardDeleteResult {
     const author = this.authorOf(caller);
-    const result = this.store.delete(topic, key, author);
+    const result = this.store.delete(topic, key, author, caller.agentId, caller.sessionId);
     if (result.ok && result.deleted) this.emitBoard(caller, author, "delete", topic, key);
+    return result;
+  }
+
+  boardRecentLog(options: { topic?: string; limit?: number } = {}): BlackboardLogEntry[] {
+    return this.store.boardRecentLog(options);
+  }
+
+  operatorPut(input: {
+    topic: string;
+    key: string;
+    value: unknown;
+    expectedToken: number | null;
+  }): OperatorPutResult {
+    const result = this.store.operatorPut({ ...input, operatorSessionId: this.operatorSessionId });
+    if (result.ok) {
+      this.emitOperatorBoard("put", result.entry.topic, result.entry.key, result.entry.revision, result.entry.value);
+    }
+    return result;
+  }
+
+  operatorDelete(input: { topic: string; key: string; expectedToken: number }): OperatorDeleteResult {
+    const result = this.store.operatorDelete({ ...input, operatorSessionId: this.operatorSessionId });
+    if (result.ok) this.emitOperatorBoard("delete", result.entry.topic, result.entry.key, result.entry.revision);
+    return result;
+  }
+
+  operatorExpire(input: { topic: string; key: string; expectedToken: number }): OperatorDeleteResult {
+    const result = this.store.operatorExpire({ ...input, operatorSessionId: this.operatorSessionId });
+    if (result.ok) this.emitOperatorBoard("expire", result.entry.topic, result.entry.key, result.entry.revision);
     return result;
   }
 
@@ -401,7 +495,7 @@ export class AgentMessagingService {
       cursor = result.cursor;
       const remaining = deadline - this.clock();
       if (remaining <= 0) return { cursor, changes: [] };
-      await this.sleep(Math.min(WAIT_POLL_MS, remaining), signal);
+      await this.sleep(Math.min(this.jitter(WAIT_POLL_MS), remaining), signal);
     }
   }
 
@@ -423,11 +517,29 @@ export class AgentMessagingService {
   }
 
   async pollOwnedMailboxes(): Promise<void> {
-    for (const peer of this.store.listPeers()) {
-      const info = this.bridge.recipientInfo(peer);
-      if (info.ownership !== "local") continue;
-      const pending = this.store.listUndelivered(peer.agentId);
-      if (pending.length > 0) await this.deliver(pending, peer);
+    if (this.closed) return;
+    this.activePolls++;
+    try {
+      for (const peer of this.store.listPeers()) {
+        if (this.closed) return;
+        if (this.bridge.peerAccess(peer) === "read-only") continue;
+        const info = this.bridge.recipientInfo(peer);
+        if (info.ownership !== "local" || info.state === "gone") continue;
+        this.store.heartbeat(peer.agentId);
+        this.store.setStatus(peer.agentId, info.state === "settled" ? "settled" : info.state);
+      }
+      this.store.reapStale();
+      this.store.sweep();
+      for (const peer of this.store.listPeers()) {
+        if (this.closed) return;
+        const info = this.bridge.recipientInfo(peer);
+        if (info.ownership !== "local") continue;
+        const pending = this.store.listUndelivered(peer.agentId);
+        if (pending.length > 0) await this.deliver(pending, peer);
+      }
+    } finally {
+      this.activePolls--;
+      if (this.closed && this.activePolls === 0) this.closeStore();
     }
   }
 
@@ -441,9 +553,8 @@ export class AgentMessagingService {
     message: MessageRow,
     recipients?: number,
   ): void {
-    if (!this.onActivity) return;
     const sender = this.store.listPeers().find(peer => peer.agentId === caller.agentId);
-    this.onActivity({
+    this.dispatchActivity({
       type: "message",
       fromAgent: caller.agentId,
       fromLabel: sender ? displayHandle(sender) : caller.agentId,
@@ -460,14 +571,13 @@ export class AgentMessagingService {
   private emitBoard(
     caller: MessagingCaller,
     author: string,
-    op: "put" | "delete",
+    op: "put" | "delete" | "expire",
     topic: string,
     key: string,
     revision?: number,
     value?: unknown,
   ): void {
-    if (!this.onActivity) return;
-    this.onActivity({
+    this.dispatchActivity({
       type: "board",
       op,
       topic,
@@ -479,6 +589,35 @@ export class AgentMessagingService {
       value,
       at: this.clock(),
     });
+  }
+
+  private emitOperatorBoard(
+    op: "put" | "delete" | "expire",
+    topic: string,
+    key: string,
+    revision?: number,
+    value?: unknown,
+  ): void {
+    this.dispatchActivity({
+      type: "board",
+      op,
+      topic,
+      key,
+      author: OPERATOR_AUTHOR,
+      authorAgent: null,
+      authorSession: this.operatorSessionId,
+      revision,
+      value,
+      at: this.clock(),
+    });
+  }
+
+  private dispatchActivity(activity: MessagingActivity): void {
+    try {
+      this.onActivity?.(activity);
+    } catch (error) {
+      console.warn("[pi-subagents] Agent messaging activity listener failed:", error);
+    }
   }
 
   private canWake(agentId: string): boolean {

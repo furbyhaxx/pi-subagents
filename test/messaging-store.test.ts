@@ -2,7 +2,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isSqliteAvailable } from "../src/messaging/driver.js";
+import { isSqliteAvailable, NodeSqliteDriver } from "../src/messaging/driver.js";
+import { SCHEMA_V1 } from "../src/messaging/schema.js";
 import { resolveMessagingLocation } from "../src/messaging/scope.js";
 import { SqliteStore } from "../src/messaging/store.js";
 import type { SqliteStoreOptions } from "../src/messaging/types.js";
@@ -292,6 +293,110 @@ describe.skipIf(!sqliteAvailable)(
     expect(store.get("operator/rules", "limit")?.value).toBe(3);
     expect(store.delete("operator/rules", "limit", "operator")).toEqual({ ok: true, deleted: true });
     expect(store.get("operator/rules", "limit")).toBeUndefined();
+  });
+
+  it("migrates v1 provenance additively without inferring legacy identity", () => {
+    const driver = new NodeSqliteDriver(filePath);
+    driver.exec(SCHEMA_V1);
+    driver.prepare("INSERT INTO meta(key,value) VALUES ($key,$value)").run({ $key: "schema_version", $value: "1" });
+    driver.prepare("INSERT INTO meta(key,value) VALUES ($key,$value)").run({ $key: "scope_key", $value: "/project" });
+    driver.prepare("INSERT INTO meta(key,value) VALUES ($key,$value)").run({ $key: "scope_mode", $value: "project" });
+    driver.prepare(`
+      INSERT INTO entries(topic,key,value,author,revision,created_at,updated_at)
+      VALUES ('facts','legacy','1','operator',4,10,20)
+    `).run({});
+    driver.prepare(`
+      INSERT INTO entry_log(topic,key,op,author,revision,value,created_at)
+      VALUES ('facts','legacy','put','operator',4,'1',20)
+    `).run({});
+    driver.close();
+
+    const first = open();
+    const legacy = first.get("facts", "legacy");
+    expect(legacy).toMatchObject({ revision: 4, authorAgentId: null, authorSessionId: null, entryToken: 1 });
+    first.close();
+    stores.splice(stores.indexOf(first), 1);
+    expect(() => open()).not.toThrow();
+  });
+
+  it("persists trusted agent provenance independently of the roster", () => {
+    const first = open();
+    first.put({
+      topic: "facts",
+      key: "owned",
+      value: 1,
+      author: "explore",
+      authorAgentId: "agent-1",
+      authorSessionId: "session-a",
+    });
+    first.close();
+    stores.splice(stores.indexOf(first), 1);
+
+    expect(open().get("facts", "owned")).toMatchObject({
+      authorAgentId: "agent-1",
+      authorSessionId: "session-a",
+    });
+  });
+
+  it("uses nonreused put tokens to reject stale operator ABA actions atomically", () => {
+    const first = open({ operatorTopicPrefix: "human/" });
+    const second = open({ operatorTopicPrefix: "human/" });
+    const created = first.operatorPut({
+      topic: "human/rules", key: "limit", value: 1, expectedToken: null, operatorSessionId: "session-a",
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const selectedToken = created.entry.entryToken;
+    expect(selectedToken).not.toBeNull();
+    if (selectedToken === null) return;
+    const afterCreate = first.readLog(0);
+    expect(first.operatorPut({
+      topic: "human/rules", key: "limit", value: 9, expectedToken: null, operatorSessionId: "session-a",
+    })).toMatchObject({ ok: false, reason: "entry-changed", current: { value: 1 } });
+    expect(first.readLog(0)).toEqual(afterCreate);
+
+    const edited = second.operatorPut({
+      topic: "human/rules", key: "limit", value: 2, expectedToken: selectedToken, operatorSessionId: "session-a",
+    });
+    expect(edited.ok).toBe(true);
+    const beforeRefusal = first.readLog(0);
+    expect(first.operatorDelete({
+      topic: "human/rules", key: "limit", expectedToken: selectedToken, operatorSessionId: "session-a",
+    })).toMatchObject({ ok: false, reason: "entry-changed", current: { value: 2 } });
+    expect(first.readLog(0)).toEqual(beforeRefusal);
+
+    if (!edited.ok || edited.entry.entryToken === null) return;
+    expect(second.operatorDelete({
+      topic: "human/rules", key: "limit", expectedToken: edited.entry.entryToken, operatorSessionId: "session-a",
+    })).toMatchObject({ ok: true, op: "delete" });
+    const recreated = second.operatorPut({
+      topic: "human/rules", key: "limit", value: 3, expectedToken: null, operatorSessionId: "session-a",
+    });
+    expect(recreated).toMatchObject({ ok: true, entry: { revision: 1 } });
+    expect(first.operatorExpire({
+      topic: "human/rules", key: "limit", expectedToken: selectedToken, operatorSessionId: "session-a",
+    })).toMatchObject({ ok: false, reason: "entry-changed", current: { value: 3, revision: 1 } });
+  });
+
+  it("requires current trusted operator provenance for edits and bounds recent log in SQL", () => {
+    const store = open();
+    store.put({ topic: "operator/rules", key: "legacy", value: 1, author: "operator" });
+    const legacy = store.get("operator/rules", "legacy")!;
+    expect(store.operatorPut({
+      topic: legacy.topic,
+      key: legacy.key,
+      value: 2,
+      expectedToken: legacy.entryToken,
+      operatorSessionId: "session-a",
+    })).toMatchObject({ ok: false, reason: "not-operator-authored" });
+    expect(store.operatorPut({
+      topic: "facts", key: "outside", value: 1, expectedToken: null, operatorSessionId: "session-a",
+    })).toMatchObject({ ok: false, reason: "read-only-namespace" });
+    for (let index = 0; index < 5; index++) {
+      store.put({ topic: index % 2 ? "other" : "facts", key: `k${index}`, value: index, author: "agent" });
+    }
+    expect(store.boardRecentLog({ topic: "facts", limit: 2 }).map(item => item.key)).toEqual(["k4", "k2"]);
+    expect(store.boardRecentLog({ limit: 1 })).toHaveLength(1);
   });
 
   it("enforces injectable payload, key, and hop limits", () => {

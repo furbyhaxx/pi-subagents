@@ -114,6 +114,23 @@ describe("MessagingCardFeed", () => {
     }]);
   });
 
+  it("keeps durable identities separate and records operator expiry", () => {
+    feed.record(board({ key: "a", authorAgent: "agent-1", authorSession: "session-a" }));
+    feed.record(board({ key: "b", authorAgent: "agent-1", authorSession: "session-b" }));
+    feed.record(board({
+      key: "c",
+      author: "operator",
+      authorAgent: null,
+      authorSession: "session-a",
+      op: "expire",
+      value: undefined,
+    }));
+    vi.advanceTimersByTime(1_500);
+
+    expect(cards).toHaveLength(3);
+    expect(cards).toContainEqual(expect.objectContaining({ kind: "board", op: "expire", author: "operator" }));
+  });
+
   it("keeps separate authors and topics apart", () => {
     feed.record(board({ key: "a" }));
     feed.record(board({ key: "b", author: "plan", authorAgent: "agent-2" }));

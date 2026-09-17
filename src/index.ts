@@ -1149,11 +1149,16 @@ export default function (pi: ExtensionAPI) {
             : new SocketNotifyBus({
               scopeKey: location.scopeKey,
               socketPath: messagingSettings.notifySocket,
-              onBump: () => { void messagingService?.pollOwnedMailboxes(); },
+              onBump: () => {
+                void messagingService?.pollOwnedMailboxes().catch(error => {
+                  console.warn("[pi-subagents] Agent messaging socket poll failed:", error);
+                });
+              },
             });
           messagingService = new AgentMessagingService({
             store,
             bridge,
+            operatorSessionId: rootSessionId,
             notifyBus,
             onActivity: activity => messagingCards?.record(activity),
             maxWakesPerMinute: messagingSettings.maxWakesPerMinute ?? 6,

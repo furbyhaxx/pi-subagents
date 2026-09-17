@@ -12,6 +12,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { NotifyBus } from "./notify-bus.js";
+import type { MessagingTransportMode } from "./types.js";
 
 const MAX_FRAME_BYTES = 4 * 1024;
 
@@ -110,6 +111,13 @@ export class SocketNotifyBus implements NotifyBus {
     this.path = options.socketPath ?? defaultNotifySocketPath(options.scopeKey);
     this.onBump = options.onBump;
     this.ready = this.runElection();
+  }
+
+  get mode(): MessagingTransportMode {
+    if (this.state === "closed") return "off";
+    if (this.state === "broker" || this.state === "client") return "socket";
+    if (this.state === "degraded" || this.everDegraded) return "degraded";
+    return "starting";
   }
 
   get degraded(): boolean {
