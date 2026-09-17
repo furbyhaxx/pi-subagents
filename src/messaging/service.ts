@@ -6,6 +6,10 @@ import { SqliteStore } from "./store.js";
 import type {
   AgentRegistration,
   AgentRow,
+  BlackboardDeleteResult,
+  BlackboardEntry,
+  BlackboardLogEntry,
+  BlackboardPutResult,
   DeliveryReceipt,
   MessageKind,
   MessageRow,
@@ -16,6 +20,11 @@ import type {
 const WAIT_POLL_MS = 250;
 const IDLE_POLL_MS = 5_000;
 const DEFAULT_MAX_WAIT_MS = 120_000;
+/**
+ * The author the store recognises as the human, and the only one allowed to
+ * write under the operator namespace.
+ */
+const OPERATOR_AUTHOR = "operator";
 
 export interface AgentMessagingServiceOptions {
   store: SqliteStore;
@@ -45,6 +54,18 @@ export interface SendResult {
 export type BroadcastResult =
   | { ok: true; receipts: DeliveryReceipt[] }
   | { ok: false; reason: string };
+
+export interface BoardPutInput {
+  topic: string;
+  key: string;
+  value: unknown;
+  ifRevision?: number;
+}
+
+export interface BoardChanges {
+  cursor: number;
+  changes: BlackboardLogEntry[];
+}
 
 function uniqueSessionPrefix(sessionId: string, candidates: AgentRow[]): string {
   const floor = Math.min(6, sessionId.length);
@@ -247,21 +268,104 @@ export class AgentMessagingService {
       if (message) return message;
       const remaining = deadline - this.clock();
       if (remaining <= 0) return undefined;
-      await new Promise<void>((resolve, reject) => {
-        const finish = () => {
-          signal?.removeEventListener("abort", abort);
-          resolve();
-        };
-        const timer = setTimeout(finish, Math.min(WAIT_POLL_MS, remaining));
-        const abort = () => {
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
-          reject(signal?.reason ?? new Error("AgentMessage wait aborted"));
-        };
-        if (signal?.aborted) abort();
-        else signal?.addEventListener("abort", abort, { once: true });
-      });
+      await this.sleep(Math.min(WAIT_POLL_MS, remaining), signal);
     }
+  }
+
+  /**
+   * Blackboard writes are attributed the same way messages are: the service
+   * stamps the caller's own display name, and the tool exposes no author
+   * parameter (§9). The `operator` name is claimed by the human surface, so an
+   * agent that happens to be handled `operator` is recorded by its id instead —
+   * otherwise naming an agent after the human would hand it write access to the
+   * read-only namespace.
+   */
+  private authorOf(caller: MessagingCaller): string {
+    const self = this.store.listPeers().find(peer => peer.agentId === caller.agentId);
+    const name = self ? displayHandle(self) : caller.agentId;
+    return name.toLowerCase() === OPERATOR_AUTHOR ? caller.agentId : name;
+  }
+
+  boardPut(caller: MessagingCaller, input: BoardPutInput): BlackboardPutResult {
+    return this.store.put({
+      topic: input.topic,
+      key: input.key,
+      value: input.value,
+      author: this.authorOf(caller),
+      ifRevision: input.ifRevision,
+    });
+  }
+
+  boardGet(topic: string, key: string): BlackboardEntry | undefined {
+    return this.store.get(topic, key);
+  }
+
+  boardList(topic?: string): BlackboardEntry[] {
+    return this.store.list(topic);
+  }
+
+  boardDelete(caller: MessagingCaller, topic: string, key: string): BlackboardDeleteResult {
+    return this.store.delete(topic, key, this.authorOf(caller));
+  }
+
+  /** Where a watcher that wants only future changes should start. */
+  boardCursor(): number {
+    return this.store.currentLogSeq();
+  }
+
+  /**
+   * Changes after `since`, newest cursor included so the caller can chain the
+   * next read. Empty means nothing happened, and the cursor comes back
+   * unchanged — re-reading from it is not a replay.
+   */
+  boardChanges(since: number, topic?: string): BoardChanges {
+    const entries = this.store.readLog(since);
+    const changes = topic === undefined ? entries : entries.filter(entry => entry.topic === topic);
+    // The cursor advances past entries filtered out by topic too: they are read
+    // and rejected, not unread, and keeping them would make every later poll
+    // re-scan the same rows.
+    const cursor = entries.length > 0 ? entries[entries.length - 1]!.seq : since;
+    return { cursor, changes };
+  }
+
+  /**
+   * Block until the board changes, or the deadline passes. Same polling floor
+   * as `wait`: the store is the source of truth, and the notify bus only ever
+   * shortens the wait.
+   */
+  async boardWatch(
+    since: number,
+    timeoutMs: number,
+    topic: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<BoardChanges> {
+    const deadline = this.clock() + Math.min(this.maxWaitMs, Math.max(0, timeoutMs));
+    let cursor = since;
+    while (true) {
+      const result = this.boardChanges(cursor, topic);
+      if (result.changes.length > 0) return result;
+      cursor = result.cursor;
+      const remaining = deadline - this.clock();
+      if (remaining <= 0) return { cursor, changes: [] };
+      await this.sleep(Math.min(WAIT_POLL_MS, remaining), signal);
+    }
+  }
+
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const finish = () => {
+        signal?.removeEventListener("abort", abort);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      const abort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        reject(signal?.reason ?? new Error("AgentMessage wait aborted"));
+      };
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    });
   }
 
   async pollOwnedMailboxes(): Promise<void> {

@@ -467,6 +467,17 @@ export class SqliteStore {
     }));
   }
 
+  /**
+   * The newest `entry_log.seq`, so a watcher can start from "now" rather than
+   * replaying the whole history of the board on its first call. `seq` is an
+   * AUTOINCREMENT column, so this never goes backwards after a sweep and a
+   * cursor taken here stays valid.
+   */
+  currentLogSeq(): number {
+    const row = this.driver.prepare("SELECT MAX(seq) AS seq FROM entry_log").get(EMPTY_PARAMS);
+    return row && row.seq !== null ? number(row, "seq") : 0;
+  }
+
   private appendLog(
     topic: string,
     key: string,
