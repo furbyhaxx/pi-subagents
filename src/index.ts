@@ -40,7 +40,7 @@ import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { resolveSubagentSessionDir } from "./session-dir.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type ViewerViewMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type ViewerViewMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -1244,75 +1244,15 @@ export default function (pi: ExtensionAPI) {
       // `no_transcript`.
     }
 
-    // Evicted, but its conversation is still on disk: reopen it. This is an
-    // ordinary spawn carrying a session file, so the new record picks up the
-    // widget, fleet row, transcript and completion notification unchanged —
-    // and `reclaim` hands it back the names the tombstone was holding.
+    // Evicted, but its conversation is still on disk: reopen it.
     if (resolved?.kind === "tombstone") {
       const entry = resolved.entry;
       const target = `@${entry.alias ?? entry.handle}`;
-
-      // Checked here rather than left to SessionManager.open: that runs inside
-      // runAgent, whose rejection lands on the record as an agent error, not in
-      // the catch below. A `/new` in another pi window or a manual delete makes
-      // the conversation unrecoverable (Claude Code's `not_reachable`), so drop
-      // the entry — a row that can only ever fail is worse than none — and say
-      // so rather than quietly sending this message to an unrelated agent.
-      if (!existsSync(entry.sessionFile)) {
-        manager.dropTombstone(entry.handle);
-        ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
-        return { action: "handled" };
-      }
-
-      // The Agent tool deliberately falls back to general-purpose for a type it
-      // cannot resolve (#183), which covers a deleted file AND a merely
-      // disabled one. A resume must not inherit that: reopening this
-      // conversation under a different agent's prompt and tools is not
-      // continuing it, and the new record would re-tombstone under the
-      // substitute, so the handle would never find its way back.
-      reloadCustomAgents();
-      const dispatch = resolveSpawnType(entry.type);
-      if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
-        // The tombstone stays: re-enabling the agent makes the handle work
-        // again, which a drop would foreclose.
-        ctx.ui.notify(`Could not resume ${target} — the ${entry.type} agent is no longer available.`, "warning");
-        return { action: "handled" };
-      }
-
-      try {
-        // spawnResolved, not spawnTopLevel: the latter strips
-        // `resumeSessionFile` and `reclaim` as untrusted. This path is the
-        // exception — both come from a tombstone this extension wrote.
-        const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
-          description: entry.description,
-          reclaim: { handle: entry.handle, alias: entry.alias },
-          resumeSessionFile: entry.sessionFile,
-          resumeWorktree: entry.worktree,
-          cwd: entry.effectiveCwd,
-          configCwd: entry.configCwd,
-          originCwd: entry.originCwd,
-          artifactRoot: entry.artifactRoot,
-          rootSessionId: entry.rootSessionId,
-          isBackground: true,
-        });
-        // The agent may still be starting — wait, so a startup failure lands in
-        // the catch below instead of being announced as a resume.
-        await manager.awaitStartup(id);
-        // The tombstone deliberately stays. `resolveMention` prefers the live
-        // record holding these same names, so it cannot shadow the resume — and
-        // if this run dies before establishing its own session, the original
-        // transcript is still the right thing for the next mention to reopen.
-        // Once the resumed record is evicted it overwrites this entry in place,
-        // keyed by the same handle, so nothing accumulates.
-        ctx.ui.notify(`Resuming ${target}`, "info");
-      } catch (err) {
-        // The type is already settled above, so what is left is a spawn-time
-        // failure: a strict worktree-isolation error, an unusable cwd.
-        ctx.ui.notify(
-          `Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`,
-          "warning",
-        );
-      }
+      const reopened = await reopenTombstone(ctx, entry, mention.message);
+      ctx.ui.notify(
+        reopened.ok ? `Resuming ${target}` : `Could not resume ${target} — ${reopened.reason}.`,
+        reopened.ok ? "info" : "warning",
+      );
       return { action: "handled" };
     }
 
@@ -1597,6 +1537,80 @@ export default function (pi: ExtensionAPI) {
           sendIndividualNudge(record);
         }
       }
+    }
+  }
+
+  /**
+   * Reopen an evicted agent's conversation from the session file its tombstone
+   * points at, as an ordinary detached spawn: the new record picks up the
+   * widget, fleet row, transcript and completion notification unchanged, and
+   * `reclaim` hands it back the names the tombstone was holding.
+   *
+   * Shared by the `@handle message` mention and the Agent tool's `resume`,
+   * which differ only in how they report the outcome — a notification versus a
+   * tool result. Failures are returned rather than thrown so each caller can
+   * phrase them for its own audience.
+   */
+  async function reopenTombstone(
+    ctx: ExtensionContext,
+    entry: AgentTombstone,
+    prompt: string,
+  ): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
+    // Checked here rather than left to SessionManager.open: that runs inside
+    // runAgent, whose rejection lands on the record as an agent error rather
+    // than here. A `/new` in another pi window or a manual delete makes the
+    // conversation unrecoverable (Claude Code's `not_reachable`), so drop the
+    // entry — a row that can only ever fail is worse than none — and say so
+    // rather than quietly sending this message to an unrelated agent.
+    if (!existsSync(entry.sessionFile)) {
+      manager.dropTombstone(entry.handle);
+      return { ok: false, reason: "its session is gone" };
+    }
+
+    // The Agent tool deliberately falls back to general-purpose for a type it
+    // cannot resolve (#183), which covers a deleted file AND a merely disabled
+    // one. A resume must not inherit that: reopening this conversation under a
+    // different agent's prompt and tools is not continuing it, and the new
+    // record would re-tombstone under the substitute, so the handle would never
+    // find its way back.
+    reloadCustomAgents();
+    const dispatch = resolveSpawnType(entry.type);
+    if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
+      // The tombstone stays: re-enabling the agent makes the handle work again,
+      // which a drop would foreclose.
+      return { ok: false, reason: `the ${entry.type} agent is no longer available` };
+    }
+
+    try {
+      // spawnResolved, not spawnTopLevel: the latter strips `resumeSessionFile`
+      // and `reclaim` as untrusted. This path is the exception — both come from
+      // a tombstone this extension wrote.
+      const id = spawnResolved(pi, ctx, dispatch.type, prompt, {
+        description: entry.description,
+        reclaim: { handle: entry.handle, alias: entry.alias },
+        resumeSessionFile: entry.sessionFile,
+        resumeWorktree: entry.worktree,
+        cwd: entry.effectiveCwd,
+        configCwd: entry.configCwd,
+        originCwd: entry.originCwd,
+        artifactRoot: entry.artifactRoot,
+        rootSessionId: entry.rootSessionId,
+        isBackground: true,
+      });
+      // The agent may still be starting — wait, so a startup failure is reported
+      // as a failed resume instead of being announced as a successful one.
+      await manager.awaitStartup(id);
+      // The tombstone deliberately stays. `resolveMention` prefers the live
+      // record holding these same names, so it cannot shadow the resume — and
+      // if this run dies before establishing its own session, the original
+      // transcript is still the right thing for the next mention to reopen.
+      // Once the resumed record is evicted it overwrites this entry in place,
+      // keyed by the same handle, so nothing accumulates.
+      return { ok: true, id };
+    } catch (err) {
+      // The type is already settled above, so what is left is a spawn-time
+      // failure: a strict worktree-isolation error, an unusable cwd.
+      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -1987,7 +2001,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID or handle to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run. An agent whose in-memory record has been evicted still resumes, reopening its stored session in the background.",
         }),
       ),
       isolated: Type.Optional(
@@ -2163,7 +2177,9 @@ Terse command-style prompts produce shallow, generic work.
         ? `Note: Unknown agent type "${dispatch.fellBackFrom}" — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
         : "";
 
-      const resumeTarget = params.resume ? manager.getRecord(params.resume) : undefined;
+      // resolveAgentRef, not getRecord: `resume` accepts the same names the
+      // user types, matching steer_subagent and get_subagent_result.
+      const resumeTarget = params.resume ? resolveAgentRef(params.resume) : undefined;
       const effectiveType = resumeTarget?.type ?? subagentType;
       const displayName = getDisplayName(effectiveType);
 
@@ -2355,6 +2371,30 @@ Terse command-style prompts produce shallow, generic work.
       if (params.resume) {
         const existing = resumeTarget;
         if (!existing || !isTopLevelAgent(existing)) {
+          // No live record, but an evicted agent's conversation outlives it on
+          // disk. `@handle` has always reopened one; an explicit id is at least
+          // as unambiguous, so refusing it here only punished the caller for
+          // waiting out the ten-minute eviction window.
+          const evicted = manager.resolveMention(params.resume);
+          if (evicted?.kind === "tombstone") {
+            const reopened = await reopenTombstone(ctx, evicted.entry, params.prompt);
+            if (!reopened.ok) {
+              return textResult(`Could not resume "${params.resume}" — ${reopened.reason}.`);
+            }
+            const record = manager.getRecord(reopened.id);
+            return textResult(
+              `Agent resumed in background from its stored session.\n` +
+              `Agent ID: ${reopened.id}\n` +
+              `Type: ${evicted.entry.type}\n` +
+              (record ? formatWorkspace(record) : "") +
+              (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+              `\nIts in-memory record had been evicted, so this run reopens the conversation from disk and takes back the handle.\n` +
+              `You will be notified when it completes.`,
+              record
+                ? { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: reopened.id }
+                : undefined,
+            );
+          }
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
         if (!existing.session) {
@@ -2410,7 +2450,8 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal, {
+        // existing.id, not params.resume: the latter may be a handle.
+        const record = await manager.resume(existing.id, params.prompt, signal, {
           modelCandidates: resumeModelCandidates,
         });
         if (!record) {

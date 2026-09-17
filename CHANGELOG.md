@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Preloaded skill discovery now follows symlinks like Pi.** Symlinked roots, flat skill files, skill directories, and inner `SKILL.md` files are discoverable, with canonical-directory tracking preventing cycles. Skill-name path-traversal validation is unchanged.
 
 ### Fixed
+- **`Agent({resume})` now reaches an evicted agent instead of reporting it cleaned up.** Its lookup consulted only the live record map, so roughly ten minutes after an agent settled the id stopped working — while `@handle` reopened the very same conversation from disk. Resume now accepts an id or a handle and reopens a stored session in the background, sharing one code path with the mention.
 - **Opening Jobs from `/agents` no longer leaves a hidden agent selector over the Jobs overlay.** The menu returns immediately after the background-jobs RPC accepts the open, including warning paths.
 - **Transcript steps are easier to distinguish and inspect.** Local timestamps now include seconds; Right expands a text-bearing row immediately, and assistant errors with a complete JSON suffix render that payload as readable multiline JSON in Preview and Detail while retaining a concise header.
 - **The `/agents → Running agents` picker now preserves time and place.** Rows are explicitly newest-first and show their local `YYYY-MM-DD HH:mm:ss` start time; closing a transcript reopens the picker on the same agent instead of resetting the cursor to the top.

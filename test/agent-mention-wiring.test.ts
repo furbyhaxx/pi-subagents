@@ -1237,6 +1237,61 @@ describe("resuming an evicted agent by name", () => {
     expect(manager.getRecord(resumedId).description).toBe("find flaky tests");
   });
 
+  it("lets the Agent tool resume an evicted agent by its id", async () => {
+    // `@handle` has always reopened an evicted conversation, while
+    // `Agent({resume: id})` answered "cleaned up" for the same agent — the
+    // lookup consulted only the live map. An explicit id is at least as
+    // unambiguous as a handle, so it reopens too.
+    const { tools } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools);
+    await flush();
+    const manager = await evict(id);
+    expect(manager.getRecord(id)).toBeUndefined();
+    vi.mocked(runAgent).mockClear();
+    heldRun(fakeSession());
+
+    const result = await tools.get("Agent").execute(
+      "tc-resume",
+      { prompt: "anything else?", description: "follow-up", subagent_type: "Explore", resume: id },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    await flush();
+
+    expect(textOf(result)).toContain("resumed in background from its stored session");
+    expect(vi.mocked(runAgent)).toHaveBeenCalledWith(
+      expect.anything(),
+      "Explore",
+      "anything else?",
+      expect.objectContaining({ resumeSessionFile: sessionPath() }),
+    );
+  });
+
+  it("reports a resume whose session file has gone, and frees the name", async () => {
+    // The id path must not silently start a fresh agent under the old name
+    // when the transcript it promised to continue no longer exists.
+    const { tools } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools);
+    await flush();
+    await evict(id);
+    unlinkSync(sessionPath());
+    vi.mocked(runAgent).mockClear();
+
+    const result = await tools.get("Agent").execute(
+      "tc-resume",
+      { prompt: "anything else?", description: "follow-up", subagent_type: "Explore", resume: id },
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    expect(textOf(result)).toContain("its session is gone");
+    expect(vi.mocked(runAgent)).not.toHaveBeenCalled();
+  });
+
   it("does not let the tools steer or read an agent that is gone", async () => {
     // A mention can resurrect it, but there is no live record to interrupt and
     // no result to return — so the tools must say so rather than resolve to a
