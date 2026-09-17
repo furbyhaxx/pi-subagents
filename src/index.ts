@@ -30,8 +30,10 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
+import { MessagingCardFeed } from "./messaging/cards.js";
 import { AgentManagerDeliveryBridge } from "./messaging/delivery-bridge.js";
 import { isSqliteAvailable } from "./messaging/driver.js";
+import { MESSAGING_ENTRY_TYPE, type MessagingCardData } from "./messaging/entry.js";
 import { resolveMessagingLocation } from "./messaging/scope.js";
 import { AgentMessagingService } from "./messaging/service.js";
 import { SqliteStore } from "./messaging/store.js";
@@ -69,6 +71,7 @@ import {
 import { createBackgroundJobsMenuRpc } from "./ui/background-jobs-rpc.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
+import { renderMessagingCard } from "./ui/messaging-card.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
@@ -578,6 +581,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerEntryRenderer<WorkflowEntryData>(WORKFLOW_ENTRY_TYPE, (entry, _options, theme) =>
     renderWorkflowEntryCard(entry.data, theme));
 
+  // ---- Bus traffic rendered as display-only transcript cards ----
+  // Registered unconditionally, like the workflow renderer above: messaging may
+  // start later (or not at all in this session), and an entry written by an
+  // earlier session still has to draw when the transcript is reloaded.
+  pi.registerEntryRenderer<MessagingCardData>(MESSAGING_ENTRY_TYPE, (entry, _options, theme) =>
+    renderMessagingCard(entry.data, theme));
+
   // Registered at activation; READ from session_start. The host applies CLI
   // values after every extension factory has run, so `getFlag` here would only
   // ever hand back the registered default (see the read site below).
@@ -779,6 +789,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   let messagingService: AgentMessagingService | undefined;
+  let messagingCards: MessagingCardFeed | undefined;
   let mainMessagingCaller: { agentId: string; sessionId: string } | undefined;
   if (messagingSettings.enabled !== false && isSqliteAvailable()) {
     for (const tool of createMessagingTools(() => messagingService, () => mainMessagingCaller)) {
@@ -1126,9 +1137,15 @@ export default function (pi: ExtensionAPI) {
             mainSessionId: rootSessionId,
             mainSurface,
           });
+          messagingCards = new MessagingCardFeed({
+            mainAgentId,
+            mainSessionId: rootSessionId,
+            append: data => { pi.appendEntry<MessagingCardData>(MESSAGING_ENTRY_TYPE, data); },
+          });
           messagingService = new AgentMessagingService({
             store,
             bridge,
+            onActivity: activity => messagingCards?.record(activity),
             maxWakesPerMinute: messagingSettings.maxWakesPerMinute ?? 6,
             maxHops: messagingSettings.maxHops ?? 4,
             maxWaitMs: messagingSettings.maxWaitMs ?? 120_000,
@@ -1507,6 +1524,8 @@ export default function (pi: ExtensionAPI) {
     scheduler.stop();
     messagingService?.close();
     messagingService = undefined;
+    messagingCards?.close();
+    messagingCards = undefined;
     mainMessagingCaller = undefined;
   });
 
@@ -1548,6 +1567,8 @@ export default function (pi: ExtensionAPI) {
       await manager.dispose(pi);
       messagingService?.close();
       messagingService = undefined;
+      messagingCards?.close();
+      messagingCards = undefined;
       mainMessagingCaller = undefined;
     } finally {
       // No request after cleanup gets an acceptance or a reply. Duplicates that

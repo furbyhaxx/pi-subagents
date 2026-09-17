@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MESSAGING_ENTRY_TYPE, type MessageCardData } from "../src/messaging/entry.js";
 import { agentCall, type PrintModeRun, runPrintMode } from "./helpers/print-mode-runner.js";
 
 vi.setConfig({ testTimeout: 30_000 });
@@ -142,8 +143,21 @@ describe("agent messaging e2e", () => {
       message: { correlationId: string; body: string };
     };
 
+    // Peer-to-peer traffic the main session is not an endpoint of is the case
+    // transcript cards exist for: without them the human sees two agents go
+    // quiet and has no way to know they were talking to each other.
+    const cards = run.parentSession.sessionManager.getEntries()
+      .filter((entry): entry is typeof entry & { data: MessageCardData } =>
+        entry.type === "custom" && entry.customType === MESSAGING_ENTRY_TYPE)
+      .map(entry => entry.data);
+
     expect(records.every(record => record.session?.getAllTools().some(tool => tool.name === "AgentMessage"))).toBe(true);
     expect(records.every(record => record.session?.getAllTools().some(tool => tool.name === "Blackboard"))).toBe(true);
+    expect(cards).toMatchObject([
+      { kind: "message", messageKind: "request", body: "correlated-question" },
+      { kind: "message", messageKind: "reply", body: "correlated-answer" },
+    ]);
+    expect(cards.every(card => card.session === undefined)).toBe(true);
     expect(reply.message.body).toBe("correlated-answer");
     expect(reply.message.correlationId).toBe(requestReceipt.receipt.correlationId);
   });
