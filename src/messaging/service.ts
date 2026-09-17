@@ -139,6 +139,7 @@ export class AgentMessagingService {
   private readonly onActivity: ((activity: MessagingActivity) => void) | undefined;
   private readonly wakeTimes = new Map<string, number[]>();
   private readonly inheritedHops = new Map<string, number>();
+  private readonly activeWaits = new Map<string, number>();
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
   private idleLoopStarted = false;
   private activePolls = 0;
@@ -371,13 +372,20 @@ export class AgentMessagingService {
       }
       fromAgent = sender.agent.agentId;
     }
-    const deadline = this.clock() + Math.min(this.maxWaitMs, Math.max(0, timeoutMs));
-    while (true) {
-      const message = this.store.consumeNext(caller.agentId, { from: fromAgent });
-      if (message) return message;
-      const remaining = deadline - this.clock();
-      if (remaining <= 0) return undefined;
-      await this.sleep(Math.min(this.jitter(WAIT_POLL_MS), remaining), signal);
+    this.activeWaits.set(caller.agentId, (this.activeWaits.get(caller.agentId) ?? 0) + 1);
+    try {
+      const deadline = this.clock() + Math.min(this.maxWaitMs, Math.max(0, timeoutMs));
+      while (true) {
+        const message = this.store.consumeNext(caller.agentId, { from: fromAgent });
+        if (message) return message;
+        const remaining = deadline - this.clock();
+        if (remaining <= 0) return undefined;
+        await this.sleep(Math.min(this.jitter(WAIT_POLL_MS), remaining), signal);
+      }
+    } finally {
+      const active = this.activeWaits.get(caller.agentId);
+      if (active === undefined || active <= 1) this.activeWaits.delete(caller.agentId);
+      else this.activeWaits.set(caller.agentId, active - 1);
     }
   }
 
@@ -661,6 +669,9 @@ export class AgentMessagingService {
     }
     if (info.surface === "off") {
       return messages.map(message => receipt(message, "queued", { reason: "surface-off" }));
+    }
+    if (info.surface === "ui" && this.activeWaits.has(recipient.agentId)) {
+      return messages.map(message => receipt(message, "queued", { reason: "active-wait" }));
     }
 
     const peers = this.store.listPeers();

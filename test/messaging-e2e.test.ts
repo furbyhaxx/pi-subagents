@@ -78,70 +78,101 @@ describe("agent messaging e2e", () => {
   });
 
   it("lets two live top-level subagents exchange a correlated request and reply", async () => {
-    run = await runPrintMode({
-      prompt: "Start both messaging peers.",
-      live: false,
-      maxModelCalls: 24,
-      respond: async (context: Context) => {
-        const prompt = promptText(context);
-        if (prompt.includes("receiver-peer")) {
-          const waits = toolResults(context, "AgentMessage");
-          if (waits.length === 0) {
-            return fauxToolCall("AgentMessage", {
-              op: "wait",
-              from: "general-purpose-2",
-              timeout_ms: 5_000,
-            });
+    let releaseSender: (() => void) | undefined;
+    const receiverWaiting = new Promise<void>(resolve => { releaseSender = resolve; });
+    let receiverPromptAfterWait = "";
+    let waitSpy: { mockRestore(): void } | undefined;
+    try {
+      run = await runPrintMode({
+        prompt: "Start both messaging peers.",
+        live: false,
+        maxModelCalls: 24,
+        respond: async (context: Context) => {
+          const prompt = promptText(context);
+          if (prompt.includes("receiver-peer")) {
+            const results = toolResults(context, "AgentMessage");
+            if (results.length === 0) return fauxToolCall("AgentMessage", { op: "peers" });
+            if (results.length === 1) {
+              const roster = JSON.parse(results[0]!) as { peers: Array<{ agentId: string }> };
+              const registry = (globalThis as Record<symbol, unknown>)[Symbol.for("pi-subagents:manager")] as {
+                getRecord(id: string): { description?: string; session?: AgentSession } | undefined;
+              };
+              const receiver = roster.peers
+                .map(peer => registry.getRecord(peer.agentId))
+                .find(record => record?.description === "message receiver");
+              const tool = receiver?.session?.getToolDefinition("AgentMessage");
+              if (!tool) throw new Error("Receiver AgentMessage tool is unavailable");
+              const originalExecute = tool.execute.bind(tool);
+              waitSpy = vi.spyOn(tool, "execute").mockImplementation(async (...args) => {
+                const result = originalExecute(...args);
+                if ((args[1] as { op?: string }).op === "wait") releaseSender?.();
+                return await result;
+              });
+              return fauxToolCall("AgentMessage", {
+                op: "wait",
+                from: "general-purpose-2",
+                timeout_ms: 5_000,
+              });
+            }
+            const request = JSON.parse(results[1]!) as { message: { id: string } };
+            if (results.length === 2) {
+              receiverPromptAfterWait = prompt;
+              return fauxToolCall("AgentMessage", {
+                op: "send",
+                to: "general-purpose-2",
+                message: "correlated-answer",
+                reply_to: request.message.id,
+              });
+            }
+            return "RECEIVER_DONE";
           }
-          const request = JSON.parse(waits[0]!) as { message: { id: string } };
-          if (waits.length === 1) {
-            return fauxToolCall("AgentMessage", {
-              op: "send",
-              to: "general-purpose-2",
-              message: "correlated-answer",
-              reply_to: request.message.id,
-            });
+          if (prompt.includes("sender-peer")) {
+            const results = toolResults(context, "AgentMessage");
+            if (results.length === 0) return fauxToolCall("AgentMessage", { op: "peers" });
+            if (results.length === 1) {
+              await receiverWaiting;
+              return fauxToolCall("AgentMessage", {
+                op: "send",
+                to: "general-purpose",
+                message: "correlated-question",
+                expect_reply: true,
+              });
+            }
+            if (results.length === 2) {
+              return fauxToolCall("AgentMessage", {
+                op: "wait",
+                from: "general-purpose",
+                timeout_ms: 5_000,
+              });
+            }
+            return "SENDER_DONE";
           }
-          return "RECEIVER_DONE";
-        }
-        if (prompt.includes("sender-peer")) {
-          const results = toolResults(context, "AgentMessage");
-          if (results.length === 0) {
-            return fauxToolCall("AgentMessage", {
-              op: "send",
-              to: "general-purpose",
-              message: "correlated-question",
-              expect_reply: true,
-            });
-          }
-          if (results.length === 1) {
-            return fauxToolCall("AgentMessage", {
-              op: "wait",
-              from: "general-purpose",
-              timeout_ms: 5_000,
-            });
-          }
-          return "SENDER_DONE";
-        }
-        if (toolResults(context, "Agent").length > 0) return "PEERS_DONE";
-        return [
-          agentCall({ prompt: "receiver-peer", description: "message receiver", run_in_background: true }),
-          agentCall({ prompt: "sender-peer", description: "message sender", run_in_background: true }),
-        ];
-      },
-    });
+          if (toolResults(context, "Agent").length > 0) return "PEERS_DONE";
+          return [
+            agentCall({ prompt: "receiver-peer", description: "message receiver", run_in_background: true }),
+            agentCall({ prompt: "sender-peer", description: "message sender", run_in_background: true }),
+          ];
+        },
+      });
+    } finally {
+      waitSpy?.mockRestore();
+    }
 
     const records = sessionToolResults(run.parentSession, "Agent")
       .map(text => /Agent ID: (\S+)/.exec(text)?.[1])
       .filter((id): id is string => id !== undefined)
       .map(id => run?.manager?.getRecord(id) as { session?: AgentSession });
-    const messagingResults = records.flatMap(record => record.session ? sessionToolResults(record.session, "AgentMessage") : []);
-    const requestReceipt = JSON.parse(messagingResults.find(text => text.includes('"status": "injected"') && text.includes('"correlationId"'))!) as {
-      receipt: { correlationId: string };
-    };
-    const reply = JSON.parse(messagingResults.find(text => text.includes('"kind": "reply"'))!) as {
-      message: { correlationId: string; body: string };
-    };
+    const messagingResults = records
+      .flatMap(record => record.session ? sessionToolResults(record.session, "AgentMessage") : [])
+      .map(text => JSON.parse(text) as {
+        receipt?: { correlationId?: string; reason?: string; status: string; toAgent: string };
+        message?: { body: string; correlationId?: string; id: string; kind: string; toAgent: string };
+      });
+    const request = messagingResults.find(result => result.message?.body === "correlated-question")!;
+    const requestReceipt = messagingResults.find(result =>
+      result.receipt?.toAgent === request.message?.toAgent
+      && result.receipt.correlationId === request.message.correlationId)!;
+    const reply = messagingResults.find(result => result.message?.kind === "reply")!;
 
     // Peer-to-peer traffic the main session is not an endpoint of is the case
     // transcript cards exist for: without them the human sees two agents go
@@ -158,8 +189,11 @@ describe("agent messaging e2e", () => {
       { kind: "message", messageKind: "reply", body: "correlated-answer" },
     ]);
     expect(cards.every(card => card.session === undefined)).toBe(true);
-    expect(reply.message.body).toBe("correlated-answer");
-    expect(reply.message.correlationId).toBe(requestReceipt.receipt.correlationId);
+    expect(request.message).toMatchObject({ body: "correlated-question", kind: "request" });
+    expect(receiverPromptAfterWait).not.toContain("[Peer mailbox notice]");
+    expect(requestReceipt.receipt).toMatchObject({ status: "queued", reason: "active-wait" });
+    expect(reply.message?.body).toBe("correlated-answer");
+    expect(reply.message?.correlationId).toBe(requestReceipt.receipt?.correlationId);
   });
 
   it("passes the configured operator topic prefix into the store", async () => {

@@ -202,6 +202,151 @@ describe("AgentMessagingService", () => {
     expect(Date.now() - started).toBeLessThan(250);
   });
 
+  it("defers UI delivery while wait consumes the message without a stale notice", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "active-wait.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    bridge = new FakeBridge();
+    service = new AgentMessagingService({
+      store,
+      bridge,
+      operatorSessionId: "session-a",
+      clock: Date.now,
+      random: () => 0,
+    });
+    service.registerAgent(registration("caller", "session-a", "caller"));
+    service.registerAgent(registration("sender", "session-a", "sender"));
+
+    const waiting = service.wait(caller, 1_000);
+    const sent = await service.send(
+      { agentId: "sender", sessionId: "session-a" },
+      { to: "caller", message: "live" },
+    );
+    await service.pollOwnedMailboxes();
+
+    expect(sent.receipt).toMatchObject({ status: "queued", reason: "active-wait" });
+    expect(bridge.deliveries).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(225);
+    const received = await waiting;
+    expect(received).toMatchObject({ fromAgent: "sender", toAgent: "caller", body: "live" });
+    expect(service.inbox(caller)).toEqual([]);
+
+    await service.pollOwnedMailboxes();
+    expect(bridge.deliveries).toHaveLength(0);
+  });
+
+  it("defers a whole UI batch during a filtered wait and delivers unmatched mail afterward", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "filtered-active-wait.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    bridge = new FakeBridge();
+    service = new AgentMessagingService({
+      store,
+      bridge,
+      operatorSessionId: "session-a",
+      clock: Date.now,
+      random: () => 0,
+    });
+    service.registerAgent(registration("caller", "session-a", "caller"));
+    service.registerAgent(registration("wanted", "session-a", "wanted"));
+    service.registerAgent(registration("other", "session-a", "other"));
+
+    const waiting = service.wait(caller, 1_000, "wanted");
+    const other = await service.send(
+      { agentId: "other", sessionId: "session-a" },
+      { to: "caller", message: "other body" },
+    );
+    const wanted = await service.send(
+      { agentId: "wanted", sessionId: "session-a" },
+      { to: "caller", message: "wanted body" },
+    );
+
+    expect(other.receipt).toMatchObject({ status: "queued", reason: "active-wait" });
+    expect(wanted.receipt).toMatchObject({ status: "queued", reason: "active-wait" });
+    expect(bridge.deliveries).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(225);
+    expect(await waiting).toMatchObject({ fromAgent: "wanted", body: "wanted body" });
+    await service.pollOwnedMailboxes();
+
+    expect(bridge.deliveries).toHaveLength(1);
+    expect(bridge.deliveries[0]?.content).toContain("other sent message; 1 unread");
+    expect(service.inbox(caller).map(message => message.body)).toEqual(["other body"]);
+  });
+
+  it("reference-counts overlapping waits and cleans up on abort and timeout without affecting context", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    service.close();
+    store = new SqliteStore({
+      filePath: join(directory, "active-wait-cleanup.sqlite3"),
+      scopeKey: "/project",
+      scopeMode: "project",
+      clock: Date.now,
+    });
+    bridge = new FakeBridge();
+    service = new AgentMessagingService({
+      store,
+      bridge,
+      operatorSessionId: "session-a",
+      clock: Date.now,
+      random: () => 0,
+    });
+    service.registerAgent(registration("caller", "session-a", "caller"));
+    service.registerAgent(registration("sender", "session-a", "sender"));
+    service.registerAgent(registration("context", "session-a", "context"));
+    setInfo("context", "context");
+
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const first = service.wait(caller, 1_000, undefined, firstAbort.signal);
+    const second = service.wait(caller, 1_000, undefined, secondAbort.signal);
+    firstAbort.abort();
+    await expect(first).rejects.toThrow();
+
+    const stillWaiting = await service.send(
+      { agentId: "sender", sessionId: "session-a" },
+      { to: "caller", message: "queued" },
+    );
+    expect(stillWaiting.receipt).toMatchObject({ status: "queued", reason: "active-wait" });
+
+    const contextAbort = new AbortController();
+    const contextWaiting = service.wait({ agentId: "context", sessionId: "session-a" }, 1_000, undefined, contextAbort.signal);
+    const context = await service.send(caller, { to: "context", message: "body" });
+    expect(context.receipt).toMatchObject({ status: "injected", surface: "body" });
+    contextAbort.abort();
+    await expect(contextWaiting).rejects.toThrow();
+
+    secondAbort.abort();
+    await expect(second).rejects.toThrow();
+    await service.pollOwnedMailboxes();
+    expect(bridge.deliveries).toHaveLength(2);
+    expect(bridge.deliveries[1]?.content).toContain("1 unread");
+    service.inbox(caller);
+
+    const timedOut = service.wait(caller, 100);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await timedOut).toBeUndefined();
+    const afterTimeout = await service.send(
+      { agentId: "sender", sessionId: "session-a" },
+      { to: "caller", message: "delivered" },
+    );
+    expect(afterTimeout.receipt).toMatchObject({ status: "injected", surface: "notice" });
+  });
+
   it("jitters each wait and watch delay, clamps deadlines, and never sleeps for zero", async () => {
     service.close();
     store = new SqliteStore({

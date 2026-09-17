@@ -140,6 +140,12 @@ carrying the same `correlationId`.
 | `accepted` | the recipient belongs to another live pi process, which will deliver it |
 | `failed` | the recipient is gone; the message is marked undeliverable |
 
+A `ui` recipient already blocked in `AgentMessage op:"wait"` leaves its whole
+pending notice batch queued with `reason: "active-wait"`. The wait can consume
+its matching row without admitting a stale unread notice. If the wait times out,
+is aborted, or filters out other senders, those unread rows remain in SQLite and
+normal mailbox polling delivers them after the wait ends.
+
 ## The blackboard
 
 A message is a conversation; the board is what a fan-out leaves behind. Entries
@@ -303,6 +309,9 @@ Caps that are not settings: a message body is capped at 16 KiB, a board value at
   owner, or make it a top-level agent.
 - **`status: "queued"` with `reason: "surface-off"`** — the recipient has
   messaging display off. It will see the message when it calls `inbox`.
+- **`status: "queued"` with `reason: "active-wait"`** — the recipient is already
+  waiting for mailbox input. Its wait may consume the matching message; normal
+  polling delivers any unread remainder after the wait ends.
 - **`status: "queued"` with `reason: "wake-budget-exhausted"`** — a settled
   recipient has already been woken `maxWakesPerMinute` times. It stays queued and
   is delivered on the next wake or resume.
