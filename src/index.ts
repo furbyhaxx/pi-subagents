@@ -36,6 +36,7 @@ import { isSqliteAvailable } from "./messaging/driver.js";
 import { MESSAGING_ENTRY_TYPE, type MessagingCardData } from "./messaging/entry.js";
 import { resolveMessagingLocation } from "./messaging/scope.js";
 import { AgentMessagingService } from "./messaging/service.js";
+import { SocketNotifyBus } from "./messaging/socket-notify-bus.js";
 import { SqliteStore } from "./messaging/store.js";
 import { createMessagingTools } from "./messaging/tool.js";
 import { describeModel, type ModelRegistry, parseCanonicalModelId, type ResolvedModelCandidate, resolveCanonicalModel, resolveModel, resolveModelCandidates } from "./model-resolver.js";
@@ -1142,9 +1143,17 @@ export default function (pi: ExtensionAPI) {
             mainSessionId: rootSessionId,
             append: data => { pi.appendEntry<MessagingCardData>(MESSAGING_ENTRY_TYPE, data); },
           });
+          const notifyBus = messagingSettings.notifySocket === false
+            ? undefined
+            : new SocketNotifyBus({
+              scopeKey: location.scopeKey,
+              socketPath: messagingSettings.notifySocket,
+              onBump: () => { void messagingService?.pollOwnedMailboxes(); },
+            });
           messagingService = new AgentMessagingService({
             store,
             bridge,
+            notifyBus,
             onActivity: activity => messagingCards?.record(activity),
             maxWakesPerMinute: messagingSettings.maxWakesPerMinute ?? 6,
             maxHops: messagingSettings.maxHops ?? 4,

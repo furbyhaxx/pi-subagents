@@ -15,6 +15,7 @@ export interface MessagingSettings {
   enabled?: boolean;
   scope?: MessagingScopeMode;
   directory?: string;
+  notifySocket?: string | false;
   maxWakesPerMinute?: number;
   maxHops?: number;
   messageTtlMs?: number;
@@ -404,6 +405,10 @@ function sanitize(raw: unknown): SubagentsSettings {
     }
     if (typeof rawMessaging.directory === "string" && rawMessaging.directory.trim()) {
       messaging.directory = rawMessaging.directory.trim();
+    }
+    if (rawMessaging.notifySocket === false) messaging.notifySocket = false;
+    else if (typeof rawMessaging.notifySocket === "string" && rawMessaging.notifySocket.trim()) {
+      messaging.notifySocket = rawMessaging.notifySocket.trim();
     }
     for (const key of ["maxWakesPerMinute", "maxHops", "messageTtlMs", "maxWaitMs", "mailboxLimit"] as const) {
       const value = rawMessaging[key];

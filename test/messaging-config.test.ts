@@ -36,6 +36,7 @@ describe("messaging configuration", () => {
         enabled: false,
         scope: "session",
         directory: ".mail",
+        notifySocket: ".mail/notify.sock",
         maxWakesPerMinute: 3,
         maxHops: 2,
         messageTtlMs: 1234,
@@ -50,6 +51,7 @@ describe("messaging configuration", () => {
       enabled: false,
       scope: "session",
       directory: ".mail",
+      notifySocket: ".mail/notify.sock",
       maxWakesPerMinute: 3,
       maxHops: 2,
       messageTtlMs: 1234,
@@ -58,5 +60,10 @@ describe("messaging configuration", () => {
       surface: "off",
       allowForeignMainWake: false,
     });
+
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({
+      messaging: { notifySocket: false },
+    }));
+    expect(loadSettings(cwd).messaging).toEqual({ notifySocket: false });
   });
 });
