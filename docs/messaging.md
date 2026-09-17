@@ -23,7 +23,8 @@ A Unix-socket bus sits beside it carrying *advisory* wakeups — "something
 changed, look now" — and never any content. If the socket is missing, busy,
 stale, or owned by a process that just died, everything still works: the store is
 polled every five seconds while idle, and every 250 ms while an agent is blocked
-waiting. The socket only collapses that wait to a round trip.
+waiting. Both schedules apply ±10% jitter to avoid synchronized readers. The
+socket only collapses that wait to a round trip.
 
 That split is what makes the feature safe to leave on. The failure mode of the
 transport is *latency*, never a lost message.
@@ -45,6 +46,12 @@ The store lives under `<agent dir>/messaging/<project-hash>/messaging.sqlite3`,
 keyed by the resolved repository root. Switching scope points at a different
 store; opening a store that was created under a different scope mode is a hard
 error rather than a silent merge of two populations.
+
+**Schema v2 upgrade.** Opening a v1 store migrates it atomically to v2, preserving
+existing data. Legacy blackboard attribution that was never recorded remains
+unknown; it is not inferred from today's roster. Old v1 binaries cannot reopen
+a v2 store. Restart all participating sessions with the upgraded version; no
+downgrade compatibility is promised.
 
 ## Addressing
 
@@ -182,6 +189,61 @@ mean read-only for *every* mutation — a namespace that refuses writes but allo
 deletes is a speed bump, since an agent that cannot overwrite a constraint could
 simply remove it. Use it for constraints you want every agent to see and none to
 edit.
+
+The human can manage this namespace from `/agents → Blackboard`. New entries
+are create-only and every edit/delete/immediate-expire action carries the audit
+token captured from the selected row. If another writer changes, deletes or
+recreates that key, the operation is refused and is never retried automatically.
+Editing is limited to entries under the configured prefix whose durable author
+is the operator, with no agent id and a recorded writing session; legacy rows
+with unknown session provenance remain readable but cannot be edited. Failed
+writes keep the draft in the dialog. A key occupied during creation remains a
+create-only flow: choose another key, or leave and use the separate edit action.
+Delete and immediate expiry may target any entry after a safe, No-first
+confirmation, and both are recorded in the audit log. Nothing seeds operator
+entries from configuration.
+
+## Inspecting messaging from `/agents`
+
+`/agents → Blackboard` browses topics, live keys, full values and the newest 100
+audit records. It supports incremental topic/key filtering and shows revision,
+durable author/session identity, timestamps and TTL. The header reports the
+scope that the already-open store actually uses and whether transport is live,
+connecting, polling, or polling because the socket is unavailable.
+
+`/agents → Peers` shows every peer in that opened scope, including session,
+status and unread count. Your own main row returns to the native conversation;
+a local managed agent opens the existing conversation viewer. Other sessions
+are strictly read-only even if a stale row happens to share this process's PID.
+When a foreign peer records a session file, the panel reads a fresh regular-file
+tail only: at most 256 KiB and 200 complete JSONL records, with records over
+32 KiB or malformed records counted as skipped. Lines stay in raw file order;
+branches are not reconstructed, and the display is not a full conversation or
+an exact byte copy because terminal controls are removed, tabs expanded and
+long lines wrapped. Missing, unreadable, replaced or non-file paths show metadata
+and a reason instead. The panel never opens, migrates, locks or writes the
+foreign session.
+
+The visible Blackboard and peer roster refresh once per second without
+overlapping reads. A visible foreign tail instead rereads the bounded file one
+second after its previous read finishes, keeping the current text visible;
+following the bottom reveals new records, while scrolling up keeps your place.
+Refresh pauses while an input, confirmation, editor or local conversation viewer
+owns input. Native confirmations temporarily hide the parent panel; closing them
+restores focus. Topic and Key use the host's single-line input with an editable
+prefill, including an occupied key on a create-only retry. Value editing uses the
+host's native Editor in a bounded overlay: even at 40×12, the key and edit
+revision stay above at least five value rows. Long keys are ellipsized without
+dropping the revision; `ctrl+o` shows the full target, and `Esc` returns to the
+unchanged draft and caret. The installed host exposes no public external-editor
+callback for this overlay, so `ctrl+g` reports that it is unavailable.
+
+A refused write or invalid Topic/Key that will reopen a field first shows a
+read-only, scrollable explanation. `Enter` continues to the retained draft or
+occupied key without writing; `Esc` discards, and `q`/`ctrl+c` closes the panel.
+Only submitting the editable value attempts another write. While editing, `q`
+is ordinary text, and `Esc`/`ctrl+c` cancels the editor. Both panels remain
+keyboard-only and usable as a one-pane drill-down at 40 columns.
 
 ## What you see
 

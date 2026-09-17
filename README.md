@@ -186,7 +186,7 @@ The cost is a visible turn — the model's reasoning and its tool block, narrati
             ▸ Cyan Agent   favorite color        ← widget, fleet row, handle
 ```
 
-It is a literal clone — the session's own entries and the same system prompt, not [`inherit_context`](#agent-frontmatter)'s text rendering of them — taken from memory and compaction-aware, so what the copy reads is what the main model is working from. The clone gets one tool and one job; it cannot read, write or run anything, because an invisible turn with the full toolset could do invisible work. The agent it starts is attributed to the *real* session, so its transcript and `rootSessionId` land where they would have anyway, and it carries no `tool-use-id` — the main conversation never issued one.
+It is a literal clone — the session's own entries and the same system prompt, not [`inherit_context`](#frontmatter-fields)'s text rendering of them — taken from memory and compaction-aware, so what the copy reads is what the main model is working from. The clone gets one tool and one job; it cannot read, write or run anything, because an invisible turn with the full toolset could do invisible work. The agent it starts is attributed to the *real* session, so its transcript and `rootSessionId` land where they would have anyway, and it carries no `tool-use-id` — the main conversation never issued one.
 
 | Mode | `@plan sketch the migration`, with no Plan agent running |
 |------|----------------------------------------------------------|
@@ -573,7 +573,7 @@ Skipping is immediate for a running agent and for one held at a pause; an agent 
 
 Use the `=` form. The bare `--flag value` spelling consumes the next argument, so `pi --subagents-workflow-file review.js "do the thing"` would take the prompt as the flag's value. Composes with headless mode: `pi -p --subagents-workflow-file=review.js`. With no tool call to attach to, the run renders as a session entry and its result is handed to the model as context for its next turn.
 
-The `/agents` command opens an interactive menu:
+The `/agents` command opens an interactive menu. When messaging is available it also includes **Blackboard** (browse/filter topics and keys, inspect values/history, and safely publish/edit/delete/expire operator entries) and **Peers** (scope roster, unread counts, local conversations, and read-only foreign transcript tails). These entries stay hidden when messaging is disabled or its store could not open.
 
 ```
 Running agents (2) — 1 running, 1 done     ← only shown when agents exist
@@ -1122,6 +1122,7 @@ src/
     tool.ts           # The AgentMessage and Blackboard tool definitions
     cards.ts          # Which traffic earns a transcript card: echo suppression, coalescing, per-minute cap
     entry.ts          # The persisted shape of a messaging session entry
+    transcript-tail.ts # Bounded, read-only raw JSONL tails for foreign sessions
 
   workflow/
     meta.ts           # Extract and validate a script's pure-literal `meta` block
@@ -1142,6 +1143,10 @@ src/
     schedule-menu.ts      # /agents → Scheduled jobs submenu
     select-item.ts        # Collision-safe ctx.ui.select wrapper (numbered rows)
     messaging-card.ts     # Transcript card for one message or board write
+    messaging-panel-common.ts # Shared terminal-safe panel geometry and text handling
+    blackboard-panel.ts   # Blackboard browser, history and guarded operator mutations
+    blackboard-dialogs.ts # Bounded value editor, full-target inspection and refusal acknowledgements
+    peers-panel.ts        # Peer roster, local viewer routing and foreign file tails
     workflow-card.ts      # Inline workflow card (tool result and session entry)
     workflow-dialog.ts    # /agents → Workflows two-pane inspector
 ```

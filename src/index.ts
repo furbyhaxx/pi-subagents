@@ -71,9 +71,11 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { createBackgroundJobsMenuRpc } from "./ui/background-jobs-rpc.js";
+import { showBlackboardPanel } from "./ui/blackboard-panel.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { renderMessagingCard } from "./ui/messaging-card.js";
+import { showPeersPanel } from "./ui/peers-panel.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
@@ -3479,6 +3481,20 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Workflows (${workflowTasks.size})`);
     }
 
+    if (messagingService) {
+      try {
+        const topicCount = new Set(messagingService.boardList().map(entry => entry.topic)).size;
+        options.push(`Blackboard (${topicCount} topic${topicCount === 1 ? "" : "s"})`);
+      } catch {
+        options.push("Blackboard");
+      }
+      try {
+        options.push(`Peers (${messagingService.panelPeers().length})`);
+      } catch {
+        options.push("Peers");
+      }
+    }
+
     if (jobsRpc.available) {
       try {
         if (await jobsRpc.checkBackgroundJobs()) {
@@ -3518,6 +3534,25 @@ Terse command-style prompts produce shallow, generic work.
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Workflows (")) {
       await showWorkflowsMenu(ctx, workflowMenuDeps);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Blackboard" || choice.startsWith("Blackboard (")) {
+      if (messagingService) await showBlackboardPanel(ctx.ui, messagingService);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Peers" || choice.startsWith("Peers (")) {
+      const service = messagingService;
+      if (!service) return;
+      const result = await showPeersPanel(ctx.ui, service, {
+        openLocal: async agentId => {
+          const peer = service.panelPeers().find(candidate => candidate.agentId === agentId);
+          if (!peer || peer.access !== "local") return "missing";
+          const record = manager.getRecord(agentId);
+          if (!record || !isTopLevelAgent(record)) return "missing";
+          if (!record.session) return "no-session";
+          await viewAgentConversation(ctx, record);
+          return "opened";
+        },
+      });
+      if (result === "main") return;
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Jobs (")) {
       try {
