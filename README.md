@@ -20,6 +20,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
 - **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
+- **Agent messaging & shared blackboard** — subagents can address each other directly (`AgentMessage`: send, broadcast, inbox, wait, peers) and leave findings on a durable keyed board (`Blackboard`: put, get, list, delete, watch) instead of routing every fact through the orchestrator. Scoped to the project by default, so agents in two terminals are peers; SQLite is the only source of truth and a Unix-socket bus carries advisory wakeups only, so losing it costs latency, never a message. What an incoming message spends of the *recipient's* context is the recipient's choice — nothing, a one-line notice with the unread count (default), or the full body — never the sender's. The board's `operator/` namespace is agent-readable and agent-unwritable, so a human's constraints cannot be edited away. Traffic is mirrored into your transcript as display-only cards that never enter the model's context. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/messaging.md)**
 - **Scripted workflows** — a `SubagentWorkflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/agents → Workflows` or by selecting the run in FleetView. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. On by default, but it stands down for company: if another extension already provides a `Workflow` or `SubagentWorkflow` tool, this one warns and disables itself for the session rather than offering the model two orchestrators. Pin it either way with `"workflowsEnabled"` in `subagents.json` or `/agents → Settings → Workflows`. A script written for Claude Code's `Workflow` tool runs here unchanged: same globals, `schema` returns a validated object exactly as it does there, `budget` is present and always reports no token target (pi has no such directive) so its `budget.total`-guarded patterns still take the branch they were written for, and nested `workflow()` composes saved workflows one level deep. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes detached by default and notifies you on completion, just like a fresh spawn; pass `run_in_background: false` to block and get the result inline
@@ -328,7 +329,8 @@ All fields are optional — sensible defaults for everything.
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
-| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
+| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools — including no [messaging](#agentmessage) tools. Distinct from `isolation: worktree` (filesystem) |
+| `messaging_surface` | `subagents.json` `messaging.surface` (default `ui`) | What an incoming [peer message](#agentmessage) puts in front of *this* agent: `off` (nothing — it waits until the agent calls `inbox`), `ui` (a one-line notice with the unread count), or `context` (the full attributed body). The setting belongs to whoever pays for the context, so a sender never decides |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
 Frontmatter remains authoritative for `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation`. Model selection is the deliberate exception: an explicit `Agent({ model })` replaces the configured list, including on resume. Omit it normally so the agent's fallback policy remains active; use it for an agent with configured models only when that selection is unavailable and the conversation must continue elsewhere.
@@ -491,6 +493,43 @@ Send a steering message to a running agent. The message interrupts after the cur
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
 
+### `AgentMessage`
+
+Address another agent in the same scope. Registered for the main session and for top-level subagents when [messaging](#persistent-settings) is on; nested children and `isolated` agents never get it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `op` | `send` \| `broadcast` \| `inbox` \| `wait` \| `peers` | yes | What to do |
+| `to` | string | for `send` | Agent id, or a handle — resolved as exact id, then your own session's handle, then a scope-unique handle. Ambiguity is refused with the qualified candidates (`explore@9f3a1c`) rather than guessed |
+| `message` | string | for `send` / `broadcast` | Body, capped at 16 KiB |
+| `expect_reply` | boolean | no | Mark as a request and mint a correlation id |
+| `reply_to` | string | no | Id of the message being answered; carries its correlation id onto the reply |
+| `timeout_ms` | number | no | How long `wait` blocks. Omitted = 30 s, capped by `messaging.maxWaitMs` |
+| `peek` | boolean | no | `inbox` without consuming |
+| `from` | string | no | `wait` only — wait for a message from this sender. A **filter**, never a claim of identity |
+
+There is no `author` parameter anywhere, by design: authorship is stamped from the caller's trusted identity, so no agent can sign as another. Peer text arrives wrapped in a nonce-bound block marking it as untrusted, attributed data rather than instructions.
+
+`broadcast` reaches live subagents only — never a main session — and never wakes anyone. `send` does wake a settled-but-resumable recipient, bounded by a wake budget and a hop cap.
+
+### `Blackboard`
+
+A durable keyed board shared by the same scope, for what a fan-out leaves behind.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `op` | `put` \| `get` \| `list` \| `delete` \| `watch` | yes | What to do |
+| `topic` | string | except for an untopiced `list` / `watch` | Topic to act on |
+| `key` | string | for `put` / `get` / `delete` | Entry key |
+| `value` | any | for `put` | JSON-shaped value, capped at 64 KiB |
+| `if_revision` | number | no | Apply only if the entry is still at this revision; `0` means it must not exist |
+| `since` | number | no | `watch` cursor. Omit to start from the present and see only what happens next; `0` replays the whole log |
+| `timeout_ms` | number | no | How long `watch` blocks |
+
+A failed `if_revision` returns the current value, author and revision instead of overwriting — an answer the agent can merge or defer on, not a tool error. Writes under `operator/` (configurable) are refused with `reason: "read-only-namespace"`, for both `put` and `delete`.
+
+**Full guide:** [`docs/messaging.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/messaging.md) — scope and addressing, what an incoming message costs the recipient, receipts, the operator namespace, transcript cards, settings and troubleshooting.
+
 ## Commands
 
 | Command | Description |
@@ -625,7 +664,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, model retries, model wraparounds, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all, viewer view steps/raw) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, model retries, model wraparounds, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, peer messaging on/off, message surface off/ui/context, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all, viewer view steps/raw) persist across pi restarts. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
@@ -671,6 +710,25 @@ The resolved artifact root is recorded for each root session and reused on resum
 The entire object is one setting: project overrides global atomically. Relative custom paths are saved as entered. Shared custom containers are namespaced by repository identity; safe hashed names avoid branch-path collisions. Changes apply to future acquisitions, never migrate existing worktrees, and registered branch paths take precedence over placement. A container inside the repository **must already be ignored**. Otherwise acquisition fails with an actionable error; add a local rule to the common repository's `info/exclude` (for project mode, `/.worktrees/`) and retry. The extension never edits tracked `.gitignore` for you.
 
 **Worktree isolation** (`worktreeIsolation`, default `true`): enables disposable isolation and retained branch workspaces. Off, the `Agent` tool's `isolation` and `branch` fields and their descriptions disappear together on the next pi session; runtime enforcement applies immediately, including workflow, nested, scheduled and RPC paths. Existing anonymous requests keep their downgrade-to-normal-run behavior without a note. Explicit `branch` requests instead **fail** when disabled or vetoed; they never silently run in the parent checkout. The agent-file generator also stops offering `isolation:`. See [Turning worktrees off](#turning-worktrees-off).
+
+**Peer messaging** (`messaging`, an object; enabled by default): whether agents can address each other and share a blackboard — see the [full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/messaging.md). Unlike every other setting here this one is a block, and it is written back whole, so hand-edited keys survive a menu toggle.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Whether [`AgentMessage`](#agentmessage) and [`Blackboard`](#blackboard) are registered at all. `/agents → Settings → Peer messaging`; applies on the next pi session, since the store and bus are opened once at session start |
+| `scope` | `"project"` | `project` — every pi session in the repository shares one roster, so agents in two terminals are peers — or `session`, limiting it to agents this session started |
+| `directory` | — | Where the store lives. Default `<agent dir>/messaging/<project-hash>/` |
+| `surface` | `"ui"` | What an incoming message puts in front of the **main session's** model: `off` (nothing; it waits until the agent calls `inbox`), `ui` (a one-line notice with the unread count), `context` (the full body). Per agent, `messaging_surface` frontmatter wins. `/agents → Settings → Message surface`; applied live, read per delivery |
+| `maxWakesPerMinute` | `6` | How often a settled-but-resumable agent may be woken by an incoming message |
+| `maxHops` | `4` | Hop cap inherited by a woken agent's own outbound messages, so two idle agents cannot ping-pong each other awake |
+| `messageTtlMs` | `3600000` | How long an undelivered message lives |
+| `mailboxLimit` | `200` | Undelivered messages retained per agent; the oldest are dropped, and a drop is never counted as read |
+| `maxWaitMs` | `120000` | Ceiling on one `wait` or `watch` block. An omitted `timeout_ms` is 30 s |
+| `allowForeignMainWake` | `true` | Whether an agent in another session may wake **your** main session |
+| `operatorTopicPrefix` | `"operator/"` | The board namespace agents may read but never write — for constraints you want every agent to see and none to edit |
+| `notifySocket` | — | Path override for the advisory wakeup socket, or `false` to run brokerless. Brokerless is not broken: the store is polled, so only latency changes |
+
+Two things worth knowing. **The recipient decides what a message costs it** — `surface` and `messaging_surface` belong to whoever pays for the context, and a sender has no say; the default notice is one line whatever arrives. And **the transport is not the truth**: SQLite is, so a missing, stale or dead socket degrades delivery from a round trip to a poll and loses nothing. Agents with `isolated: true` get neither tool, and nested children are not addressable peers.
 
 **Report usage to session** (`reportUsage`, default `false`): whether subagent spend is added to *this* session's own totals. Subagents run in their own pi sessions, so by default pi's footer, statusline and `/cost` count only what the main model spent — a session that delegated most of its work reads as nearly free. Turn it on and each `Agent` / `get_subagent_result` / `steer_subagent` result carries the spend accumulated since the last one, which pi folds into `getSessionStats()`; `/cost` attributes it to the **Tools/summaries** bucket. Toggle via `/agents → Settings → Report usage to session`; applied live.
 
@@ -997,6 +1055,7 @@ This is useful for creating agents that inherit extension tools but should not h
 docs/                 # Long-form guides (shipped to npm; README links out to them)
   workflows.md        # SubagentWorkflow: writing, editing, saving and re-running scripts
   rpc.md              # Cross-extension integration: pi.events, subagents:rpc:*, background-jobs stop-worktree, manager registry
+  messaging.md        # Agent messaging and the shared blackboard: scope, addressing, surfaces, settings
   conversation-viewer.md # Reading tasks, grouped activity, retained output, and nested agents
 examples/
   workflows/          # Runnable examples, executed by test/workflow-examples.test.ts
@@ -1050,6 +1109,20 @@ src/
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)
   env.ts              # Environment detection (git, platform)
 
+  messaging/
+    store.ts          # The only source of truth: roster, mailboxes, blackboard, entry log (node:sqlite)
+    schema.ts         # Schema v1 and the pragmas the store opens with
+    driver.ts         # Thin seam over node:sqlite (DatabaseSync), so the dependency stays one file
+    scope.ts          # Project/session scope key and where the store file lives
+    types.ts          # Row shapes, receipts, activity events, store options
+    service.ts        # Policy: addressing, caps, correlation, batched delivery, wake budget
+    delivery-bridge.ts # The single seam onto AgentManager (steer, resume, recipient state)
+    notify-bus.ts     # The advisory wakeup seam, plus the no-op used when there is no socket
+    socket-notify-bus.ts # Bind-or-connect broker election, NDJSON bump frames, stale-path recovery
+    tool.ts           # The AgentMessage and Blackboard tool definitions
+    cards.ts          # Which traffic earns a transcript card: echo suppression, coalescing, per-minute cap
+    entry.ts          # The persisted shape of a messaging session entry
+
   workflow/
     meta.ts           # Extract and validate a script's pure-literal `meta` block
     worker-source.ts  # The sandbox: vm context, determinism prelude, script globals
@@ -1068,6 +1141,7 @@ src/
     background-jobs-rpc.ts # UI-only Jobs menu link to the companion's existing overlay
     schedule-menu.ts      # /agents → Scheduled jobs submenu
     select-item.ts        # Collision-safe ctx.ui.select wrapper (numbered rows)
+    messaging-card.ts     # Transcript card for one message or board write
     workflow-card.ts      # Inline workflow card (tool result and session entry)
     workflow-dialog.ts    # /agents → Workflows two-pane inspector
 ```
