@@ -35,7 +35,7 @@ import { isSqliteAvailable } from "./messaging/driver.js";
 import { resolveMessagingLocation } from "./messaging/scope.js";
 import { AgentMessagingService } from "./messaging/service.js";
 import { SqliteStore } from "./messaging/store.js";
-import { createAgentMessageTool } from "./messaging/tool.js";
+import { createMessagingTools } from "./messaging/tool.js";
 import { describeModel, type ModelRegistry, parseCanonicalModelId, type ResolvedModelCandidate, resolveCanonicalModel, resolveModel, resolveModelCandidates } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -781,7 +781,9 @@ export default function (pi: ExtensionAPI) {
   let messagingService: AgentMessagingService | undefined;
   let mainMessagingCaller: { agentId: string; sessionId: string } | undefined;
   if (messagingSettings.enabled !== false && isSqliteAvailable()) {
-    pi.registerTool(createAgentMessageTool(() => messagingService, () => mainMessagingCaller));
+    for (const tool of createMessagingTools(() => messagingService, () => mainMessagingCaller)) {
+      pi.registerTool(tool);
+    }
   }
 
   function registerMessagingRecord(record: AgentRecord, status: "queued" | "running" | "settled" | "gone"): void {
@@ -892,8 +894,8 @@ export default function (pi: ExtensionAPI) {
     if (reportUsage) pendingUsage.add(usage);
   });
   if (messagingSettings.enabled !== false && isSqliteAvailable()) {
-    manager.setAgentMessageToolFactory(caller =>
-      createAgentMessageTool(() => messagingService, () => caller));
+    manager.setMessagingToolFactory(caller =>
+      createMessagingTools(() => messagingService, () => caller));
   }
 
   // Expose manager via Symbol.for() global registry for cross-package access.

@@ -484,7 +484,7 @@ export class AgentManager {
   private runningBackground = 0;
   /** Number of currently running foreground (blocking) agents. */
   private runningForeground = 0;
-  private agentMessageToolFactory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition) | undefined;
+  private messagingToolFactory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition[]) | undefined;
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -503,10 +503,10 @@ export class AgentManager {
     this.cleanupInterval.unref();
   }
 
-  setAgentMessageToolFactory(
-    factory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition) | undefined,
+  setMessagingToolFactory(
+    factory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition[]) | undefined,
   ): void {
-    this.agentMessageToolFactory = factory;
+    this.messagingToolFactory = factory;
   }
 
   /** Update the max concurrent background agents limit. */
@@ -928,8 +928,8 @@ export class AgentManager {
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
       structuredOutput: options.structuredOutput,
-      agentMessageTool: isTopLevelAgent(record) && this.agentMessageToolFactory
-        ? this.agentMessageToolFactory({ agentId: id, sessionId: record.rootSessionId ?? "standalone" })
+      messagingTools: isTopLevelAgent(record) && this.messagingToolFactory
+        ? this.messagingToolFactory({ agentId: id, sessionId: record.rootSessionId ?? "standalone" })
         : undefined,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,

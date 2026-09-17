@@ -487,8 +487,8 @@ export interface RunOptions {
    * fails at the call that wrote it rather than inside the child.
    */
   structuredOutput?: CompiledSchema;
-  /** Trusted mailbox tool for an addressable top-level peer. */
-  agentMessageTool?: ToolDefinition;
+  /** Trusted mailbox and blackboard tools for an addressable top-level peer. */
+  messagingTools?: ToolDefinition[];
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -1049,9 +1049,8 @@ export async function runAgent(
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
-  const messagingTools = options.agentMessageTool && !options.nested && !options.isolated
-    && !disallowedSet?.has(options.agentMessageTool.name)
-    ? [options.agentMessageTool]
+  const messagingTools = options.messagingTools && !options.nested && !options.isolated
+    ? options.messagingTools.filter(tool => !disallowedSet?.has(tool.name))
     : [];
   const messagingToolNames = new Set(messagingTools.map(tool => tool.name));
 

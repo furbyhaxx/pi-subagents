@@ -40,21 +40,39 @@ describe("agent messaging e2e", () => {
     for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   });
 
-  it("registers AgentMessage for a peer-capable main session and exposes its main roster entry", async () => {
+  it("registers both messaging tools for a peer-capable main session and attributes its board writes", async () => {
     run = await runPrintMode({
-      prompt: "Inspect messaging peers.",
+      prompt: "Inspect messaging peers, then record a finding.",
       live: false,
       respond: (context: Context) => {
-        const result = toolResults(context, "AgentMessage")[0];
-        if (result) return "MESSAGING_ROSTER_OK";
-        return fauxToolCall("AgentMessage", { op: "peers" });
+        if (!toolResults(context, "AgentMessage")[0]) return fauxToolCall("AgentMessage", { op: "peers" });
+        if (!toolResults(context, "Blackboard")[0]) {
+          return fauxToolCall("Blackboard", { op: "put", topic: "findings", key: "e2e", value: { ok: true } });
+        }
+        return "MESSAGING_ROSTER_OK";
       },
     });
 
     const tools = run.parentSession.getAllTools().map(tool => tool.name);
     const resultText = sessionToolResults(run.parentSession, "AgentMessage").join("\n");
+    // The main session writes under the name a human would address it by — its
+    // session alias here, `main-<short>` when the session is unnamed — which is
+    // what makes a board entry attributable to a peer rather than anonymous.
+    const roster = JSON.parse(sessionToolResults(run.parentSession, "AgentMessage")[0]!) as {
+      peers: Array<{ kind: string; alias?: string; handle?: string }>;
+    };
+    const main = roster.peers.find(peer => peer.kind === "main")!;
+    const board = JSON.parse(sessionToolResults(run.parentSession, "Blackboard")[0]!) as {
+      ok: boolean;
+      entry: { author: string; revision: number };
+    };
     expect(tools).toContain("AgentMessage");
+    expect(tools).toContain("Blackboard");
     expect(resultText).toContain('"kind": "main"');
+    expect(board).toMatchObject({
+      ok: true,
+      entry: { author: main.alias ?? main.handle, revision: 1 },
+    });
     expect(run.responseText).toBe("MESSAGING_ROSTER_OK");
   });
 
@@ -125,6 +143,7 @@ describe("agent messaging e2e", () => {
     };
 
     expect(records.every(record => record.session?.getAllTools().some(tool => tool.name === "AgentMessage"))).toBe(true);
+    expect(records.every(record => record.session?.getAllTools().some(tool => tool.name === "Blackboard"))).toBe(true);
     expect(reply.message.body).toBe("correlated-answer");
     expect(reply.message.correlationId).toBe(requestReceipt.receipt.correlationId);
   });
@@ -200,6 +219,7 @@ describe("agent messaging e2e", () => {
     const refusal = probeRecord?.session ? sessionToolResults(probeRecord.session, "AgentMessage").join("\n") : "";
     expect(nestedTools).toBeDefined();
     expect(nestedTools).not.toContain("AgentMessage");
+    expect(nestedTools).not.toContain("Blackboard");
     expect(refusal).toContain('"reason": "nested-child"');
   });
 });
