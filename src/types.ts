@@ -4,6 +4,7 @@
 
 import type { ModelThinkingLevel, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { MessagingSurface } from "./messaging/types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { WorktreeCleanupResult, WorktreeInfo } from "./worktree.js";
 
@@ -70,6 +71,8 @@ export interface AgentConfig {
    * "all" = any enabled agent; string[] = only those agent types.
    */
   allowedSubagents?: "all" | string[];
+  /** Per-reader override for incoming mailbox delivery. */
+  messagingSurface?: MessagingSurface;
   systemPrompt: string;
   promptMode: "replace" | "append";
   /** Default for spawn: fork parent conversation. undefined = caller decides. */

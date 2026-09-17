@@ -136,6 +136,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
       sessionDir: str(fm.session_dir),
       allowedSubagents: parseAllowedSubagents(fm.allowed_subagents),
+      messagingSurface: parseMessagingSurface(fm.messaging_surface),
       systemPrompt: body.trim(),
       promptMode: fm.prompt_mode === "append" ? "append" : "replace",
       inheritContext: fm.inherit_context != null ? fm.inherit_context === true : undefined,
@@ -250,6 +251,11 @@ function str(val: unknown): string | undefined {
 /** Extract a non-negative integer or undefined. 0 means unlimited for max_turns. */
 function nonNegativeInt(val: unknown): number | undefined {
   return typeof val === "number" && val >= 0 ? val : undefined;
+}
+
+function parseMessagingSurface(val: unknown): AgentConfig["messagingSurface"] {
+  const value = str(val);
+  return value === "off" || value === "ui" || value === "context" ? value : undefined;
 }
 
 /**
