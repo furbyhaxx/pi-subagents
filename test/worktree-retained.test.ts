@@ -150,10 +150,15 @@ describe("retained branch worktrees", () => {
     unlock();
   });
 
-  it("rejects missing anonymous resume and releases retained leases even when status fails", async () => {
+  it("reacquires a settled anonymous worktree and releases retained leases even when status fails", async () => {
     const anonymous = await create();
-    await cleanupWorktree(pi, repo, anonymous, "done");
-    await expect(resumeWorktree(pi, anonymous, "resume")).rejects.toThrow(/missing/);
+    expect(await cleanupWorktree(pi, repo, anonymous, "done")).toEqual({
+      hasChanges: false, path: anonymous.path, retained: true,
+    });
+    expect(existsSync(anonymous.path)).toBe(true);
+    await resumeWorktree(pi, anonymous, "resume");
+    expect(anonymous.initialDirty).toBe(false);
+    releaseWorktreeLease(anonymous);
     const scope = await create("broken");
     writeFileSync(join(scope.path, "keep.txt"), "do not delete");
     writeFileSync(join(scope.path, ".git"), "gitdir: /missing/git-dir");

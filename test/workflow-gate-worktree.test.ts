@@ -5,12 +5,11 @@
  * The other workflow tests stub either side of the seam; this one does not. It
  * drives the real `AgentManager` over a real git repo with the real
  * `src/worktree.ts`, and only the model itself is faked — because the whole bug
- * class lives in the timing between two real things: the manager commits the
- * child's worktree to a branch and deletes the copy *inside the child's own
- * settle*, so a gate that waits for `spawnAndWait` to resolve has nothing left
- * to verify and quietly runs against the main tree. A gate that passes on the
- * wrong directory marks unverified work as verified, which is worse than having
- * no gate at all.
+ * class lives in the timing between two real things: the manager must run the
+ * gate before releasing the child's writer lease, so another owner cannot alter
+ * a named workspace between execution and verification. A gate that passes on
+ * the wrong directory marks unverified work as verified, which is worse than
+ * having no gate at all.
  *
  * So the assertions are about the directory, not about plumbing: the gate ran in
  * the child's worktree path, that path existed at that moment, and it contained
@@ -206,11 +205,14 @@ describe("gate on an isolated child", () => {
     expect(result.ok).toBe(true);
     expect(result.gate).toEqual({ ok: true, output: "3 passing" });
 
-    // …and the copy is still torn down afterwards: verifying it must not keep it.
-    expect(existsSync(worktreePath!)).toBe(false);
+    // Settlement retains the verified workspace for orchestrator review.
+    expect(existsSync(worktreePath!)).toBe(true);
+    expect(manager.listAgents()[0].worktreeResult).toMatchObject({
+      path: worktreePath, retained: true,
+    });
   });
 
-  it("fails the agent with the gate's output, and still cleans the worktree up", async () => {
+  it("fails the agent with the gate's output, and retains the worktree", async () => {
     const { pi, gateRuns } = makePi(() => execFail("FAIL src/auth.test.ts\n1 failing"));
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
@@ -232,7 +234,7 @@ describe("gate on an isolated child", () => {
     expect(gateRuns).toHaveLength(1);
     expect(gateRuns[0].cwd).toBe(manager.listAgents()[0].worktree?.path);
     expect(gateRuns[0].sawChildWork).toBe(true);
-    expect(existsSync(gateRuns[0].cwd)).toBe(false);
+    expect(existsSync(gateRuns[0].cwd)).toBe(true);
   });
 
   it("names the command when a failing gate in a worktree says nothing", async () => {
@@ -274,7 +276,7 @@ describe("gate on an isolated child", () => {
     expect(result.value).toBeNull();
     expect(agentEntries(result.progress).at(-1)?.error).toBe("spawn sh ENOENT");
     expect(gateRuns).toHaveLength(1);
-    expect(existsSync(manager.listAgents()[0].worktree!.path)).toBe(false);
+    expect(existsSync(manager.listAgents()[0].worktree!.path)).toBe(true);
   });
 
   it("gates a steered child too — a steer is a finished child, not a failed one", async () => {
@@ -310,7 +312,7 @@ describe("gate on an isolated child", () => {
     expect(result).toMatchObject({ ok: false, error: "provider exploded" });
     expect(result.gate).toBeUndefined();
     expect(gateRuns).toEqual([]);
-    expect(existsSync(manager.listAgents()[0].worktree!.path)).toBe(false);
+    expect(existsSync(manager.listAgents()[0].worktree!.path)).toBe(true);
   });
 });
 
@@ -365,7 +367,7 @@ describe("an isolated child with no gate", () => {
     vi.mocked(runAgent).mockReset();
   });
 
-  it("is untouched: nothing runs, and the work still lands on a branch", async () => {
+  it("is untouched: nothing runs, and the detached worktree remains in place", async () => {
     const { pi, gateRuns } = makePi();
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
@@ -375,13 +377,11 @@ describe("an isolated child with no gate", () => {
     expect(result.ok).toBe(true);
     const record = manager.listAgents()[0];
     expect(record.worktreeResult?.hasChanges).toBe(true);
-    // The child's file survives the copy's removal, on the branch.
-    const branch = record.worktreeResult!.branch!;
-    const files = execFileSync("git", ["show", "--name-only", "--format=", branch], {
-      cwd: repo,
-      encoding: "utf-8",
+    expect(record.worktreeResult).toMatchObject({
+      path: record.worktree!.path, retained: true,
     });
-    expect(files).toContain(CHILD_FILE);
-    expect(existsSync(record.worktree!.path)).toBe(false);
+    expect(record.worktreeResult?.branch).toBeUndefined();
+    expect(existsSync(join(record.worktree!.path, CHILD_FILE))).toBe(true);
+    expect(existsSync(record.worktree!.path)).toBe(true);
   });
 });

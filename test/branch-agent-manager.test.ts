@@ -113,10 +113,10 @@ describe("branch-scoped manager execution", () => {
     expect(createWorktree).toHaveBeenCalledOnce();
   });
 
-  it("cleans up a workspace if a startup lifecycle subscriber throws", async () => {
+  it("retains a workspace if a startup lifecycle subscriber throws", async () => {
     await manager.dispose();
     manager = new AgentManager(undefined, undefined, () => { throw new Error("subscriber failed"); });
-    await expect(manager.spawnAndWait(pi, ctx, "general-purpose", "implement", spawnOptions)).rejects.toThrow(/subscriber failed.*Workspace retained/);
+    await expect(manager.spawnAndWait(pi, ctx, "general-purpose", "implement", spawnOptions)).rejects.toThrow(/subscriber failed[\s\S]*Workspace retained/);
     expect(cleanupWorktree).toHaveBeenCalledOnce();
     expect(runAgent).not.toHaveBeenCalled();
     expect(releaseWorktreeLease).toHaveBeenCalledWith(scope);

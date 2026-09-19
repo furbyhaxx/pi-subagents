@@ -1,8 +1,8 @@
 /**
  * worktree.ts — Git worktree isolation for agents.
  *
- * Anonymous copies are detached and disposable, preserving edits on completion.
- * Explicit branches acquire retained workspaces: no automatic commit or removal.
+ * Anonymous copies are detached and retained in place after settlement.
+ * Explicit branches acquire reusable retained workspaces.
  * Leases serialize extension-owned writers across processes through settlement.
  *
  * Every git call goes through `pi.exec` (async) rather than `execFileSync`: a
@@ -40,7 +40,7 @@ export interface WorktreeInfo {
   initialDirty: boolean;
   /** Absolute path to the worktree directory (the copied repo's root). */
   path: string;
-  /** Exact checked-out branch for retained scopes; preservation branch for anonymous copies. */
+  /** Exact checked-out branch for retained scopes; descriptive slug for anonymous copies. */
   branch: string;
   /** HEAD at acquisition, including the existing tip when reusing a branch. */
   baseSha: string;
@@ -74,11 +74,11 @@ export function isWorktreeIsolationEnabled(): boolean {
 }
 
 export interface WorktreeCleanupResult {
-  /** Whether changes were found in the worktree. */
+  /** Whether changes were found, or conservatively assumed after verification failed. */
   hasChanges: boolean;
-  /** Branch name if changes were committed. */
+  /** Exact branch name for a named retained worktree. */
   branch?: string;
-  /** Worktree path if it was kept. */
+  /** Retained worktree path. */
   path?: string;
   retained?: true;
 }
@@ -359,88 +359,34 @@ export async function createWorktree(
 }
 
 /**
- * Clean up a worktree after agent completion.
- * - Retained: verify/report changes and release the lease; never modify Git state.
- * - Anonymous: preserve the existing commit/branch/remove behavior unchanged.
+ * Verify and report a settled worktree, then release its writer lease.
+ * Settlement never stages, commits, creates a branch, resets, stashes, cleans,
+ * or removes the workspace. Anonymous worktrees remain detached in place.
+ *
+ * A named workspace keeps its strict verification behavior. An anonymous
+ * workspace reports changes conservatively when its state cannot be verified:
+ * the retained path is still the authoritative recovery location.
  */
 export async function cleanupWorktree(
   pi: ExtensionAPI,
-  cwd: string,
+  _cwd: string,
   worktree: WorktreeInfo,
-  agentDescription: string,
+  _agentDescription: string,
 ): Promise<WorktreeCleanupResult> {
-  if (worktree.lifecycle === "retained") {
-    try {
-      const dirty = await verifyWorktree(pi, worktree);
-      const head = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
-      return { hasChanges: dirty || head !== worktree.baseSha, branch: worktree.branch, path: worktree.path, retained: true };
-    } finally { releaseWorktreeLease(worktree); }
-  }
-  if (!existsSync(worktree.path)) {
-    releaseWorktreeLease(worktree);
-    return { hasChanges: false };
-  }
-
   try {
-    // Check for uncommitted changes in the worktree
-    const status = await git(pi, worktree.path, ["status", "--porcelain"], 10000);
-
-    if (status) {
-      // Changes exist — stage, commit, and create a branch
-      await git(pi, worktree.path, ["add", "-A"], 10000);
-      // Truncate description for commit message (no shell sanitization needed — pi.exec uses argv)
-      const safeDesc = agentDescription.slice(0, 200);
-      const commitMsg = `pi-agent: ${safeDesc}`;
-      await git(pi, worktree.path, ["commit", "--no-verify", "-m", commitMsg], 10000);
-    } else {
-      const currentSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
-
-      if (currentSha === worktree.baseSha) {
-        // No changes — remove worktree
-        await removeWorktree(pi, cwd, worktree.path);
-        return { hasChanges: false };
-      }
-    }
-
-    // Create a branch pointing to the worktree's HEAD.
-    // If the branch already exists, append a suffix to avoid overwriting previous work.
-    let branchName = worktree.branch;
-    try {
-      await git(pi, worktree.path, ["branch", branchName], 5000);
-    } catch {
-      // Branch already exists — use a unique suffix
-      branchName = `${worktree.branch}-${Date.now()}`;
-      await git(pi, worktree.path, ["branch", branchName], 5000);
-    }
-    // Update branch name in worktree info for the caller
-    worktree.branch = branchName;
-
-    // Remove the worktree (branch persists in main repo)
-    await removeWorktree(pi, cwd, worktree.path);
-
+    const dirty = await verifyWorktree(pi, worktree);
+    const head = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
     return {
-      hasChanges: true,
-      branch: worktree.branch,
+      hasChanges: dirty || head !== worktree.baseSha,
+      ...(worktree.lifecycle === "retained" ? { branch: worktree.branch } : {}),
       path: worktree.path,
+      retained: true,
     };
-  } catch {
-    // Best effort cleanup on error
-    try { await removeWorktree(pi, cwd, worktree.path); } catch { /* ignore */ }
-    return { hasChanges: false };
-  } finally { releaseWorktreeLease(worktree); }
-}
-
-/**
- * Force-remove a worktree.
- */
-async function removeWorktree(pi: ExtensionAPI, cwd: string, worktreePath: string): Promise<void> {
-  try {
-    await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], 10000);
-  } catch {
-    // If git worktree remove fails, try pruning
-    try {
-      await git(pi, cwd, ["worktree", "prune"], 5000);
-    } catch { /* ignore */ }
+  } catch (error) {
+    if (worktree.lifecycle === "retained") throw error;
+    return { hasChanges: true, path: worktree.path, retained: true };
+  } finally {
+    releaseWorktreeLease(worktree);
   }
 }
 

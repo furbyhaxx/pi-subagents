@@ -9,8 +9,8 @@
  * agent-startup-error) mock ../src/worktree.js entirely and assert only the gate
  * and the fail-loud throw. So the chain the feature actually promises was never
  * pinned end to end: spawn → the child's cwd IS the copy → its edits stay out of
- * the main checkout → cleanup commits them to a branch the result names → the
- * copy is gone. Every link was tested; the chain was not.
+ * the main checkout → settlement retains the detached copy and reports its path.
+ * Every link was tested; the chain was not.
  *
  * Deliberately faux, not live: a live model may decline to spawn at all, which
  * would look like a pass. Each run pins `live: false` rather than trusting the
@@ -114,12 +114,19 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     // a later run without the key would otherwise inherit whatever this one set.
     setWorktreeIsolationEnabled(true);
     for (const dir of repos.splice(0)) {
-      try { git(dir, "worktree", "prune"); } catch { /* repo may be gone */ }
+      try {
+        const paths = git(dir, "worktree", "list", "--porcelain")
+          .split("\n").filter(line => line.startsWith("worktree ")).map(line => line.slice(9));
+        for (const path of paths) {
+          if (path !== dir) git(dir, "worktree", "remove", "--force", path);
+        }
+        git(dir, "worktree", "prune");
+      } catch { /* repo may be gone */ }
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("runs the child in the copy and lands its changes on a branch, not the main checkout", async () => {
+  it("runs the child in a retained detached copy, not the main checkout", async () => {
     const repo = initGitRepo();
     repos.push(repo);
 
@@ -137,18 +144,14 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     const result = agentResultText(run.parentSession);
     expect(result).toContain(CHILD_MARKER);
 
-    // The result names a branch and the command to merge it — the only artifact,
-    // since the worktree directory does not survive.
-    const branch = /Changes saved to branch `(pi-agent-[^`]+)`/.exec(result)?.[1];
-    expect(branch).toBeTruthy();
-    expect(result).toContain(`git merge ${branch}`);
+    const worktree = /Workspace retained at `([^`]+)` on its detached HEAD/.exec(result)?.[1];
+    expect(worktree).toBeTruthy();
+    expect(result).toContain("No automatic commit, branch, or removal performed.");
 
-    // That branch exists in the MAIN repo and carries the child's file.
-    expect(git(repo, "branch", "--list", branch!)).toContain(branch!);
-    expect(git(repo, "ls-tree", "--name-only", branch!)).toContain(MARKER_FILE);
-
-    // And the copy is gone: `git worktree list` is down to the main checkout.
-    expect(git(repo, "worktree", "list").split("\n")).toHaveLength(1);
+    expect(existsSync(join(worktree!, MARKER_FILE))).toBe(true);
+    expect(git(worktree!, "rev-parse", "--symbolic-full-name", "HEAD")).toBe("HEAD");
+    expect(git(repo, "branch", "--list", "pi-agent-*")).toBe("");
+    expect(git(repo, "worktree", "list").split("\n")).toHaveLength(2);
   });
 
   it("downgrades to the main checkout when the project set worktreeIsolation: false", async () => {
