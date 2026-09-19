@@ -31,6 +31,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — disposable detached copies with automatic branch preservation, or `branch: "feat/x"` for a retained, reusable linked worktree without automatic commit or removal
 - **Persistent session artifacts** — transcripts, workflow scripts and journals under `<agent dir>/sessions/<project>/<session>/tasks/` by default — or under `<PI_CODING_AGENT_SESSION_DIR>/subagents/` when that session-root override is set — with sibling `worktrees/`; configure artifact and worktree storage independently
+- **Bundled skills** — the package ships three skills pi discovers automatically: `authoring-subagents` (writing, scoping, modelling and evaluating agent types), `coordinating-subagents` (briefing, steering, supervising and verifying a fleet), and `executing-work-with-subagents` (decomposing work into batches, worktrees and branches, workflows). See [`skills/`](skills/)
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
@@ -1057,6 +1058,10 @@ docs/                 # Long-form guides (shipped to npm; README links out to th
   rpc.md              # Cross-extension integration: pi.events, subagents:rpc:*, background-jobs stop-worktree, manager registry
   messaging.md        # Agent messaging and the shared blackboard: scope, addressing, surfaces, settings
   conversation-viewer.md # Reading tasks, grouped activity, retained output, and nested agents
+skills/               # Bundled skills, discovered by pi from the installed package
+  authoring-subagents/          # Agent types: frontmatter, prompts, scoping, models, evaluation
+  coordinating-subagents/       # Delegation, steering, supervision, evidence discipline, messaging
+  executing-work-with-subagents/ # Decomposition, batching, worktrees/branches, workflows
 examples/
   workflows/          # Runnable examples, executed by test/workflow-examples.test.ts
   agent-tool-description.md
