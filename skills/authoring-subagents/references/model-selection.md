@@ -163,6 +163,24 @@ level beside the requested one (`thinking: low (asked max)`).
 Thinking level is often a better lever than model tier: a workhorse at `high`
 frequently beats a frontier model at `low`, for a fraction of the price.
 
+**Frequency is not the deciding factor — the cost of a miss is.** The table above
+reads off the *shape* of the job, but a cheap-looking job whose failure is
+expensive belongs a tier up, and running it often makes that worse, not better:
+a gate that runs 50 times a day and misses one destructive migration has failed
+once, which is all it takes.
+
+| Runs often | A miss is | Level |
+|---|---|---|
+| yes | cheap and immediately visible (a bad grep, a wrong file) | `off`–`low` — the retry is cheaper than the reasoning |
+| yes | expensive or silent (a merge gate, a security check, a data migration) | `medium`–`high`, and control cost with a cheaper *model*, not less thinking |
+| no | cheap | `medium` — it is not worth optimizing |
+| no | expensive | `high`–`max` — this is what the budget is for |
+
+The common mistake is treating a high-frequency job as automatically a cheap one.
+Spend the savings on the model tier and the context you hand it; buy the thinking
+that the consequence justifies. When both matter, a cheap model at `high` is
+usually the better trade than a strong model at `low`.
+
 ## Designing a fallback list
 
 ```yaml

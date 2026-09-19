@@ -12,6 +12,7 @@ time.
 - [The lease: one writer per branch](#the-lease-one-writer-per-branch)
 - [What a worktree does not contain](#what-a-worktree-does-not-contain)
 - [Briefing an agent that runs in a workspace](#briefing-an-agent-that-runs-in-a-workspace)
+- [Reviewing, merging and cleaning up](#reviewing-merging-and-cleaning-up)
 - [Storage and cleanup](#storage-and-cleanup)
 - [Turning isolation off](#turning-isolation-off)
 - [Failure modes](#failure-modes)
@@ -138,6 +139,117 @@ So your brief should add only what is task-specific:
   nothing.
 - **State the validation**: the command that must pass, run inside the workspace.
 - **Say what to preserve** when reusing a workspace that may already be dirty.
+
+## Reviewing, merging and cleaning up
+
+The extension gets the work *into* a workspace and leaves it there. Nothing
+merges, pushes or deletes on your behalf, so a run is finished only when it has
+been reviewed, integrated and removed from disk. Skipping the last step is how a
+machine ends up with fifteen stale copies of the repository, one of which someone
+eventually reviews by mistake.
+
+### Find what you have
+
+```bash
+git worktree list                       # every linked worktree and its branch
+git branch --list 'pi-agent-*'          # disposable runs that preserved changes
+```
+
+A disposable run reports its `pi-agent-<id>` branch in the completion message and
+its directory is already gone. A named `branch` run reports the retained path,
+and its files may still be uncommitted.
+
+### Review before you merge
+
+```bash
+git log --oneline main..pi-agent-abc123          # what it did
+git diff main...pi-agent-abc123                  # the change as a whole
+git diff --stat main...pi-agent-abc123           # scope check: did it stay in bounds?
+```
+
+For a retained workspace, review it in place — it is a working tree:
+
+```bash
+git -C /path/to/worktree status
+git -C /path/to/worktree diff
+```
+
+Two things to know before you trust what you see:
+
+- **The automatic preservation commit uses `--no-verify`.** Your pre-commit hooks
+  did not run on it. Whatever they would have caught is still in there.
+- **An agent's gate proves only what the gate ran.** Re-run the project's own
+  check suite after merging, in the main checkout, where the full toolchain and
+  hooks apply.
+
+Delegating the review is fine — a read-only reviewer agent pointed at
+`git diff main...pi-agent-abc123`, or a fresh agent on the same `branch` with
+"do not edit". Do not use a *new* worktree to review someone's uncommitted work:
+a fresh copy contains committed files only.
+
+### Merge it back
+
+Git refuses to check out a branch that a linked worktree already holds, so merge
+**from the main checkout** rather than trying to switch to it:
+
+```bash
+cd /path/to/main/checkout
+git merge --no-ff pi-agent-abc123       # or feat/x
+npm run check                            # validate in the real tree, with hooks
+```
+
+Other shapes, depending on what you want in history:
+
+```bash
+git cherry-pick <sha>                    # take one commit out of an agent branch
+git rebase --onto main <base> feat/x     # linearize before merging
+git merge --squash feat/x                # one commit, agent's history dropped
+```
+
+If the work is still uncommitted in a retained workspace, commit it there first —
+the workspace is a normal checkout, so `git -C <path> add -p` and
+`git -C <path> commit` work — or steer the owning agent to commit under your
+commit policy. Integrate one branch at a time and re-run the check after each;
+two agent branches that merge cleanly can still be semantically incompatible.
+
+### Then clean up
+
+Once the branch is merged into your local main, remove the copy and the branch:
+
+```bash
+git worktree remove /path/to/worktree    # refuses if the tree is dirty
+git worktree prune                       # drop stale administrative records
+git branch -d feat/x                     # -d refuses if it is not merged
+git branch -d pi-agent-abc123            # same for a preservation branch
+```
+
+`git branch -d` failing is a feature: it means what you are about to delete is
+not in your main line. Find out why before reaching for `-D`.
+
+Four things that make removal fail or unsafe, and what they mean:
+
+| Situation | What it means | Do |
+|---|---|---|
+| `remove` refuses: tree is dirty | Uncommitted or untracked files remain — possibly work you have not read | Review them; commit or discard deliberately. `--force` only after you have looked |
+| An agent still owns the branch lease | A run is live in that workspace | Let it finish, or stop it; then remove |
+| Background jobs are running in the tree | Something is still writing there | Stop them (`job_list`, `job_stop`) before removing |
+| The directory is gone but `worktree list` still shows it | Stale administrative record | `git worktree prune` |
+
+A disposable run needs no `worktree remove` — the copy was deleted when it
+finished, unless jobs could not be confirmed stopped, in which case it was
+retained on purpose and the result said so. Only the `pi-agent-*` branch is left
+to delete.
+
+### Checklist
+
+1. `git worktree list` and `git branch --list 'pi-agent-*'` — know what exists.
+2. Read the diff against the base, and check the scope it actually touched.
+3. Merge from the main checkout, one branch at a time.
+4. Run the project's check suite in the main checkout — hooks were bypassed.
+5. `git worktree remove` + `git worktree prune`.
+6. `git branch -d` for the merged branch, and let the refusal stop you if it is
+   not merged.
+7. Nothing gets pushed as part of this unless you say so.
 
 ## Storage and cleanup
 

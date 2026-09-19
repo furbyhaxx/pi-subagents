@@ -30,7 +30,9 @@ work  →  scout  →  units  →  batches  →  execute  →  validate  →  in
    discovered at run time.
 5. **Validate** each unit against its own criterion — ideally a command.
 6. **Integrate** and re-validate the whole, because units that each pass can
-   still fail together.
+   still fail together. Work done in a worktree or on a branch is integrated only
+   once it is reviewed, merged back, re-checked in the main tree, and the copy is
+   removed.
 
 Do not skip step 1. A hybrid approach — scout inline, then fan out over what you
 found — beats both "plan everything up front" and "delegate the whole feature".
@@ -92,6 +94,17 @@ Batch shapes, dependency graphs, fan-out patterns and what a barrier costs:
 | Shared checkout (default) | Read-only work, or a single writer | None; no protection either |
 | `isolation: "worktree"` | Speculative or risky writes you may throw away | Copy setup + disk; changes preserved on a `pi-agent-*` branch, worktree removed |
 | `branch: "feat/x"` | Multi-step work on one line, reused across calls | Retained workspace; nothing auto-commits or removes it |
+
+**Isolation is not free.** Every worktree is a full checkout: seconds to minutes
+of setup and a copy of the repository on disk, per agent. It does not remove a
+conflict either — it converts a race into a merge, which is a better problem but
+still a problem you have to work. Pay for it when writes would genuinely collide,
+when the work may be thrown away, or when the main checkout must stay usable;
+otherwise a shared checkout with one writer is faster and simpler.
+
+Work in a worktree is not done when the agent finishes — it is done when it has
+been reviewed, merged back, and the copy is off your disk. See
+[integrating a workspace](references/worktrees-and-branches.md#reviewing-merging-and-cleaning-up).
 
 Three rules that cause most of the pain when ignored:
 
@@ -156,6 +169,8 @@ the next job; that irrelevant context is not free, and it biases the new work.
 | Pattern | Why it fails |
 |---|---|
 | Delegating a plan task verbatim | Feature-sized; the agent runs out of context and returns a `steered` partial |
+| Merging an agent branch without reading it | The preservation commit bypassed your hooks; nothing has validated it |
+| Leaving worktrees on disk after merging | Copies accumulate silently, and a stale one gets reused or reviewed by mistake |
 | Fanning out before scouting | You cannot size or scope units for a work-list you have not seen |
 | Parallel agents in one checkout writing related files | Lost edits, half-applied changes, no way to attribute them |
 | One task per file | Brief + spawn + integrate overhead exceeds the work |
