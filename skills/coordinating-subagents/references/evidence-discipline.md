@@ -56,8 +56,8 @@ criterion, not a request in prose.
   output."*
 - In a workflow: `agent(prompt, { gate: 'npm test' })` — the gate runs in the
   child's effective working directory after it finishes and before worktree
-  cleanup or branch-lease release; a non-zero exit fails the agent and the
-  command output becomes the error.
+  settlement or lease release; a non-zero exit fails the agent and the command
+  output becomes the error.
 - After the fact: run it yourself. One command beats a paragraph of reasoning
   about whether the change is correct.
 

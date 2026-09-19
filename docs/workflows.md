@@ -244,9 +244,9 @@ An agent definition may provide ordered `models` fallback candidates. Pi exhaust
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId[:thinking]`, or fuzzy like `haiku`. Replaces the agent definition's fallback list; omit normally, and use on resume only when recovering from an unavailable configured selection |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
-| `isolation` | `"worktree"` | Without `branch`, a disposable detached copy; changes are preserved on a reported `pi-agent-*` branch before removal |
-| `branch` | string | Exact local branch, e.g. `feat/x`. Implies worktree isolation; creates or reuses a retained linked worktree. No automatic commit or removal |
-| `gate` | string | Shell command in the child's effective cwd after it finishes, before cleanup or branch lease release; a non-zero exit fails the agent and its output becomes the error |
+| `isolation` | `"worktree"` | Without `branch`, a retained detached copy. Completion reports its path and change state; no automatic Git mutation or removal |
+| `branch` | string | Exact local branch, e.g. `feat/x`. Implies worktree isolation; creates or reuses a retained linked worktree. No automatic Git mutation or removal |
+| `gate` | string | Shell command in the child's effective cwd after it finishes, before worktree settlement and lease release; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
@@ -254,7 +254,7 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` may be combined with `model` to continue the same conversation on a replacement model. It cannot be combined with `agentType`, `effort`, `isolation`, `branch`, `gate` or `schema` — the child keeps its agent type and tree, and its session predates the `StructuredOutput` tool.
 
-Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`, and a disposable `isolation: "worktree"` copy is removed only after that worktree's jobs are stopped — if termination cannot be confirmed the worktree is retained and the failure is reported in that agent's output instead of deleting a tree a live job may still be writing in. A retained `branch` worktree is never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
+Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`. Anonymous-worktree settlement stops that worktree's jobs before releasing its lease; a failure to confirm termination is reported in the child's output. The worktree remains retained either way. A named `branch` worktree is never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
 
 ### Retained branch workspaces
 
@@ -273,9 +273,11 @@ These sequential calls share files, not conversation; use `resume: 'fix'` for co
 
 A missing local branch starts at the caller's resolved HEAD; an existing local branch starts at its tip. An already registered linked worktree is reused at its actual path, including staged, unstaged and untracked files. No fetch or remote-branch guessing occurs. New copies never include uncommitted files from the caller. Main/orchestrating-checkout reuse is refused. The runtime keeps configuration discovery at the initiating project and preserves monorepo subdirectory scope.
 
-Branch names must be nonempty exact local branch names, not tags or revision shortcuts. `branch` conflicts with `resume` and `isolation: 'off'`, and fails if worktrees are disabled or the agent definition vetoes them. Concurrent writers to one repository/branch fail fast as busy; use a different branch or steer/resume its owner. Gates hold the same lease while verifying. Completion, failure and cancellation release it without auto-committing, resetting, stashing or deleting the retained worktree.
+Branch names must be nonempty exact local branch names, not tags or revision shortcuts. `branch` conflicts with `resume` and `isolation: 'off'`, and fails if worktrees are disabled or the agent definition vetoes them. Concurrent writers to one repository/branch fail fast as busy; use a different branch or steer/resume its owner. Gates hold the same lease while verifying. Success, turn limit, abort, stop, failure, cancellation and shutdown release it without auto-committing, creating a preservation branch, merging, resetting, stashing, cleaning, deleting or pruning the retained worktree.
 
-Use repository-relative task paths and state the permitted edits, validation and commit policy. Runtime workspace metadata is separate from the child's schema-validated output and truncated result preview; `agent()` still returns only its text or validated object. Completion XML includes an untruncated `<workspaces>` JSON array of deduplicated `{ worktree, cwd? }` records. `cwd` is the actual effective working directory, not a guess from the worktree root or mapped subdirectory; pending requests have no resolved record. Workspace scope is a directive, not a shell sandbox; explicitly configured memory/artifact destinations keep their semantics.
+Use repository-relative task paths and state the permitted edits, validation and commit policy. Runtime workspace metadata is separate from the child's schema-validated output and truncated result preview; `agent()` still returns only its text or validated object. Completion XML includes an untruncated `<workspaces>` JSON array of deduplicated `{ worktree, cwd? }` records, while each completion reports the retained path and change state. `cwd` is the actual effective working directory, not a guess from the worktree root or mapped subdirectory; pending requests have no resolved record. Workspace scope is a directive, not a shell sandbox; explicitly configured memory/artifact destinations keep their semantics.
+
+After a workflow settles, the orchestrating agent owns cleanup: inspect each retained worktree, choose integration or discard, create any needed branch/commit deliberately inside that worktree, then run `git worktree remove` and `git worktree prune` when it is safe to do so.
 
 ### `pipeline()` and `parallel()`
 
@@ -317,7 +319,7 @@ Scripts, journals and transcripts use `sessionArtifactDirectory`: default `join(
 
 Default worktrees live under `<project>/<session>/worktrees/`, sibling to `tasks/`. `worktreeDirectory` independently chooses `{ mode: 'session' }` (default), `{ mode: 'project' }` (`<origin-repository>/.worktrees/`) or `{ mode: 'custom', path: '...' }`. Relative custom paths resolve against the origin repository, never a nested child's worktree. Changes apply to future acquisitions, not existing worktrees; registered branch paths take precedence. A container inside the repository must already be ignored: acquisition fails with an actionable error otherwise, without editing `.gitignore`. Configure both directories in `/agents → Settings`; see [storage settings](../README.md#persistent-settings).
 
-This is extension-artifact storage, independent of an agent's `session_dir`; without an explicit `sessionArtifactDirectory` it follows `PI_CODING_AGENT_SESSION_DIR` into the same `subagents/` container as the child's own session file. Persistent storage does not change anonymous-worktree cleanup; only named worktrees are retained.
+This is extension-artifact storage, independent of an agent's `session_dir`; without an explicit `sessionArtifactDirectory` it follows `PI_CODING_AGENT_SESSION_DIR` into the same `subagents/` container as the child's own session file. Anonymous and named worktrees are both retained; storage settings only decide where newly acquired worktrees are placed.
 
 ### Limits and caps
 

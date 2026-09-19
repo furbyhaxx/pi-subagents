@@ -59,7 +59,7 @@ Then enforce it where it matters:
 | Low — read-only agents | The brief plus a read-only agent type |
 | Medium — one writer at a time | Serialize; run the check suite after |
 | High — parallel writers on related code | A `branch` workspace per agent, merged deliberately |
-| Speculative — may be thrown away | `isolation: "worktree"` (disposable) |
+| Speculative — may be thrown away | `isolation: "worktree"` (retained detached copy; discard explicitly) |
 
 Remember that scope in a prompt is a directive, not a sandbox: an agent with
 `bash` can write anywhere. If the blast radius matters, use isolation and a
