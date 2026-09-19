@@ -11,10 +11,13 @@
  *      type, model, tree and tools it was started with, so the corrective pass
  *      is NOT itself gated — re-verification needs its own gated call.
  *   2. `isolation: "worktree"` is deliberately not used here. An isolated child's
- *      worktree is committed to a branch and removed when it settles, so a later
- *      agent would verify the main tree and could pass while the fix it was
- *      checking lives somewhere else. Isolation is for parallel writers that
- *      would collide; a serial fix-then-verify chain wants one shared tree.
+ *      detached worktree is retained when it settles, but a later fresh agent
+ *      would still verify the main tree and could pass while the fix it was
+ *      checking lives somewhere else. Nothing automatically commits, branches,
+ *      merges, resets, stashes, cleans or removes that worktree; its reported path
+ *      must be explicitly reviewed and integrated or discarded before removal.
+ *      Isolation is for parallel writers that would collide; a serial
+ *      fix-then-verify chain wants one shared tree.
  *
  * args: { task?: string, test?: string }
  *

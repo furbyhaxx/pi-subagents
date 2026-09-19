@@ -1986,13 +1986,13 @@ export default function (pi: ExtensionAPI) {
   // parameter that isn't declared — accepted (TypeBox sets no
   // `additionalProperties: false`) and then silently dropped by the resolver.
   // With no per-result note by design, the model would have every reason to go
-  // on reporting a `pi-agent-*` branch that was never created.
+  // on reporting an isolated workspace that was never created.
   const isolationGuideline = isWorktreeIsolationEnabled()
-    ? `\n- Use isolation: "worktree" without branch for a disposable detached copy; changes are preserved on a reported pi-agent-* branch before removal. With branch: "feat/x", Agent creates or reuses a retained workspace checked out on that exact local branch, with no automatic commit or removal. A missing branch starts at caller HEAD. Creation never copies caller uncommitted changes; reuse exposes the existing workspace changes. Pass branch as a tool argument, not a request to create/switch worktrees. Use repository-relative task paths; state objective, permitted edits, validation and commit policy. Do not ask parallel agents to write the same branch. A fresh call reuses files, not conversation; use resume for conversation continuity. Branch cannot combine with resume or isolation: "off", and fails when worktrees are disabled or the branch is busy.`
+    ? `\n- Use isolation: "worktree" without branch for a fresh detached linked worktree retained after every outcome; completion reports its path. There is no automatic commit, branch creation, merge, reset, stash, clean or removal. Review it explicitly: either integrate its changes and then remove it, or discard and remove it. With branch: "feat/x", Agent creates or reuses a reusable named workspace checked out on that exact local branch. A missing branch starts at caller HEAD. Named workspaces also have no automatic commit, merge, reset, stash, clean or removal. Creation never copies caller uncommitted changes; reuse exposes the existing workspace changes. Pass branch as a tool argument, not a request to create/switch worktrees. Use repository-relative task paths; state objective, permitted edits, validation and commit policy. Do not ask parallel agents to write the same branch. A fresh call reuses files, not conversation; use resume for conversation continuity. Branch cannot combine with resume or isolation: "off", and fails when worktrees are disabled or the branch is busy.`
     : "";
 
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
-    ? `\n- isolation: "worktree" is disposable; changes commit to a reported branch before removal. branch: "feat/x" creates/reuses a retained local-branch workspace, without auto-commit/removal. Creation copies committed files; reuse keeps changes. Pass branch as an argument; use repo-relative paths. One writer per branch; resume continues conversation, not branch reuse.`
+    ? `\n- isolation: "worktree" creates a fresh detached linked worktree retained after every outcome; the result reports its path. No automatic commit, branch creation, merge, reset, stash, clean or removal: review, then integrate and remove it or discard/remove it. branch: "feat/x" creates/reuses a reusable named workspace. New worktrees see committed files only; reuse keeps changes.`
     : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —

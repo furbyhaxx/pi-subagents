@@ -28,12 +28,12 @@ import type { AgentConfig, IsolationMode, JoinMode, ModelThinkingLevel } from ".
 const isolationParamShape = {
   branch: Type.Optional(Type.String({
     minLength: 1,
-    description: 'Exact local Git branch, e.g. "feat/x". Implies worktree isolation. Reuses its existing linked worktree or creates one; a missing branch starts at the caller\'s HEAD. The workspace and existing changes are retained without automatic commit or removal. Reuses files, not conversation. Cannot combine with resume or isolation "off". Fails when worktrees are disabled or the branch is busy.',
+    description: 'Exact local Git branch, e.g. "feat/x". Implies worktree isolation. Reuses its existing linked worktree or creates one; a missing branch starts at the caller\'s HEAD. This is a reusable named workspace; no automatic commit, merge, reset, stash, clean, or removal occurs. Reuses files, not conversation. Cannot combine with resume or isolation "off". Fails when worktrees are disabled or the branch is busy.',
   })),
   isolation: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
       description:
-        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" without branch creates a disposable detached copy; changes are preserved on a reported pi-agent-* branch before removal. With branch, the checked-out workspace is retained without automatic commits. New worktrees cannot see uncommitted or staged changes in the caller; reused named worktrees keep their existing changes.',
+        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" without branch creates a fresh detached linked worktree retained after every outcome; completion reports its path. No automatic commit, branch creation, merge, reset, stash, clean, or removal occurs. The orchestrating agent must review it and explicitly either integrate its changes and then remove it, or discard and remove it. With branch, the checked-out workspace is a reusable named workspace. New worktrees cannot see uncommitted or staged changes in the caller; reused named worktrees keep their existing changes.',
     }),
   ),
 };

@@ -446,10 +446,27 @@ describe("buildAgentPrompt", () => {
       expect(prompt).toContain("Checked-out branch: feat/x");
       expect(prompt).toContain("Workspace: reused; retained after this run");
       expect(prompt).toContain("existing uncommitted changes are present");
-      expect(prompt).toContain("No automatic commit, merge or removal occurs");
+      expect(prompt).toContain("reusable workspace");
+      expect(prompt).toContain("No automatic commit, merge, reset, stash, clean or removal occurs");
       expect(prompt.indexOf("<worktree_scope>")).toBeGreaterThan(prompt.indexOf("Custom instructions."));
       expect(prompt.endsWith("</worktree_scope>")).toBe(true);
     }
+  });
+
+  it("tells anonymous worktree agents that detached workspaces remain for explicit review", () => {
+    const worktree: WorktreeInfo = {
+      lifecycle: "ephemeral", sourceRoot: "/repo", commonDir: "/repo/.git", reused: false, initialDirty: false,
+      branch: "fix-tests", path: "/worktrees/fix-tests", workPath: "/worktrees/fix-tests", baseSha: "abc",
+    };
+    const prompt = buildAgentPrompt(getDefaultConfig("general-purpose"), worktree.path, env, undefined, { worktree });
+
+    expect(prompt).toContain("Checkout: detached HEAD");
+    expect(prompt).toContain("Workspace: created; retained after this run");
+    expect(prompt).toContain("No automatic commit, branch creation, merge, reset, stash, clean or removal occurs");
+    expect(prompt).toContain("either integrate its changes and then remove it, or discard and remove it");
+    expect(prompt).toContain("Report the worktree path");
+    expect(prompt).not.toContain("disposable");
+    expect(prompt).not.toContain("automatically preserved");
   });
 
   describe("workflow child block", () => {

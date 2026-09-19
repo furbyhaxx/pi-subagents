@@ -322,9 +322,15 @@ describe("toolDescriptionMode", () => {
       const tools = setup();
       expect(props(tools)).toContain("isolation");
       expect(props(tools)).toContain("branch");
-      expect(tools.get("Agent").description).toContain('Use isolation: "worktree"');
-      expect(tools.get("Agent").description).toContain("retained workspace");
-      expect(tools.get("Agent").description).toContain("no automatic commit or removal");
+      const description: string = tools.get("Agent").description;
+      expect(description).toContain('Use isolation: "worktree"');
+      expect(description).toContain("fresh detached linked worktree retained after every outcome");
+      expect(description).toContain("completion reports its path");
+      expect(description).toContain("no automatic commit, branch creation, merge, reset, stash, clean or removal");
+      expect(description).toContain("either integrate its changes and then remove it, or discard and remove it");
+      expect(description).toContain("reusable named workspace");
+      expect(description).not.toContain("disposable");
+      expect(description).not.toContain("reported pi-agent-*");
     });
 
     it("drops both when worktree isolation is disabled", () => {
@@ -340,8 +346,13 @@ describe("toolDescriptionMode", () => {
 
     it("drops the compact description's bullet too", () => {
       const enabled = setup({ toolDescriptionMode: "compact" });
-      expect(enabled.get("Agent").description).toContain('isolation: "worktree"');
-      expect(enabled.get("Agent").description).toContain("retained local-branch workspace");
+      const description: string = enabled.get("Agent").description;
+      expect(description).toContain('isolation: "worktree"');
+      expect(description).toContain("fresh detached linked worktree retained after every outcome");
+      expect(description).toContain("reports its path");
+      expect(description).toContain("review, then integrate and remove it or discard/remove it");
+      expect(description).toContain("reusable named workspace");
+      expect(description).not.toContain("disposable");
     });
 
     it("compact mode says nothing about isolation when disabled", () => {

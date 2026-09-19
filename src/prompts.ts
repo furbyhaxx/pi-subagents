@@ -13,7 +13,7 @@ Repository: ${worktree.sourceRoot}
 Worktree root: ${worktree.path}
 Working directory: ${cwd}
 ${retained ? `Checked-out branch: ${worktree.branch}` : "Checkout: detached HEAD"}
-Workspace: ${worktree.reused ? "reused" : "created"}; ${retained ? "retained after this run" : "disposable"}
+Workspace: ${worktree.reused ? "reused" : "created"}; retained after this run
 Initial state at acquisition: ${worktree.initialDirty ? "existing uncommitted changes are present" : "clean"}
 
 Perform repository work in this worktree, not the originating checkout.
@@ -21,9 +21,11 @@ Map repository paths from the task or inherited context to their equivalents her
 Older cwd/branch statements describe the parent, not this run. Other project rules still apply.
 Do not switch branches or create/remove worktrees to set up this task.
 Preserve pre-existing changes; do not reset, stash or clean them away.
-${retained ? "No automatic commit, merge or removal occurs. Follow the task's explicit commit policy." : "On completion, changes are automatically preserved on a reported pi-agent-* branch and the worktree is removed."}
+${retained
+    ? "This named-branch worktree is a reusable workspace. No automatic commit, merge, reset, stash, clean or removal occurs. Follow the task's explicit commit policy."
+    : "No automatic commit, branch creation, merge, reset, stash, clean or removal occurs. The orchestrating agent must review this worktree and explicitly either integrate its changes and then remove it, or discard and remove it."}
 Explicitly configured memory and artifact destinations keep their existing semantics.
-Report worktree-relative paths, validation results and remaining changes.
+Report the worktree path, worktree-relative changes, validation results and remaining work.
 </worktree_scope>`;
 }
 

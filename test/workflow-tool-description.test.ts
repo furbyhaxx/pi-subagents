@@ -130,6 +130,19 @@ describe("the examples it ships", () => {
   });
 });
 
+describe("the worktree lifecycle it documents", () => {
+  it("retains anonymous worktrees for explicit review and releases leases after gates", () => {
+    expect(description).toContain("fresh detached linked worktree retained after every outcome");
+    expect(description).toContain("Completion reports its path");
+    expect(description).toContain("No automatic commit, branch creation, merge, reset, stash, clean or removal occurs");
+    expect(description).toContain("either integrate its changes then remove it, or discard and remove it");
+    expect(description).toContain("reusable named linked worktree");
+    expect(description).toContain("before workspace lease release");
+    expect(description).not.toContain("disposable detached");
+    expect(description).not.toContain("before worktree cleanup");
+  });
+});
+
 describe("the limits it quotes", () => {
   it("quotes the real agent and item caps", () => {
     expect(description).toContain(`capped at ${WORKFLOW_AGENT_CAP}`);

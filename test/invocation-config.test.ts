@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
+import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
 import type { AgentConfig } from "../src/types.js";
 
 function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -17,6 +17,21 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     ...overrides,
   };
 }
+
+describe("isolationParam", () => {
+  it("documents retained detached worktrees and explicit orchestration", () => {
+    const shape = isolationParam(true);
+    const description = shape.isolation?.description ?? "";
+
+    expect(description).toContain("fresh detached linked worktree retained after every outcome");
+    expect(description).toContain("completion reports its path");
+    expect(description).toContain("No automatic commit, branch creation, merge, reset, stash, clean, or removal occurs");
+    expect(description).toContain("either integrate its changes and then remove it, or discard and remove it");
+    expect(description).toContain("reusable named workspace");
+    expect(description).not.toContain("disposable");
+    expect(description).not.toContain("reported pi-agent-*");
+  });
+});
 
 describe("resolveAgentInvocationConfig", () => {
   it("lets an explicit model replace config while other locked fields stay authoritative", () => {
