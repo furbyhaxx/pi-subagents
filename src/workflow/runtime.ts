@@ -159,12 +159,12 @@ export interface WorkflowSpawnResult {
    */
   cwd?: string;
   /**
-   * The outcome of this agent's `gate`, when the host already ran it.
+   * The outcome of this agent's `gate`, when the host handled it.
    *
-   * Set only by a host that ran the command itself — inside the child's
-   * worktree, while that directory still existed. Its presence is what tells
-   * {@link applyGate} the command has already been executed; the pass/fail
-   * decision and the error shaping still happen there, in one place.
+   * A host may run the command inside the child's still-live worktree or reject
+   * it because a prerequisite such as background-job quiescence failed. Its
+   * presence tells {@link applyGate} not to execute a fallback; pass/fail and
+   * error shaping still happen there, in one place.
    */
   gate?: WorkflowGateResult;
 }
@@ -498,10 +498,10 @@ interface CompletedChild {
  * becomes the error, because that is the thing worth reading.
  *
  * The single place that decides whether a gate passed. The command may have
- * been run by the host instead (inside a worktree that no longer exists by
- * now), but only ever by one of the two: a host that ran it says so with
- * `result.gate`, and this then shapes that outcome rather than running it
- * again.
+ * been handled by the host instead (inside a worktree that no longer exists by
+ * now, or rejected before execution when a prerequisite failed), but only ever
+ * by one of the two: a host that handled it says so with `result.gate`, and this
+ * shapes that outcome rather than running it again.
  */
 /**
  * Hold a schema'd result to its schema, host-side.

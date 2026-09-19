@@ -247,6 +247,12 @@ export interface AgentRecord {
   /** Worktree cleanup result after agent completion. */
   worktreeResult?: WorktreeCleanupResult;
   /**
+   * Why anonymous background-job quiescence failed before worktree settlement.
+   * Machine-readable by workflow hosts so a skipped pre-cleanup gate cannot be
+   * mistaken for a gate the host declined to run.
+   */
+  worktreeQuiescenceError?: string;
+  /**
    * The tool_use_id from the original Agent call, including a nested child's
    * invoking Agent call so transcript viewers can resolve that child.
    */

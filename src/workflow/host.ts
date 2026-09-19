@@ -28,9 +28,10 @@
  *     run `npm test` in is the main one — which would report on code the child
  *     never wrote. So the gate runs from `onBeforeWorktreeCleanup`, inside that
  *     settle (before lease release for retained trees), and the verdict travels
- *     back on the spawn result. `runGate` still
- *     exists for a child that had no worktree; the runtime uses whichever of
- *     the two happened, never both.
+ *     back on the spawn result. If prerequisite quiescence fails, that failure
+ *     travels as the verdict instead. `runGate` still exists for a child that
+ *     had no worktree; the runtime uses whichever outcome the host reports,
+ *     never both.
  */
 
 import { existsSync } from "node:fs";
@@ -251,11 +252,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       }
 
       /**
-       * The gate's verdict, set only if the hook below actually ran the command.
-       * Its presence is what stops the runtime running the gate a second time,
-       * so it is set on the failure route too — a gate we tried and could not
-       * complete is a failed gate, never an un-run one that then re-runs
-       * against the wrong tree.
+       * The gate's verdict, set if the hook ran the command or the manager
+       * reports that its quiescence prerequisite failed. Its presence stops the
+       * runtime running the gate after lease release against the wrong tree.
        */
       let gate: WorkflowGateResult | undefined;
       let spawnedId: string | undefined;
@@ -368,6 +367,18 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             reportResolved();
           },
         );
+        if (
+          gate === undefined &&
+          command !== undefined &&
+          succeeded(record) &&
+          record.worktree !== undefined &&
+          record.worktreeQuiescenceError !== undefined
+        ) {
+          gate = {
+            ok: false,
+            output: `Background-job termination could not be confirmed (${record.worktreeQuiescenceError}). Worktree retained at \`${record.worktree.path}\`.`,
+          };
+        }
         return { ...toSpawnResult(record), ...(gate !== undefined ? { gate } : {}) };
       } catch (error) {
         // Strict worktree isolation rejects out of `awaitStartup` — the child

@@ -34,6 +34,7 @@ import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "../src/workflow/progress.js";
 import { runWorkflow, type WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { ctx } from "./helpers/boot-extension.js";
+import { createTestEventBus, type TestEventBus } from "./helpers/event-bus.js";
 
 /** What the child leaves behind, and the thing a correct gate can see. */
 const CHILD_FILE = "child-work.txt";
@@ -92,6 +93,30 @@ function makePi(gate: (command: string) => ExecResult | Promise<ExecResult> = ()
 
 const execOk = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0, killed: false });
 const execFail = (stderr: string): ExecResult => ({ stdout: "", stderr, code: 1, killed: false });
+
+/** Expose the background-jobs family and fail its worktree stop request. */
+function failQuiescence(
+  pi: {
+    events?: TestEventBus;
+    getAllTools?: () => { name: string; sourceInfo: { path: string; source: string } }[];
+  },
+  error: string,
+): void {
+  const bus = createTestEventBus();
+  bus.on("background-jobs:rpc:ping", (raw) => {
+    const { requestId } = raw as { requestId: string };
+    bus.emit(`background-jobs:rpc:ping:reply:${requestId}`, { success: true, data: { version: 1 } });
+  });
+  bus.on("background-jobs:rpc:stop-worktree", (raw) => {
+    const { requestId } = raw as { requestId: string };
+    bus.emit(`background-jobs:rpc:stop-worktree:reply:${requestId}`, { success: false, error });
+  });
+  pi.events = bus;
+  pi.getAllTools = () => ["bash", "job_list", "job_output", "job_stop"].map(name => ({
+    name,
+    sourceInfo: { path: "/ext/pi-background-jobs/src/index.ts", source: "extension" },
+  }));
+}
 
 /** A git repo with one commit, so `git worktree add` has a HEAD to copy. */
 function initRepo(): string {
@@ -257,6 +282,29 @@ describe("gate on an isolated child", () => {
 
     expect(result.gate?.ok).toBe(false);
     expect(result.gate?.output).toMatch(/timed out/);
+  });
+
+  it("does not fall back to a gate after background-job quiescence fails", async () => {
+    const { pi, gateRuns } = makePi();
+    failQuiescence(pi, "cannot signal pid");
+    const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
+
+    const result = await runWorkflow({
+      script: `${HEAD}return await agent("x", { gate: "npm test", isolation: "worktree" });`,
+      host,
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.value).toBeNull();
+    expect(gateRuns).toEqual([]);
+    const entry = agentEntries(result.progress).at(-1);
+    expect(entry?.state).toBe("error");
+    expect(entry?.error).toContain("Background-job termination could not be confirmed");
+    expect(entry?.error).toContain("cannot signal pid");
+    const record = manager.listAgents()[0];
+    expect(entry?.error).toContain(`Worktree retained at \`${record.worktree!.path}\``);
+    expect(record.worktreeQuiescenceError).toContain("cannot signal pid");
+    expect(existsSync(record.worktree!.path)).toBe(true);
   });
 
   it("treats a gate that could not run at all as a failed gate, not an un-run one", async () => {

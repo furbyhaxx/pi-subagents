@@ -1096,7 +1096,9 @@ export class AgentManager {
           const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
           if (jobs?.outcome === "failed") {
             // A gate cannot certify a workspace that may still be changing.
-            // Keep conservative metadata and release without gate or verification.
+            // Keep a machine-readable failure so workflow hosts do not mistake
+            // the skipped hook for a gate they should run after lease release.
+            record.worktreeQuiescenceError = jobs.error;
             record.worktreeResult = retainedWorktreeResult(record.worktree);
             releaseWorktreeLease(record.worktree);
             record.result = (record.result ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
@@ -1144,6 +1146,7 @@ export class AgentManager {
           await this.stopOwnedChildren(id);
           const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
           if (jobs?.outcome === "failed") {
+            record.worktreeQuiescenceError = jobs.error;
             record.worktreeResult = retainedWorktreeResult(record.worktree);
             releaseWorktreeLease(record.worktree);
             record.error = (record.error ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
@@ -1499,9 +1502,11 @@ export class AgentManager {
 
   private async finishWorktreeResume(record: AgentRecord): Promise<void> {
     const worktree = record.worktree!;
+    delete record.worktreeQuiescenceError;
     const jobs = await this.stopEphemeralWorktreeJobs(this.worktreeApis.get(record.id), record);
     if (jobs?.outcome === "failed") {
       // Same rule as the spawn paths: no confirmed termination, no verification.
+      record.worktreeQuiescenceError = jobs.error;
       record.worktreeResult = retainedWorktreeResult(worktree);
       releaseWorktreeLease(worktree);
       const note = worktreeJobsRetainedNote(worktree, jobs.error);

@@ -1297,6 +1297,7 @@ describe("AgentManager — background jobs before ephemeral worktree lease relea
     // The child's own outcome is untouched — this is a cleanup failure.
     expect(record.status).toBe("completed");
     expect(record.jobsPossible).toBe(true);
+    expect(record.worktreeQuiescenceError).toBe("background-jobs stop-worktree failed: cannot signal pid");
     expect(record.worktreeResult?.path).toBe("/wt/jobs");
     expect(record.result).toContain("could not be stopped (background-jobs stop-worktree failed: cannot signal pid)");
     expect(record.result).toContain("Worktree retained at `/wt/jobs`; change state was not verified before lease release.");
