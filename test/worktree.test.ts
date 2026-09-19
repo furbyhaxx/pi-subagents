@@ -10,6 +10,7 @@ import {
   isWorktreeIsolationEnabled,
   pruneWorktrees,
   setWorktreeIsolationEnabled,
+  WorktreeAcquisitionError,
 } from "../src/worktree.js";
 
 /**
@@ -152,6 +153,35 @@ describe("worktree", () => {
         "timed-out",
       );
       expect(wt).toBeUndefined();
+    });
+
+    it("surfaces the acquired path when post-add verification fails", async () => {
+      const real = mockPi();
+      let added = false;
+      const postAddFailure = {
+        exec: vi.fn(async (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => {
+          if (added && args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+            return { stdout: "", stderr: "verification failed", code: 128, killed: false };
+          }
+          const result = await real.exec(command, args, options);
+          if (args[0] === "worktree" && args[1] === "add" && result.code === 0) added = true;
+          return result;
+        }),
+      } as unknown as ExtensionAPI;
+
+      let failure: unknown;
+      try {
+        await createWorktree(postAddFailure, repoDir, "verify-fails");
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toBeInstanceOf(WorktreeAcquisitionError);
+      const acquired = (failure as WorktreeAcquisitionError).worktree;
+      expect(acquired.path).toContain("pi-agent-verify-fails");
+      expect(existsSync(acquired.path)).toBe(true);
+      expect((failure as Error).message).toContain(acquired.path);
+      execFileSync("git", ["worktree", "remove", "--force", acquired.path], { cwd: repoDir, stdio: "pipe" });
     });
 
     it("workPath equals path when created from the repo root", async () => {

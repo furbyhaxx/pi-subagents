@@ -84,6 +84,21 @@ export interface WorktreeCleanupResult {
 }
 
 /**
+ * A linked worktree was added, but its post-add verification did not complete.
+ * The scope is recovery metadata: callers must retain and report it rather than
+ * treating this like a failure that happened before Git acquired a path.
+ */
+export class WorktreeAcquisitionError extends Error {
+  override readonly name = "WorktreeAcquisitionError";
+  readonly code = "worktree_acquired";
+
+  constructor(readonly worktree: WorktreeInfo, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Worktree acquired at ${worktree.path}, but verification failed: ${detail}`, { cause });
+  }
+}
+
+/**
  * Run git and return its trimmed stdout, throwing on failure so callers keep
  * the try/catch control flow `execFileSync` gave them.
  *
@@ -349,9 +364,13 @@ export async function createWorktree(
       releaseWorktreeLease(scope);
       return undefined;
     }
-    scope.initialDirty = await verifyWorktree(pi, scope);
-    scope.baseSha = await git(pi, scope.path, ["rev-parse", "HEAD"], 5000);
-    return scope;
+    try {
+      scope.initialDirty = await verifyWorktree(pi, scope);
+      scope.baseSha = await git(pi, scope.path, ["rev-parse", "HEAD"], 5000);
+      return scope;
+    } catch (error) {
+      throw new WorktreeAcquisitionError(scope, error);
+    }
   } catch (error) {
     releaseWorktreeLease(scope);
     throw error;

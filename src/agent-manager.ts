@@ -32,7 +32,7 @@ import type { ModelTransition, RetryModelCandidate } from "./pi-retry-adapter.js
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, ModelThinkingLevel, SubagentType } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, releaseWorktreeLease, resumeWorktree, type WorktreeCleanupResult, type WorktreeInfo } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, releaseWorktreeLease, resumeWorktree, type WorktreeAcquisitionError, type WorktreeCleanupResult, type WorktreeInfo } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -54,6 +54,13 @@ function retainedWorktreeResult(worktree: WorktreeInfo): WorktreeCleanupResult {
     path: worktree.path,
     retained: true,
   };
+}
+
+/** Narrow the typed post-add failure without requiring runtime mock wiring. */
+function isWorktreeAcquisitionError(error: unknown): error is WorktreeAcquisitionError {
+  return error instanceof Error &&
+    "code" in error && error.code === "worktree_acquired" &&
+    "worktree" in error && typeof error.worktree === "object" && error.worktree !== null;
 }
 
 /** Human-readable settlement note without claiming unverified Git state. */
@@ -446,9 +453,6 @@ export class AgentManager {
   private onUsage?: OnAgentUsage;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
-  /** Base repos worktrees were created from — so dispose() can prune them all,
-   *  not just the parent repo (caller-supplied cwd can target other repos). */
-  private worktreeRepos = new Set<string>();
   private worktreeApis = new Map<string, ExtensionAPI>();
   /** Includes settlement/gates, even after a record has a terminal display status. */
   private activeRuns = new Set<string>();
@@ -854,6 +858,13 @@ export class AgentManager {
           );
         }
       } catch (error) {
+        if (isWorktreeAcquisitionError(error)) {
+          record.worktree = error.worktree;
+          record.worktreeResult = retainedWorktreeResult(error.worktree);
+          record.effectiveCwd = error.worktree.workPath;
+          releaseSlot();
+          throw new Error(`${error.message}${worktreeRetainedNote(error.worktree, record.worktreeResult)}`, { cause: error });
+        }
         releaseSlot();
         throw error;
       }
@@ -869,7 +880,6 @@ export class AgentManager {
       // subdirectory, silently dropping extensions/skills.
       worktreeCwd = wt.lifecycle === "retained" || customCwd !== undefined ? wt.workPath : wt.path;
       this.worktreeApis.set(id, pi);
-      this.worktreeRepos.add(baseCwd);
 
       // No longer "running" means a stop landed while the copy was being made
       // (abort(), abortAll()) — a window that did not exist when creation was
@@ -1081,26 +1091,25 @@ export class AgentManager {
         // them before running a gate or releasing the branch's writer lease.
         if (record.worktree) await this.stopOwnedChildren(id);
 
-        // Quiesce, verify, report, and release the worktree lease if used.
+        // Quiesce, gate, verify, report, and release the worktree lease if used.
         if (record.worktree) {
-          // The child is done writing, but the lease is still held. try/catch,
-          // not decoration: a hook that throws must not block settlement.
-          if (options.onBeforeWorktreeCleanup) {
-            try {
-              await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
-            } catch { /* ignore — never block cleanup */ }
-          }
           const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
           if (jobs?.outcome === "failed") {
-            // Termination could not be confirmed, so change state stays
-            // conservative and the lease is released without verification. The
-            // quiescence failure travels in prose; the child outcome is unchanged.
+            // A gate cannot certify a workspace that may still be changing.
+            // Keep conservative metadata and release without gate or verification.
             record.worktreeResult = retainedWorktreeResult(record.worktree);
             releaseWorktreeLease(record.worktree);
             record.result = (record.result ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
           } else {
             if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
               record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
+            }
+            // Anonymous jobs are now stopped; named worktrees deliberately skip
+            // implicit job control. In both cases the lease remains held here.
+            if (options.onBeforeWorktreeCleanup) {
+              try {
+                await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
+              } catch { /* ignore — never block settlement */ }
             }
             const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
@@ -1946,12 +1955,7 @@ export class AgentManager {
     }
   }
 
-  /**
-   * @param pi - Needed to run `git worktree prune`, which is async now and so
-   *   cannot be reached through a stored spawn argument at shutdown. Omitting
-   *   it (tests, teardown of a manager that never spawned) skips the prune.
-   */
-  async dispose(pi?: ExtensionAPI): Promise<void> {
+  async dispose(_pi?: ExtensionAPI): Promise<void> {
     clearInterval(this.cleanupInterval);
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
@@ -1969,17 +1973,6 @@ export class AgentManager {
       ]);
     }
     const sessions = [...this.agents.values()].map(record => record.session);
-    if (pi) {
-      // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
-      // on the shutdown path, which cannot wait for git. Started before the awaited
-      // shutdown below rather than after it, so the git calls have that window to
-      // finish in instead of racing the process exit that follows.
-      const prune = (repo: string) => { pruneWorktrees(pi, repo).catch(() => {}); };
-      prune(process.cwd());
-      // Also prune repos that caller-supplied cwds created worktrees in — a clean
-      // exit with in-flight agents would otherwise leave stale registrations there.
-      for (const repo of this.worktreeRepos) prune(repo);
-    }
     // Awaited, unlike the eviction path: pi awaits this extension's `session_shutdown`
     // handler and the process exits right after it returns, so anything left unawaited
     // here never runs at all. Bounded — each call carries its own ceiling, concurrently.

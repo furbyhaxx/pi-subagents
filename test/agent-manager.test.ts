@@ -19,7 +19,6 @@ vi.mock("../src/worktree.js", () => ({
     path: worktree.path,
     retained: true,
   })),
-  pruneWorktrees: vi.fn(),
   isWorktreeIsolationEnabled: vi.fn(() => true),
   releaseWorktreeLease: vi.fn(),
   resumeWorktree: vi.fn(),
@@ -931,6 +930,32 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(record.result).toContain("Workspace retained at `/wt/a` on its detached HEAD");
   });
 
+  it("reports conservative retained metadata when verification fails after add", async () => {
+    const { createWorktree } = await import("../src/worktree.js");
+    const wt = {
+      path: "/wt/acquired", workPath: "/wt/acquired", branch: "pi-agent-acquired", baseSha: "abc",
+      lifecycle: "ephemeral", sourceRoot: "/tmp", commonDir: "/tmp/.git", reused: false, initialDirty: false,
+    } as const;
+    const failure = Object.assign(new Error("verification failed"), {
+      code: "worktree_acquired",
+      worktree: wt,
+    });
+    vi.mocked(createWorktree).mockRejectedValueOnce(failure);
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "test", {
+      description: "test", isBackground: true, isolation: "worktree",
+    });
+    const record = manager.getRecord(id)!;
+
+    await expect(manager.awaitStartup(id)).rejects.toThrow(
+      /verification failed[\s\S]*Workspace retained at `\/wt\/acquired`/,
+    );
+    expect(record.worktree).toBe(wt);
+    expect(record.effectiveCwd).toBe(wt.workPath);
+    expect(record.worktreeResult).toEqual({ hasChanges: true, path: wt.path, retained: true });
+  });
+
   it("a stop that lands during the copy retains the worktree without running", async () => {
     // Window that did not exist when creation was synchronous: abort() can mark
     // the record stopped while the repo is still being copied.
@@ -1219,7 +1244,7 @@ describe("AgentManager — background jobs before ephemeral worktree lease relea
     }));
   });
 
-  it("stops the worktree's jobs before lease release and reports the ids", async () => {
+  it("orders anonymous jobs, gate, then settlement", async () => {
     const bus = createTestEventBus();
     const { stops } = companion(bus, [{ kind: "ok", stopped: ["job-00000001", "job-00000002"] }]);
     const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
@@ -1236,10 +1261,11 @@ describe("AgentManager — background jobs before ephemeral worktree lease relea
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
       isolation: "worktree",
+      onBeforeWorktreeCleanup: async () => { order.push("gate"); },
     });
 
     expect(stops).toEqual([{ requestId: expect.any(String), path: "/wt/jobs" }]);
-    expect(order).toEqual(["stop", "cleanup"]);
+    expect(order).toEqual(["stop", "gate", "cleanup"]);
     expect(record.result).toContain(
       "Stopped 2 background job(s) still running in the worktree: job-00000001, job-00000002.",
     );
@@ -1257,12 +1283,15 @@ describe("AgentManager — background jobs before ephemeral worktree lease relea
     vi.mocked(releaseWorktreeLease).mockClear();
     resolvedRun();
 
+    const gate = vi.fn(async () => {});
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
       isolation: "worktree",
+      onBeforeWorktreeCleanup: gate,
     });
 
+    expect(gate).not.toHaveBeenCalled();
     expect(cleanupWorktree).not.toHaveBeenCalled();
     expect(releaseWorktreeLease).toHaveBeenCalledWith(wt);
     // The child's own outcome is untouched — this is a cleanup failure.
@@ -2407,31 +2436,14 @@ describe("AgentManager — waitForAll", () => {
   });
 });
 
-describe("AgentManager — dispose prunes worktree repos", () => {
-  it("prunes the process cwd and every repo a worktree was created from", async () => {
-    // Pruning needs pi (the git call is async now), so it is handed in at
-    // dispose. A manager disposed without one just skips it.
-    const { createWorktree, pruneWorktrees } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockResolvedValueOnce({
-      path: "/wt/copy", branch: "b", baseSha: "abc", workPath: "/wt/copy",
-    });
-    vi.mocked(pruneWorktrees).mockClear().mockResolvedValue(undefined);
-    resolvedRun();
-
+describe("AgentManager — dispose retains worktree registrations", () => {
+  it("does not execute repository-wide prune during shutdown", async () => {
+    const exec = vi.fn(async () => ({ stdout: "", stderr: "", code: 0, killed: false }));
     const manager = new AgentManager();
-    const id = manager.spawn(mockPi, mockCtx, "X", "p", {
-      description: "p", cwd: "/", isolation: "worktree",
-    });
-    await manager.awaitStartup(id);
-    await manager.getRecord(id)!.promise;
 
-    manager.dispose();
-    expect(pruneWorktrees).not.toHaveBeenCalled();
+    await manager.dispose({ exec } as never);
 
-    manager.dispose(mockPi);
-    expect(pruneWorktrees).toHaveBeenCalledWith(mockPi, process.cwd());
-    // The caller-supplied cwd's repo too — that is where its worktree lived.
-    expect(pruneWorktrees).toHaveBeenCalledWith(mockPi, "/");
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

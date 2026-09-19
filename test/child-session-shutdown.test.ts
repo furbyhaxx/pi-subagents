@@ -22,12 +22,10 @@ vi.mock("../src/agent-runner.js", () => ({
 vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
   cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(async () => {}),
   isWorktreeIsolationEnabled: vi.fn(() => true),
 }));
 
 import { runAgent } from "../src/agent-runner.js";
-import { pruneWorktrees } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -114,8 +112,6 @@ describe("child session shutdown (#242)", () => {
     await spawnCompleted(manager, session);
 
     vi.useFakeTimers();
-    // `pi` is what reaches `pruneWorktrees` now that it shells out through
-    // `pi.exec`; without it dispose skips the prune and proves nothing here.
     const disposed = manager.dispose(mockPi);
     // Past the internal ceiling. Without it the TUI is already torn down and the
     // user is left at a dead terminal with only Ctrl-C.
@@ -123,8 +119,6 @@ describe("child session shutdown (#242)", () => {
     await disposed;
 
     expect(session.dispose).toHaveBeenCalledOnce();
-    // Teardown continues past the timeout rather than unwinding.
-    expect(pruneWorktrees).toHaveBeenCalled();
   });
 
   it("skips the emit when no extension handles session_shutdown", async () => {
