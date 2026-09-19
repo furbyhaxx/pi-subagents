@@ -101,7 +101,7 @@ so `.filter(Boolean)` before using results.
 | `agentType` | Which agent definition; defaults to `general-purpose`. **An unknown name falls back silently** — option keys are validated, values are not |
 | `model` | `provider/modelId[:thinking]` or fuzzy. Replaces the definition's fallback list; omit normally |
 | `effort` | `minimal`…`max`; omitted, the definition's `thinking` decides, then the parent's. Use `low` for mechanical stages, high tiers for verify/judge |
-| `isolation: "worktree"` | Disposable copy — expensive; use when parallel edits would collide |
+| `isolation: "worktree"` | Retained detached copy — expensive; use when parallel edits would collide |
 | `branch` | Retained workspace on an exact local branch |
 | `gate` | Shell command run after the agent finishes, in its effective cwd |
 | `resume` | Continue the child that ran under that label |
@@ -121,7 +121,7 @@ const fixed = await agent('Fix the failing test in src/parser.ts.', { label: 'fi
 ```
 
 The gate runs in the child's effective working directory after it finishes and
-**before** worktree cleanup or branch-lease release. A non-zero exit marks the
+**before** worktree settlement and lease release. A non-zero exit marks the
 agent failed and the command output becomes the error.
 
 Prefer `gate: 'npm test'` to asking another agent whether the code looks right. A
@@ -185,8 +185,12 @@ await agent('Review src/x.ts and report remaining issues. Do not edit.', { branc
 
 Sequential calls on one branch share files, not conversation. The same lease
 applies: never give two concurrent calls the same branch. Gates hold the lease
-while verifying. Completion, failure and cancellation release it without
-committing, resetting, stashing or deleting anything.
+while verifying. Success, turn limit, abort, stop, failure, cancellation and
+shutdown release it without committing, creating a preservation branch, merging,
+resetting, stashing, cleaning, deleting or pruning anything. The completion reports the retained path
+and change state. The orchestrating agent must review it, choose integration or
+discard, create any needed branch/commit deliberately inside it, then remove and
+prune it.
 
 ## Patterns
 

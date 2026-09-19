@@ -1,6 +1,6 @@
 ---
 name: executing-work-with-subagents
-description: Turn real work into subagent-executable batches — splitting plan or feature tasks into units that fit one agent's context, deciding what runs sequentially vs in parallel, keeping write scopes disjoint so parallel agents cannot collide, choosing disposable worktrees vs retained branches vs the shared checkout, gating each batch on a command that must pass, and choosing between Agent calls and SubagentWorkflow. Use this whenever a multi-step implementation, migration, refactor, audit, review or research job is about to be delegated, when a plan's tasks are too large for one agent, when agents might write the same files, or when someone says "split this up", "do these in parallel", "use worktrees" or "work through this plan".
+description: Turn real work into subagent-executable batches — splitting plan or feature tasks into units that fit one agent's context, deciding what runs sequentially vs in parallel, keeping write scopes disjoint so parallel agents cannot collide, choosing detached worktrees vs named branches vs the shared checkout, gating each batch on a command that must pass, and choosing between Agent calls and SubagentWorkflow. Use this whenever a multi-step implementation, migration, refactor, audit, review or research job is about to be delegated, when a plan's tasks are too large for one agent, when agents might write the same files, or when someone says "split this up", "do these in parallel", "use worktrees" or "work through this plan".
 ---
 
 # Executing work with subagents
@@ -92,8 +92,8 @@ Batch shapes, dependency graphs, fan-out patterns and what a barrier costs:
 | Mode | Use when | Cost |
 |---|---|---|
 | Shared checkout (default) | Read-only work, or a single writer | None; no protection either |
-| `isolation: "worktree"` | Speculative or risky writes you may throw away | Copy setup + disk; changes preserved on a `pi-agent-*` branch, worktree removed |
-| `branch: "feat/x"` | Multi-step work on one line, reused across calls | Retained workspace; nothing auto-commits or removes it |
+| `isolation: "worktree"` | Speculative or risky writes you may throw away | Retained detached copy; nothing auto-commits, branches or removes it |
+| `branch: "feat/x"` | Multi-step work on one line, reused across calls | Retained named workspace; nothing auto-commits or removes it |
 
 **Isolation is not free, and whoever asked for it should be told the price.**
 Every worktree is a full checkout: seconds to minutes of setup and a whole copy
@@ -109,18 +109,21 @@ or when the main checkout must stay usable; otherwise a shared checkout with one
 writer is faster and simpler.
 
 Work in a worktree is not done when the agent finishes — it is done when it has
-been reviewed, merged back, re-checked, and the copy is off the disk. Two facts
-that decide how that goes, both easy to find out too late:
+been reviewed, deliberately integrated or discarded, re-checked when integrated,
+and removed from disk. Every extension-created worktree stays retained after
+success, turn limit, abort, stop, failure, cancellation and shutdown. Anonymous
+worktrees stay detached. The extension never auto-commits, creates a preservation
+branch, merges, resets, stashes, cleans, removes or prunes them.
 
-- **The automatic preservation commit uses `--no-verify`.** Your pre-commit hooks
-  never ran on an agent branch, so re-run the project's checks in the main
-  checkout after merging — not only inside the workspace.
-- **A workspace cannot be removed out from under a live agent**, and a worktree
-  with running background jobs is not safe to delete either.
+Completion reports the retained path and change state. The orchestrating agent
+owns the next steps: inspect the tree, choose integration or discard, create a
+branch/commit deliberately inside it when integration requires one, then remove
+and prune it. A workspace cannot be removed out from under a live agent, and an
+anonymous worktree's background jobs are quiesced before its lease is released.
 
-The full procedure — inventory, review, merge from the main checkout, `git
+The full procedure — inventory, review, deliberate integration or discard, `git
 worktree remove` / `prune`, `git branch -d` — is in
-[reviewing, merging and cleaning up](references/worktrees-and-branches.md#reviewing-merging-and-cleaning-up).
+[reviewing, integrating and cleaning up](references/worktrees-and-branches.md#reviewing-integrating-and-cleaning-up).
 
 Three rules that cause most of the pain when ignored:
 
@@ -185,7 +188,7 @@ the next job; that irrelevant context is not free, and it biases the new work.
 | Pattern | Why it fails |
 |---|---|
 | Delegating a plan task verbatim | Feature-sized; the agent runs out of context and returns a `steered` partial |
-| Merging an agent branch without reading it | The preservation commit bypassed your hooks; nothing has validated it |
+| Integrating a retained worktree without reading it | The completion report is a location and state claim, not validation |
 | Leaving worktrees on disk after merging | Copies accumulate silently, and a stale one gets reused or reviewed by mistake |
 | Fanning out before scouting | You cannot size or scope units for a work-list you have not seen |
 | Parallel agents in one checkout writing related files | Lost edits, half-applied changes, no way to attribute them |

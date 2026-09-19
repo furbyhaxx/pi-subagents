@@ -54,7 +54,7 @@ All optional.
 | `skills` | `true` | `true` inherits the parent's skills, `false` none, a comma-separated list preloads **only** those into the system prompt. |
 | `memory` | — | `project` \| `local` \| `user`. Read-only automatically for agents without `write`/`edit`. |
 | `disallowed_tools` | — | Denied even if an extension provides them. Also respected when deciding memory write capability. |
-| `isolation` | — | `worktree` for a disposable copy, or `off` to veto worktrees (authoritative — a caller's `branch` against it errors). |
+| `isolation` | — | `worktree` for a retained detached copy, or `off` to veto worktrees (authoritative — a caller's `branch` against it errors). |
 | `model` | inherit | Scalar alias for `models: [model]`. Canonical `provider/modelId[:thinking]` only. Cannot combine with `models`. |
 | `models` | inherit | Ordered, non-empty fallback list. Each entry may carry a `:level` suffix. |
 | `thinking` | inherit | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. A candidate's suffix wins for that candidate; pi clamps unsupported levels down. |
@@ -187,14 +187,17 @@ Default-off. `allowed_subagents` injects ownership-scoped `Agent`,
 
 ## Isolation and worktrees
 
-- `isolation: worktree` in frontmatter gives every run a disposable detached copy;
-  changes are preserved on a `pi-agent-*` branch before the copy is removed.
+- `isolation: worktree` in frontmatter gives every run a retained detached copy.
+  Every settlement outcome leaves it detached at its reported path and change
+  state; the extension does not create a branch, commit or remove it.
 - `isolation: off` **vetoes** worktrees for this agent. An explicit caller
   `branch` against that veto is an error, not an unisolated run.
 - A fresh worktree never contains the caller's uncommitted or staged changes — so
   never use one to review the working-tree diff.
-- Worktree behavior, retained `branch` workspaces and their lease rules are a
-  delegation-time decision; see
+- The orchestrating agent reviews each retained worktree, explicitly chooses
+  integration or discard, creates any needed branch/commit inside it, then removes
+  and prunes it. Worktree behavior, named `branch` workspaces and their lease rules
+  are a delegation-time decision; see
   [`../../executing-work-with-subagents/references/worktrees-and-branches.md`](../../executing-work-with-subagents/references/worktrees-and-branches.md).
 
 ## Persistence and transcripts

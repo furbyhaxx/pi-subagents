@@ -1,19 +1,19 @@
 # Worktrees and branches
 
-Three places delegated work can happen: the shared checkout, a disposable
-worktree, or a retained branch workspace. Picking wrong costs either safety or
-time.
+Three places delegated work can happen: the shared checkout, a retained detached
+worktree, or a retained named-branch workspace. Picking wrong costs either safety
+or time.
 
 ## Contents
 
 - [Choosing](#choosing)
-- [Disposable worktrees](#disposable-worktrees)
-- [Retained branch workspaces](#retained-branch-workspaces)
+- [Detached worktrees](#detached-worktrees)
+- [Named branch workspaces](#named-branch-workspaces)
 - [The lease: one writer per branch](#the-lease-one-writer-per-branch)
 - [What a worktree does not contain](#what-a-worktree-does-not-contain)
 - [Briefing an agent that runs in a workspace](#briefing-an-agent-that-runs-in-a-workspace)
-- [Reviewing, merging and cleaning up](#reviewing-merging-and-cleaning-up)
-- [Storage and cleanup](#storage-and-cleanup)
+- [Reviewing, integrating and cleaning up](#reviewing-integrating-and-cleaning-up)
+- [Storage and settlement](#storage-and-settlement)
 - [Turning isolation off](#turning-isolation-off)
 - [Failure modes](#failure-modes)
 
@@ -22,36 +22,36 @@ time.
 | Mode | Call | Use when | Aftermath |
 |---|---|---|---|
 | Shared checkout | omit both | Read-only work, or exactly one writer | Nothing isolated; your tree is edited directly |
-| Disposable | `isolation: "worktree"` | Speculative writes, risky refactors, parallel writers you may discard | Worktree removed; changes preserved on a `pi-agent-<id>` branch if any |
-| Retained | `branch: "feat/x"` | Multi-step work on one line, reused across several agents | Workspace, branch, index and files all remain; nothing auto-commits |
+| Detached | `isolation: "worktree"` | Speculative writes, risky refactors, parallel writers you may discard | Worktree stays detached and retained; nothing auto-commits or removes it |
+| Named | `branch: "feat/x"` | Multi-step work on one line, reused across several agents | Workspace, branch, index and files remain; nothing auto-commits |
 
 Isolation is not free: a copy costs setup time and disk per agent. Reach for it
 when parallel edits would actually collide, when you might want to throw the work
 away, or when the main checkout must stay usable while an agent works.
 
-## Disposable worktrees
+## Detached worktrees
 
 `isolation: "worktree"` gives the agent a full isolated copy of the repository at
-a detached HEAD.
+a detached HEAD. Every extension-created worktree is retained after success,
+turn-limit wrap-up, abort, stop, failure, cancellation and shutdown. An anonymous
+worktree remains detached whether it is clean or changed.
 
-- **No changes:** the worktree is removed, no branch.
-- **Changes:** they are committed to a new `pi-agent-<id>` branch and the result
-  names the branch and the `git merge` command. The worktree path is gone.
-- **The agent committed its own work:** the branch is created at its HEAD, with
-  any leftovers committed on top.
-
-The preservation commit uses `--no-verify`, so local pre-commit hooks cannot
-block it; the commit is local-only and never pushed.
+The extension never automatically commits, creates a preservation branch,
+merges, resets, stashes, cleans, removes or prunes the worktree. Completion
+reports its retained path and whether it has changes. The orchestrating agent
+owns the next decision: inspect the tree, choose integration or discard, create a
+branch and commit deliberately inside the retained worktree if integration needs
+them, then remove and prune the worktree explicitly.
 
 If the worktree cannot be created (not a git repo, no commits, `git worktree add`
 failed), the `Agent` call **fails**. Isolation is a strict guarantee, not a hint,
 and the failure is reported as a failed tool call rather than as an agent that
-ran and complained.
+ran and complained. Acquisition failure creates no workspace to retain.
 
-It is a directive, not a sandbox: the agent's system prompt tells it to work only
-in the copy, but an agent with `bash` can `cd` out.
+Isolation is a directive, not a sandbox: the agent's system prompt tells it to
+work only in the copy, but an agent with `bash` can `cd` out.
 
-## Retained branch workspaces
+## Named branch workspaces
 
 ```text
 Agent({
@@ -73,9 +73,10 @@ no fetch and no remote-branch guessing.
   outside the configured container.
 - Reusing the main or orchestrating checkout is refused.
 
-Retained means retained: on success, failure, cancellation and shutdown, the
-extension never commits, merges, resets, stashes, cleans or removes the
-workspace. Integration is yours.
+Named worktrees follow the same retention rule as detached worktrees: every
+settlement outcome leaves the workspace in place, and the extension performs no
+automatic Git mutation or removal. A completion reports the retained path and
+change state. Integration and cleanup belong to the orchestrating agent.
 
 Sequential calls on the same branch share **files, not conversation**:
 
@@ -84,16 +85,18 @@ Agent({ branch: "feat/x", prompt: "Implement …", name: "impl" })
 Agent({ branch: "feat/x", prompt: "Review src/x.ts. Do not edit.", ... })   # after the first settles
 ```
 
-For conversation continuity use `resume` instead — and note `resume` cannot be
-combined with `branch`; it reacquires and validates the original scope itself,
-refusing a missing path or a changed checked-out branch rather than silently
-falling back to the parent directory.
+For conversation continuity use `resume` instead. `resume` cannot be combined
+with `branch`; it reacquires and validates the original scope itself, refusing a
+missing path or a changed checked-out branch rather than silently falling back
+to the parent directory.
 
 ## The lease: one writer per branch
 
 One extension-managed writer holds a cross-process repository/branch lease
-through execution and through any workflow `gate`. Contention **fails fast**
-rather than queueing: steer or resume the owning agent, or use another branch.
+through execution, workflow gates and anonymous-worktree background-job
+quiescence. Contention **fails fast** rather than queueing: steer or resume the
+owning agent, or use another branch. The gate and quiescence steps complete
+before lease release; retention does not shorten this ordering.
 
 Consequences for scheduling:
 
@@ -121,12 +124,11 @@ exposed, because they are its files.
 
 ## Briefing an agent that runs in a workspace
 
-The harness already injects a `<worktree_scope>` block naming the repository,
-worktree root, working directory, branch or detached state, whether it was
-created or reused, whether it started dirty, and whether it is retained. It also
-already tells the agent to work in the copy, map paths into it, preserve
-pre-existing changes, not switch branches or create worktrees, and report
-worktree-relative paths.
+The harness injects a `<worktree_scope>` block naming the repository, worktree
+root, working directory, branch or detached state, whether it was created or
+reused, whether it started dirty, and that it is retained. It also tells the
+agent to work in the copy, map paths into it, preserve pre-existing changes, not
+switch branches or create worktrees, and report worktree-relative paths.
 
 So your brief should add only what is task-specific:
 
@@ -135,123 +137,111 @@ So your brief should add only what is task-specific:
 - **Pass `branch` as an argument.** Never ask the agent to create a worktree,
   switch branches or set up git — it will improvise.
 - **State the commit policy explicitly.** "Do not commit", or "commit each
-  logical change with a conventional message". Retained workspaces auto-commit
+  logical change with a conventional message". The extension auto-commits
   nothing.
 - **State the validation**: the command that must pass, run inside the workspace.
 - **Say what to preserve** when reusing a workspace that may already be dirty.
 
-## Reviewing, merging and cleaning up
+## Reviewing, integrating and cleaning up
 
 The extension gets the work *into* a workspace and leaves it there. Nothing
-merges, pushes or deletes on your behalf, so a run is finished only when it has
-been reviewed, integrated and removed from disk. Skipping the last step is how a
-machine ends up with fifteen stale copies of the repository, one of which someone
-eventually reviews by mistake.
+commits, branches, merges, pushes or deletes on your behalf. A run is finished
+only when the orchestrating agent has reviewed the retained tree, deliberately
+integrated or discarded it, and removed it from disk.
 
 ### Find what you have
 
-```bash
-git worktree list                       # every linked worktree and its branch
-git branch --list 'pi-agent-*'          # disposable runs that preserved changes
-```
-
-A disposable run reports its `pi-agent-<id>` branch in the completion message and
-its directory is already gone. A named `branch` run reports the retained path,
-and its files may still be uncommitted.
-
-### Review before you merge
+The completion report is authoritative for the retained path and change state.
+Confirm it against Git:
 
 ```bash
-git log --oneline main..pi-agent-abc123          # what it did
-git diff main...pi-agent-abc123                  # the change as a whole
-git diff --stat main...pi-agent-abc123           # scope check: did it stay in bounds?
+git worktree list
+git -C /path/to/worktree status --short
+git -C /path/to/worktree diff --stat
 ```
 
-For a retained workspace, review it in place — it is a working tree:
+For an anonymous run, `git branch --show-current` in the retained tree prints
+nothing because the worktree stays detached. A named run reports its exact
+branch and retained path.
+
+### Review before you integrate
 
 ```bash
 git -C /path/to/worktree status
 git -C /path/to/worktree diff
+git -C /path/to/worktree log --oneline --decorate -10
 ```
 
-Two things to know before you trust what you see:
+An agent's gate proves only what the gate ran. Inspect staged, unstaged and
+untracked files, and re-run the project's own check suite after integration in
+the main checkout.
 
-- **The automatic preservation commit uses `--no-verify`.** Your pre-commit hooks
-  did not run on it. Whatever they would have caught is still in there.
-- **An agent's gate proves only what the gate ran.** Re-run the project's own
-  check suite after merging, in the main checkout, where the full toolchain and
-  hooks apply.
+Delegating review is fine: point a read-only reviewer at the retained path. Do
+not acquire a *new* worktree to review someone's uncommitted work; a fresh copy
+contains committed files only.
 
-Delegating the review is fine — a read-only reviewer agent pointed at
-`git diff main...pi-agent-abc123`, or a fresh agent on the same `branch` with
-"do not edit". Do not use a *new* worktree to review someone's uncommitted work:
-a fresh copy contains committed files only.
+### Integrate or discard deliberately
 
-### Merge it back
+If an anonymous detached worktree should be integrated, create the branch and
+commit deliberately **inside that retained worktree**:
 
-Git refuses to check out a branch that a linked worktree already holds, so merge
-**from the main checkout** rather than trying to switch to it:
+```bash
+git -C /path/to/worktree switch -c feat/x
+git -C /path/to/worktree add -p
+git -C /path/to/worktree commit
+```
+
+For a named workspace, commit there if needed. Then integrate from the main
+checkout rather than trying to check out a branch already held by a linked
+worktree:
 
 ```bash
 cd /path/to/main/checkout
-git merge --no-ff pi-agent-abc123       # or feat/x
-npm run check                            # validate in the real tree, with hooks
+git merge --no-ff feat/x
+npm run check
 ```
 
-Other shapes, depending on what you want in history:
+Cherry-pick, rebase or squash are valid deliberate alternatives. Integrate one
+workspace at a time and re-run checks after each; textually clean merges can
+still be semantically incompatible.
 
-```bash
-git cherry-pick <sha>                    # take one commit out of an agent branch
-git rebase --onto main <base> feat/x     # linearize before merging
-git merge --squash feat/x                # one commit, agent's history dropped
-```
-
-If the work is still uncommitted in a retained workspace, commit it there first —
-the workspace is a normal checkout, so `git -C <path> add -p` and
-`git -C <path> commit` work — or steer the owning agent to commit under your
-commit policy. Integrate one branch at a time and re-run the check after each;
-two agent branches that merge cleanly can still be semantically incompatible.
+If the work is unwanted, inspect it first, then discard it deliberately. Do not
+mistake a clean completion summary for permission to delete a dirty tree.
 
 ### Then clean up
 
-Once the branch is merged into your local main, remove the copy and the branch:
+After integration or an explicit discard decision:
 
 ```bash
 git worktree remove /path/to/worktree    # refuses if the tree is dirty
 git worktree prune                       # drop stale administrative records
-git branch -d feat/x                     # -d refuses if it is not merged
-git branch -d pi-agent-abc123            # same for a preservation branch
+git branch -d feat/x                     # only when the branch is no longer needed
 ```
 
-`git branch -d` failing is a feature: it means what you are about to delete is
-not in your main line. Find out why before reaching for `-D`.
-
-Four things that make removal fail or unsafe, and what they mean:
+`git worktree remove` or `git branch -d` refusing is a safety signal. Review the
+remaining work before considering force; the extension will not do that for you.
 
 | Situation | What it means | Do |
 |---|---|---|
-| `remove` refuses: tree is dirty | Uncommitted or untracked files remain — possibly work you have not read | Review them; commit or discard deliberately. `--force` only after you have looked |
-| An agent still owns the branch lease | A run is live in that workspace | Let it finish, or stop it; then remove |
-| Background jobs are running in the tree | Something is still writing there | Stop them (`job_list`, `job_stop`) before removing |
+| `remove` refuses: tree is dirty | Uncommitted or untracked files remain | Review; commit for integration or discard deliberately |
+| An agent still owns the branch lease | A run is live in that workspace | Let it finish, or stop it; then re-check |
+| Background jobs are running in the tree | Something may still be writing there | Stop them (`job_list`, `job_stop`) prior to manual removal |
 | The directory is gone but `worktree list` still shows it | Stale administrative record | `git worktree prune` |
-
-A disposable run needs no `worktree remove` — the copy was deleted when it
-finished, unless jobs could not be confirmed stopped, in which case it was
-retained on purpose and the result said so. Only the `pi-agent-*` branch is left
-to delete.
 
 ### Checklist
 
-1. `git worktree list` and `git branch --list 'pi-agent-*'` — know what exists.
-2. Read the diff against the base, and check the scope it actually touched.
-3. Merge from the main checkout, one branch at a time.
-4. Run the project's check suite in the main checkout — hooks were bypassed.
-5. `git worktree remove` + `git worktree prune`.
-6. `git branch -d` for the merged branch, and let the refusal stop you if it is
-   not merged.
-7. Nothing gets pushed as part of this unless you say so.
+1. Read the completion's retained path and change state.
+2. Confirm with `git worktree list` and `git -C <path> status`.
+3. Read staged, unstaged, untracked and committed changes.
+4. Choose integration or discard explicitly.
+5. If integrating a detached tree, create its branch/commit deliberately there.
+6. Integrate from the main checkout and run the project's checks.
+7. Ensure no agent or background job still uses the tree.
+8. Run `git worktree remove` and `git worktree prune`; delete an unneeded named
+   branch only after its work is integrated or deliberately discarded.
+9. Nothing gets pushed unless you say so.
 
-## Storage and cleanup
+## Storage and settlement
 
 The worktree container is chosen by `worktreeDirectory`:
 
@@ -267,16 +257,20 @@ with an actionable error otherwise, and the extension never edits a tracked
 `.git/info/exclude`). Changes apply to future acquisitions only; existing
 worktrees are never migrated.
 
-Cleanup interacts with background jobs: a disposable worktree is removed only
-after that worktree's background jobs are stopped, and the result lists what was
-stopped. If termination cannot be confirmed, the worktree is **retained** and the
-failure reported — a tree a live job may still be writing to is never deleted.
-Named worktrees are never implicitly stopped and keep their jobs.
+For an anonymous worktree, settlement asks a loaded background-jobs runtime to
+stop jobs in that tree before lease release, and reports the stopped ids. If
+termination cannot be confirmed, the failure is reported. The tree is retained
+regardless: quiescence protects review and manual cleanup; it does not authorize
+automatic deletion. Named worktrees are never implicitly stopped and keep their
+jobs.
+
+At shutdown, `pi-background-jobs` calls the extension's settlement endpoint
+before disposing its responder, preserving that same ordering. Workflow gates
+also run before lease release. Bounded shutdown behavior is unchanged.
 
 Monorepos: with a `cwd` inside a package, the agent works at the equivalent
-subdirectory inside the copy, and the preservation branch lands in that
-repository. Configuration discovery stays anchored to the initiating project — a
-branch's own `.pi` extensions are not loaded.
+subdirectory inside the copy. Configuration discovery stays anchored to the
+initiating project — a named branch's own `.pi` extensions are not loaded.
 
 ## Turning isolation off
 
@@ -286,8 +280,8 @@ branch's own `.pi` extensions are not loaded.
 | Per agent | `isolation: off` in frontmatter — authoritative; an explicit caller `branch` then **errors** |
 | Per project | `"worktreeIsolation": false` in `subagents.json` — the parameters disappear from the schema next session, and creation is refused on every path including RPC and schedules |
 
-Project-level off is the right call on a repository large enough that a copy
-costs real time and disk.
+Project-level off is the right call on a repository large enough that a retained
+copy's setup time and disk cost are not justified.
 
 ## Failure modes
 
@@ -297,6 +291,6 @@ costs real time and disk.
 | Agent reports a clean tree when reviewing "my changes" | Fresh worktree has no uncommitted caller changes | Review in the shared checkout, or commit first |
 | Branch request refused as busy | Another agent holds the lease | Steer/resume that agent, or pick another branch |
 | Agent edited the main checkout anyway | Absolute parent paths in the brief, or it `cd`'d out | Repository-relative paths; restrict `bash` |
-| Worktree still on disk after the run | Retained (named), or a background job could not be confirmed stopped | Remove it yourself after checking jobs |
-| Changes vanished | Disposable worktree; they are on the reported `pi-agent-*` branch | `git log --all`, then merge that branch |
+| Worktree still on disk after the run | Expected retention | Review, integrate or discard, then remove and prune it |
+| Completion says the retained tree changed | Agent left staged, unstaged, untracked or committed work | Inspect at the reported path; decide integration or discard |
 | Acquisition fails naming `.gitignore` | Container inside the repo is not ignored | Add the rule to `.git/info/exclude` and retry |

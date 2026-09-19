@@ -24,8 +24,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
-| `isolation` | `"off"` \| `"worktree"` | Without `branch`, disposable detached copy; changes preserved on a `pi-agent-*` branch before removal |
-| `branch` | string | Exact local branch. Implies worktree isolation; create or reuse a retained linked worktree, without automatic commit or removal |
+| `isolation` | `"off"` \| `"worktree"` | Without `branch`, a retained detached copy. Completion reports its path and change state; no automatic Git mutation or removal |
+| `branch` | string | Exact local branch. Implies worktree isolation; create or reuse a retained linked worktree, without automatic Git mutation or removal |
 | `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
 | `signal` | AbortSignal | Aborting it stops the subagent |
@@ -53,11 +53,11 @@ Four things that are not obvious from the tables:
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
 
-### Branch workspaces and storage
+### Workspaces and storage
 
-`options.branch: 'feat/x'` has the same contract as the [Agent tool](../README.md#retained-branch-workspaces). A missing local branch starts at the calling checkout's resolved HEAD; an existing branch starts at its tip. Git-registered linked worktrees are reused at their actual path, even outside the configured container, preserving staged, unstaged and untracked changes. No fetch, remote-branch guessing, automatic commit, merge, reset, stash or removal occurs. Main/orchestrating-checkout reuse is refused.
+Every extension-created worktree is retained after success, turn limit, abort, stop, failure, cancellation and shutdown. Without `branch`, `options.isolation: 'worktree'` creates a detached worktree that remains detached. With `options.branch: 'feat/x'`, the [Agent tool's named-workspace contract](../README.md#retained-branch-workspaces) applies: a missing local branch starts at the calling checkout's resolved HEAD; an existing branch starts at its tip. Git-registered linked worktrees are reused at their actual path, even outside the configured container, preserving staged, unstaged and untracked changes. No fetch, remote-branch guessing, automatic commit, preservation-branch creation, merge, reset, stash, clean, removal or prune occurs. Main/orchestrating-checkout reuse is refused.
 
-Explicit `isolation: 'off'`, agent-file `isolation: off`, or project-wide worktree disablement fails a branch request rather than silently downgrading it. Invalid exact local names, stale or inaccessible registrations and a busy repository/branch lease also fail. The cross-process lease is held through execution and `onBeforeWorktreeCleanup`; that callback receives the **effective working cwd**, including monorepo scope, before lease release. The legacy callback name also covers retained trees: they are not cleaned up. Cancellation and failure release the lease without deleting retained files. Other human processes are not covered by the lease.
+Explicit `isolation: 'off'`, agent-file `isolation: off`, or project-wide worktree disablement fails a branch request rather than silently downgrading it. Invalid exact local names, stale or inaccessible registrations and a busy repository/branch lease also fail. The cross-process lease is held through execution and `onBeforeWorktreeCleanup`; workflow gates and anonymous background-job quiescence run before lease release. The callback receives the **effective working cwd**, including monorepo scope. Its legacy name now means the settlement boundary for retained trees, not deletion. Every settlement path releases the lease without deleting retained files. Other human processes are not covered by the lease.
 
 A fresh spawn reuses files, not conversation. Resume keeps recorded scope, reacquires its lease and validates the repository/path/checked-out branch. It cannot retarget to a new `branch` or fall back to the parent checkout. Named execution keeps configuration at the initiating project; the reused branch's `.pi` extensions do not become authoritative. With `cwd`, the equivalent subdirectory must exist in the target tree.
 
@@ -65,7 +65,7 @@ Session artifacts default to `join(getAgentDir(), 'sessions')/<project>/<root-se
 
 `worktreeDirectory` independently selects `{ mode: 'session' }`, `{ mode: 'project' }` (origin repository's `.worktrees/`), or `{ mode: 'custom', path: '...' }` (absolute or origin-repository-relative). Placement changes apply to future acquisitions and never move registered worktrees. Repository-internal containers must already be ignored; otherwise acquisition reports an actionable error. The extension never edits tracked `.gitignore`. Both settings are available in `/agents → Settings`; see the [storage reference](../README.md#persistent-settings).
 
-Resolved workspace metadata (`worktree`, `branch`, `effectiveCwd`) is carried separately from result prose in lifecycle payloads and records, so truncation cannot hide where edits live. Until acquisition completes, only the requested branch is known; queued results must not be treated as a resolved workspace. RPC spawn returns `{ id, worktree?, cwd?, branch?, workspacePending? }` in the success envelope. `worktree` is the verified `WorktreeInfo` (`path`, `workPath`, `branch`, `baseSha`, `lifecycle`, `sourceRoot`, `commonDir`, `reused`, `initialDirty`); `cwd` is the effective working directory. Before acquisition, `branch` and `workspacePending: true` describe the request, not a resolved path. Non-worktree replies remain `{ id }`. An immediate reply is not a promise that startup succeeded: inspect lifecycle failures and the settled record.
+Resolved workspace metadata (`worktree`, `branch`, `effectiveCwd`) is carried separately from result prose in lifecycle payloads and records, so truncation cannot hide where edits live. Completion also reports the retained path and whether the worktree has changes. Until acquisition completes, only the requested branch is known; queued results must not be treated as a resolved workspace. RPC spawn returns `{ id, worktree?, cwd?, branch?, workspacePending? }` in the success envelope. `worktree` is the verified `WorktreeInfo` (`path`, `workPath`, `branch`, `baseSha`, `lifecycle`, `sourceRoot`, `commonDir`, `reused`, `initialDirty`); `cwd` is the effective working directory. Before acquisition, `branch` and `workspacePending: true` describe the request, not a resolved path. Non-worktree replies remain `{ id }`. An immediate reply is not a promise that startup succeeded: inspect lifecycle failures and the settled record. The orchestrating/main agent owns the retained workspace afterward: review it, choose integration or discard, create any required branch/commit deliberately inside it, then remove and prune it explicitly.
 
 ### Names that look right and are not
 
@@ -177,9 +177,9 @@ The consequence is worth stating plainly: **a session that excludes pi-subagents
 
 One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2104`) and detached resume (`:1350`). Your first event for your own agent is `subagents:started` (`:625`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
 
-## Stopping background jobs before worktree cleanup
+## Stopping background jobs before lease release
 
-The one place this extension is an RPC **client** rather than a server: before an ephemeral worktree is removed, it asks `pi-background-jobs` — when one is loaded — to stop that worktree's jobs, so a detached supervisor never survives the tree it was writing in. The caller side is `src/background-jobs-rpc.ts`; `path` is the worktree's path.
+The one place this extension is an RPC **client** rather than a server: while settling an anonymous worktree, it asks `pi-background-jobs` — when one is loaded — to stop that worktree's jobs before releasing the lease. This leaves the retained tree quiescent for review; it never authorizes removal. The caller side is `src/background-jobs-rpc.ts`; `path` is the worktree's path.
 
 ```text
 request  background-jobs:rpc:ping          { requestId }
@@ -188,21 +188,21 @@ request  background-jobs:rpc:stop-worktree { requestId, path }
 reply    background-jobs:rpc:stop-worktree:reply:<id> { success: true, data: { stopped: string[] } }
 ```
 
-The protocol version is `1`, checked from the ping reply; a companion answering with anything else is a *failure*, not an unload, because an unconfirmed stop may not be followed by deletion. Availability is probed with a ping on **every** call and never cached — a runtime loaded after pi-subagents, a reload, or no runtime at all resolve correctly at the moment a worktree is cleaned up. Once a runtime has answered for a record, though, an unavailable RPC is a failure for that record: a runtime that disappeared after launch must not make a live tree look safe to delete.
+The protocol version is `1`, checked from the ping reply; a companion answering with anything else is a *failure*. Availability is probed with a ping on **every** call and never cached — a runtime loaded after pi-subagents, a reload, or no runtime at all resolve correctly at the moment a worktree settles. Once a runtime has answered for a record, though, an unavailable RPC is a failure for that record: a runtime that disappeared after launch must not make a possibly live tree look quiescent.
 
-The three outcomes and what cleanup does with them:
+The three outcomes and what settlement does with them:
 
-| Outcome | Meaning | Cleanup |
+| Outcome | Meaning | Settlement |
 |---|---|---|
-| `unavailable` | No ping reply within 2 s | Proceeds only for a record whose spawn never exposed the job family (`jobsPossible` unset). Once a runtime was possible for that record, unavailability is converted to `failed` and the worktree is **retained** |
+| `unavailable` | No ping reply within 2 s | Proceeds only for a record whose spawn never exposed the job family (`jobsPossible` unset). Once a runtime was possible for that record, unavailability is converted to `failed` |
 | `stopped` | The reply's `stopped` ids | Proceeds; ids are appended to the agent's result |
-| `failed` | Ping error, version mismatch, stop error, malformed reply, or no stop reply within 10 s | **Retained**: no removal, failure and path appended to the result (success) or error (failure), worktree lease released |
+| `failed` | Ping error, version mismatch, stop error, malformed reply, or no stop reply within 10 s | Failure and retained path are appended to the result (success) or error (failure), then the worktree lease is released |
 
-Retained (`branch`) worktrees are never implicitly stopped and never gated this way. `stop-worktree` is a privileged internal route: the only thing this extension ever passes is the path of a worktree it owns. A record that later resolves to a recovered failure does not remove an already-retained tree either — retention is final for that pass and nothing re-scans old worktrees.
+Named (`branch`) worktrees are never implicitly stopped and never gated this way. `stop-worktree` is a privileged internal route: the only thing this extension ever passes is the path of an anonymous worktree it owns. Anonymous and named trees remain retained regardless of the quiescence outcome; nothing later re-scans or removes them.
 
 ### Shutdown coordination
 
-Pi awaits every extension's `session_shutdown` handler sequentially in load order, so pi-background-jobs disposed its `stop-worktree` responder before this extension's cleanup ran when it was loaded first. It now sends this extension one session-scoped request before its own disposal:
+Pi awaits every extension's `session_shutdown` handler sequentially in load order, so pi-background-jobs disposed its `stop-worktree` responder before this extension's settlement ran when it was loaded first. It now sends this extension one session-scoped request before its own disposal:
 
 ```text
 request  subagents:rpc:prepare-shutdown              { requestId, version: 1, sessionId, reason, targetSessionFile? }
@@ -210,7 +210,7 @@ accepted subagents:rpc:prepare-shutdown:accepted:<id> { version: 1, sessionId }
 reply    subagents:rpc:prepare-shutdown:reply:<id>     { success: true, data: { prepared: true } } | { success: false, error }
 ```
 
-The endpoint is registered at `session_start`, answers only for its bound session, and is unsubscribed when the cleanup it starts finishes. A request naming another session, with an unknown version or reason, or with a malformed payload is ignored, so a child or independent activation is never driven by a parent-scoped request. Acceptance is emitted synchronously, before the first await: a requester that sees none in the same tick treats the companion as unavailable and proceeds with local disposal, with no absence timer. Duplicate valid requests join one memoized cleanup — the same promise this extension's own Pi handler awaits — and each gets its own scoped reply. The channel is versioned independently at `1`, outside the `subagents:rpc:ping` handshake, and it never authorizes worktree removal. The provider's 10-second deadline contains a failure — a timeout warns and disposes its RPC anyway — so a slow or unfinished cleanup is never reported as successful. The existing bounded settlement policy is unchanged: fixing the responder order does not extend how long the manager joins a TERM-resistant child.
+The endpoint is registered at `session_start`, answers only for its bound session, and is unsubscribed when the settlement it starts finishes. A request naming another session, with an unknown version or reason, or with a malformed payload is ignored, so a child or independent activation is never driven by a parent-scoped request. Acceptance is emitted synchronously, before the first await: a requester that sees none in the same tick treats the companion as unavailable and proceeds with local disposal, with no absence timer. Duplicate valid requests join one memoized settlement — the same promise this extension's own Pi handler awaits — and each gets its own scoped reply. The channel is versioned independently at `1`, outside the `subagents:rpc:ping` handshake, and it never authorizes worktree removal. The provider's 10-second deadline contains a failure — a timeout warns and disposes its RPC anyway — so slow or unfinished settlement is never reported as successful. The existing bounded settlement policy is unchanged: fixing the responder order does not extend how long the manager joins a TERM-resistant child.
 
 ## What the tests pin
 
@@ -221,8 +221,8 @@ This document has no test of its own, so it is worth knowing which claims are ac
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings, model resolution and scope enforcement |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, the `prepare-shutdown` channel included, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
-| `test/background-jobs-rpc.test.ts` | Contract fixture on a test event bus | The outbound ping/`stop-worktree` envelope, per-request reply scoping, the three cleanup outcomes (`unavailable`, `stopped`, `failed`), and the `prepare-shutdown` endpoint's synchronous acceptance, session scoping and duplicate joining |
-| `test/agent-manager.test.ts` | Mocked worktree + real manager | Jobs stopped before ephemeral cleanup, retained-on-failure, retained worktrees untouched |
+| `test/background-jobs-rpc.test.ts` | Contract fixture on a test event bus | The outbound ping/`stop-worktree` envelope, per-request reply scoping, the three settlement outcomes (`unavailable`, `stopped`, `failed`), and the `prepare-shutdown` endpoint's synchronous acceptance, session scoping and duplicate joining |
+| `test/agent-manager.test.ts` | Mocked worktree + real manager | Jobs stopped before anonymous-worktree lease release, every settlement outcome retained, retained worktrees untouched |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, `subagents:ready`'s `{}` payload, consume's handle resolution, and its missing `workflowId` check.
 
