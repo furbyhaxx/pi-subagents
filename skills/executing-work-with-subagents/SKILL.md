@@ -95,16 +95,32 @@ Batch shapes, dependency graphs, fan-out patterns and what a barrier costs:
 | `isolation: "worktree"` | Speculative or risky writes you may throw away | Copy setup + disk; changes preserved on a `pi-agent-*` branch, worktree removed |
 | `branch: "feat/x"` | Multi-step work on one line, reused across calls | Retained workspace; nothing auto-commits or removes it |
 
-**Isolation is not free.** Every worktree is a full checkout: seconds to minutes
-of setup and a copy of the repository on disk, per agent. It does not remove a
-conflict either — it converts a race into a merge, which is a better problem but
-still a problem you have to work. Pay for it when writes would genuinely collide,
-when the work may be thrown away, or when the main checkout must stay usable;
-otherwise a shared checkout with one writer is faster and simpler.
+**Isolation is not free, and whoever asked for it should be told the price.**
+Every worktree is a full checkout: seconds to minutes of setup and a whole copy
+of the repository on disk, per agent, plus the integration work at the end. It
+does not remove a conflict either — it converts a race into a merge, which is a
+better problem but still a problem someone has to work. When you recommend
+isolation, say what it costs and why it is worth it here; when you recommend
+against it, say the same. "Give each agent a worktree" with no price attached is
+the advice people regret three days later with fifteen copies on disk.
+
+Pay for it when writes would genuinely collide, when the work may be thrown away,
+or when the main checkout must stay usable; otherwise a shared checkout with one
+writer is faster and simpler.
 
 Work in a worktree is not done when the agent finishes — it is done when it has
-been reviewed, merged back, and the copy is off your disk. See
-[integrating a workspace](references/worktrees-and-branches.md#reviewing-merging-and-cleaning-up).
+been reviewed, merged back, re-checked, and the copy is off the disk. Two facts
+that decide how that goes, both easy to find out too late:
+
+- **The automatic preservation commit uses `--no-verify`.** Your pre-commit hooks
+  never ran on an agent branch, so re-run the project's checks in the main
+  checkout after merging — not only inside the workspace.
+- **A workspace cannot be removed out from under a live agent**, and a worktree
+  with running background jobs is not safe to delete either.
+
+The full procedure — inventory, review, merge from the main checkout, `git
+worktree remove` / `prune`, `git branch -d` — is in
+[reviewing, merging and cleaning up](references/worktrees-and-branches.md#reviewing-merging-and-cleaning-up).
 
 Three rules that cause most of the pain when ignored:
 

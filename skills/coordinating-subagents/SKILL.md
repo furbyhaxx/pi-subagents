@@ -148,6 +148,8 @@ disagreement: [`references/evidence-discipline.md`](references/evidence-discipli
 | Symptom | Read this way | Action |
 |---|---|---|
 | Agent asks a question in its final answer | It had no user to ask; the brief was ambiguous | Answer it via resume (`@handle`), and fix the brief for next time |
+| Context at 85%+, or `⇊N` compactions | It has **already lost** the start of its task — what it read first is now a paraphrase of a paraphrase | Do not wait it out. Steer it to write down what it has and stop; re-scope the remainder. A bigger model would fail the same way |
+| Two agents claim the same fix | They were given overlapping write scopes — a scoping error of yours, not a contest between them | Look at the tree (`git diff`/`status`) and run the check; keep whichever the evidence supports, and cut disjoint scopes next time |
 | `steered` status | Hit `max_turns`, wrapped up | Treat the answer as partial; split the task |
 | `aborted` | Blew through the grace period | Almost always too-large scope |
 | Result contradicts another agent's | Both are claims | Verify with a command, or a third agent given both |

@@ -176,10 +176,19 @@ once, which is all it takes.
 | no | cheap | `medium` — it is not worth optimizing |
 | no | expensive | `high`–`max` — this is what the budget is for |
 
-The common mistake is treating a high-frequency job as automatically a cheap one.
-Spend the savings on the model tier and the context you hand it; buy the thinking
-that the consequence justifies. When both matter, a cheap model at `high` is
-usually the better trade than a strong model at `low`.
+**Escalate thinking before tier.** These two levers are not interchangeable, and
+they are priced very differently at 50 runs a day. A high-stakes check that runs
+constantly should stay on the cheap or workhorse tier and buy the *thinking* its
+consequence justifies — a cheap model at `high` beats a frontier model at `low`
+for a fraction of the money. Move up a model tier only when you have evidence the
+cheaper model actually misses (see
+[evaluating-agents.md](evaluating-agents.md)), or when the job needs breadth a
+small model does not have: many files at once, unfamiliar domain, genuinely open
+judgement.
+
+So: stakes decide the thinking level, capability decides the tier, and frequency
+decides how much you care about getting both right. A destructive-SQL gate is a
+cheap model at `medium`/`high`, not an expensive model.
 
 ## Designing a fallback list
 
@@ -225,3 +234,8 @@ models:
 4. Never state a model ID, price or context window from memory. A hallucinated
    model ID in an agent file silently falls back to inheriting the parent model,
    which is the failure that is hardest to notice.
+
+Say where the IDs came from when you hand a recommendation to someone — "checked
+against `pi --list-models` just now" or "verify these before committing them; my
+list may be stale". An unsourced model ID reads as verified when it is not, and
+the person receiving it has no way to tell which of the two you meant.
