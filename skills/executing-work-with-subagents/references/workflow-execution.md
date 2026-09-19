@@ -121,8 +121,11 @@ const fixed = await agent('Fix the failing test in src/parser.ts.', { label: 'fi
 ```
 
 The gate runs in the child's effective working directory after it finishes and
-**before** worktree settlement and lease release. A non-zero exit marks the
-agent failed and the command output becomes the error.
+**before** worktree settlement and lease release. For anonymous worktrees,
+background jobs are quiesced before the gate; if quiescence cannot be
+confirmed, the gate does not run. Named worktrees skip implicit job control.
+A non-zero exit marks the agent failed and the command output becomes the
+error.
 
 Prefer `gate: 'npm test'` to asking another agent whether the code looks right. A
 model judging whether a fix works is a weaker signal than the test suite.
@@ -261,6 +264,7 @@ for the current session.
 | An agent ran as the wrong type, silently | `agentType` value is not validated — check spelling in `/agents` |
 | `agent()` returned `null` | Terminal failure, an inspector skip, or a schema never satisfied |
 | Un-awaited `agent()` error | A dropped `await`, usually inside a stage |
-| `Cannot run with isolation: "worktree"` | Not a git repo, no commits, or `git worktree add` failed |
+| `Cannot run with isolation: "worktree"` | Not a git repo, no commits, or `git worktree add` failed — no workspace |
+| Call fails naming a retained path | Verification failed after add; path retained conservatively |
 | `No saved workflow named "x"` | Not in the three directories, or missing `export const meta` |
 | Run seems stuck with agents queued | Concurrency cap; `p` (pause) also holds new starts |

@@ -246,7 +246,7 @@ An agent definition may provide ordered `models` fallback candidates. Pi exhaust
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Without `branch`, a retained detached copy. Completion reports its path and change state; no automatic Git mutation or removal |
 | `branch` | string | Exact local branch, e.g. `feat/x`. Implies worktree isolation; creates or reuses a retained linked worktree. No automatic Git mutation or removal |
-| `gate` | string | Shell command in the child's effective cwd after it finishes, before worktree settlement and lease release; a non-zero exit fails the agent and its output becomes the error |
+| `gate` | string | Shell command in the child's effective cwd after it finishes, before worktree settlement and lease release. For anonymous worktrees, jobs are quiesced first; if that cannot be confirmed, the gate does not run. Named worktrees skip implicit job control. A non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
@@ -254,7 +254,7 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` may be combined with `model` to continue the same conversation on a replacement model. It cannot be combined with `agentType`, `effort`, `isolation`, `branch`, `gate` or `schema` — the child keeps its agent type and tree, and its session predates the `StructuredOutput` tool.
 
-Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`. Anonymous-worktree settlement stops that worktree's jobs before releasing its lease; a failure to confirm termination is reported in the child's output. The worktree remains retained either way. A named `branch` worktree is never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
+Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`. For anonymous worktrees, background jobs are quiesced before a workflow gate runs, and the gate runs before settlement and lease release. If quiescence cannot be confirmed, the gate does not run; the failure is reported in the child's output. The worktree remains retained either way. A named `branch` worktree skips implicit job control and is never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
 
 ### Retained branch workspaces
 
@@ -419,7 +419,7 @@ The agent failed terminally, or you skipped it with `s` in the inspector. These 
 A dropped `await`, usually inside a `pipeline` stage. The run would otherwise finish while children were still working and throw their results away, so it fails instead — immediately rather than draining, since an agent that ignores its abort signal would wedge the run forever.
 
 **`Cannot run with isolation: "worktree"`.**
-Not a git repo, no commits yet, or `git worktree add` failed. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.
+Not a git repo, no commits yet, or `git worktree add` failed. Failures before `git worktree add` create no workspace; failures after add during verification retain and report the acquired path conservatively. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.
 
 **`No saved workflow named "x". Looked in: …`**
 The file is not in any of the three directories, or it is there but carries no `export const meta =` declaration, so it is not recognized as a workflow. The message lists the directories it searched and any workflows it did find.

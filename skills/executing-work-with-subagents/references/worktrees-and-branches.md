@@ -43,10 +43,12 @@ owns the next decision: inspect the tree, choose integration or discard, create 
 branch and commit deliberately inside the retained worktree if integration needs
 them, then remove and prune the worktree explicitly.
 
-If the worktree cannot be created (not a git repo, no commits, `git worktree add`
-failed), the `Agent` call **fails**. Isolation is a strict guarantee, not a hint,
-and the failure is reported as a failed tool call rather than as an agent that
-ran and complained. Acquisition failure creates no workspace to retain.
+If the worktree cannot be created (not a git repo, no commits, or `git worktree
+add` failed), the `Agent` call **fails**. Isolation is a strict guarantee, not a
+hint, and the failure is reported as a failed tool call rather than as an agent
+that ran and complained. Failures before `git worktree add` create no workspace.
+Failures after add during verification still fail the call, but retain and
+report the acquired path conservatively.
 
 Isolation is a directive, not a sandbox: the agent's system prompt tells it to
 work only in the copy, but an agent with `bash` can `cd` out.
@@ -95,8 +97,11 @@ to the parent directory.
 One extension-managed writer holds a cross-process repository/branch lease
 through execution, workflow gates and anonymous-worktree background-job
 quiescence. Contention **fails fast** rather than queueing: steer or resume the
-owning agent, or use another branch. The gate and quiescence steps complete
-before lease release; retention does not shorten this ordering.
+owning agent, or use another branch. For anonymous worktrees, background jobs
+are quiesced before a workflow gate runs, and the gate runs before settlement
+and lease release; if quiescence cannot be confirmed, the gate does not run.
+Named worktrees skip implicit job control. Retention does not shorten this
+ordering.
 
 Consequences for scheduling:
 
@@ -257,16 +262,17 @@ with an actionable error otherwise, and the extension never edits a tracked
 `.git/info/exclude`). Changes apply to future acquisitions only; existing
 worktrees are never migrated.
 
-For an anonymous worktree, settlement asks a loaded background-jobs runtime to
-stop jobs in that tree before lease release, and reports the stopped ids. If
-termination cannot be confirmed, the failure is reported. The tree is retained
-regardless: quiescence protects review and manual cleanup; it does not authorize
-automatic deletion. Named worktrees are never implicitly stopped and keep their
-jobs.
+For an anonymous worktree, a loaded background-jobs runtime is asked to stop
+jobs in that tree before a workflow gate runs, and reports the stopped ids. If
+termination cannot be confirmed, the failure is reported and the gate does not
+run. The tree is retained regardless: quiescence protects review and manual
+cleanup; it does not authorize automatic deletion. Named worktrees skip
+implicit job control and keep their jobs.
 
 At shutdown, `pi-background-jobs` calls the extension's settlement endpoint
-before disposing its responder, preserving that same ordering. Workflow gates
-also run before lease release. Bounded shutdown behavior is unchanged.
+before disposing its responder, preserving that same ordering. When the gate
+runs, it still runs before settlement and lease release. Bounded shutdown
+behavior is unchanged.
 
 Monorepos: with a `cwd` inside a package, the agent works at the equivalent
 subdirectory inside the copy. Configuration discovery stays anchored to the
@@ -287,7 +293,8 @@ copy's setup time and disk cost are not justified.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Cannot run with isolation: "worktree"` | Not a git repo, no commits, or `git worktree add` failed | `git init` + one commit, or drop the option |
+| `Cannot run with isolation: "worktree"` | Not a git repo, no commits, or `git worktree add` failed before a workspace existed | `git init` + one commit, or drop the option |
+| Call fails after add, naming a retained path | Post-add verification failed | Inspect the reported path; it is retained conservatively |
 | Agent reports a clean tree when reviewing "my changes" | Fresh worktree has no uncommitted caller changes | Review in the shared checkout, or commit first |
 | Branch request refused as busy | Another agent holds the lease | Steer/resume that agent, or pick another branch |
 | Agent edited the main checkout anyway | Absolute parent paths in the brief, or it `cd`'d out | Repository-relative paths; restrict `bash` |
