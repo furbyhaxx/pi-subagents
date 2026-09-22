@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   // The print-mode e2e suite (test/subagents-print-mode-e2e.test.ts) drives REAL
@@ -12,6 +12,11 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
+    // `.pi/git/**` holds pi's cached checkout of this extension when it is
+    // installed from git; it is a full clone with its own `test/`, and the
+    // default include would run those stale copies against the local
+    // node_modules. Keep them out so `npm test` reflects this working tree.
+    exclude: [...configDefaults.exclude, "**/.pi/**"],
     // Sandbox `PI_CODING_AGENT_SESSION_DIR` per test file, before any test
     // imports — the fixtures isolate the agent dir and HOME, but an inherited
     // session-root override sends real child sessions into the live session
