@@ -17,8 +17,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
 // over ordinary top-level consts.
-const { buildSessionContext, createAgentSession, inMemory } = vi.hoisted(() => ({
-  buildSessionContext: vi.fn(),
+const { createAgentSession, inMemory } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   inMemory: vi.fn(),
 }));
@@ -27,7 +26,6 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   const actual = await vi.importActual<any>("@earendil-works/pi-coding-agent");
   return {
     ...actual,
-    buildSessionContext,
     createAgentSession,
     SessionManager: { ...actual.SessionManager, inMemory },
   };
@@ -36,18 +34,20 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
 import { agentMentionReminder } from "../src/mention.js";
 import { runMentionClone } from "../src/mention-clone.js";
 
-/** One user turn and its reply, as buildSessionContext resolves them. */
-const CONVERSATION = [
-  { role: "user", content: [{ type: "text", text: "hi" }] },
-  { role: "assistant", content: [{ type: "text", text: "hello" }] },
+/**
+ * The parent's active branch entries, as `buildContextEntries()` returns them.
+ * Pi 0.87 made the SessionManager canonical for provider context, so the clone
+ * is seeded with these instead of having messages pushed onto agent state.
+ */
+const CONTEXT_ENTRIES = [
+  { type: "message", id: "u1", parentId: null, timestamp: "t" },
+  { type: "message", id: "a1", parentId: "u1", timestamp: "t" },
 ] as any[];
 
 beforeEach(() => {
   createAgentSession.mockReset();
   inMemory.mockReset();
   inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
-  buildSessionContext.mockReset();
-  buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
 });
 
 /** The main session's context — the one the spawn must be attributed to. */
@@ -59,8 +59,7 @@ function mainCtx(overrides: Record<string, unknown> = {}) {
     modelRegistry: { runtime: { kind: "runtime" } },
     getSystemPrompt: vi.fn(() => "the live system prompt"),
     sessionManager: {
-      getEntries: vi.fn(() => [{ type: "message" }] as any[]),
-      getLeafId: vi.fn(() => "leaf-1"),
+      buildContextEntries: vi.fn(() => CONTEXT_ENTRIES),
     },
     ...overrides,
   } as any;
@@ -131,28 +130,31 @@ const opts = (over: Record<string, unknown> = {}) => ({
 }) as any;
 
 describe("cloning the conversation", () => {
-  it("carries the conversation's own messages, not a rendering of them", async () => {
-    // The whole point: the copy reasons over what the main model can see.
-    const session = cloneSession(callsAgent());
+  it("seeds the clone with the conversation's own entries, not a rendering of them", async () => {
+    // The whole point: the copy reasons over what the main model can see. Pi
+    // 0.87 reads provider context from the SessionManager, so the entries are
+    // handed to the in-memory manager at construction.
+    const ctx = mainCtx();
+    cloneSession(callsAgent());
 
-    await runMentionClone(opts());
+    await runMentionClone(opts({ ctx }));
 
-    expect(session.agent.state.messages).toEqual([
-      { role: "user", content: [{ type: "text", text: "hi" }] },
-      { role: "assistant", content: [{ type: "text", text: "hello" }] },
-    ]);
+    expect(ctx.sessionManager.buildContextEntries).toHaveBeenCalled();
+    expect(inMemory).toHaveBeenCalledWith("/repo", undefined, CONTEXT_ENTRIES);
+    expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
+      kind: "in-memory-session-manager",
+    });
   });
 
   it("takes the conversation from memory, never from the session file", async () => {
     // SessionManager withholds every write until the first assistant message,
     // so a file-based copy is empty for the whole of the first turn — which is
     // exactly when someone types their first mention.
-    const o = opts();
     cloneSession(callsAgent());
 
-    await runMentionClone(o);
+    await runMentionClone(opts());
 
-    expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
+    expect(inMemory).toHaveBeenCalledTimes(1);
     expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
       kind: "in-memory-session-manager",
     });
@@ -166,13 +168,11 @@ describe("cloning the conversation", () => {
     expect(createAgentSession.mock.calls[0][0].thinkingLevel).toBe("high");
   });
 
-  it("omits the level rather than taking buildSessionContext's, which lies", async () => {
-    // getSessionContextSettings starts at "off" and moves only on an explicit
-    // thinking_level_change entry, so a session where nobody ran /think reports
-    // "off". Passing that would silently think less than the user asked for;
-    // omitting it lets createAgentSession resolve the real level from settings.
-    // Also the Pi <0.82.0 path, where ctx has no thinkingLevel at all.
-    buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "off", model: null } as any);
+  it("omits the level when the live session does not expose one", async () => {
+    // `ctx.thinkingLevel` is the live level. When it is absent — an older host,
+    // or a session that never chose one — omitting the option lets
+    // createAgentSession resolve it from the restored transcript and settings
+    // instead of guessing "off".
     const o = opts({ ctx: mainCtx({ thinkingLevel: undefined }) });
     cloneSession(callsAgent());
 
@@ -185,25 +185,27 @@ describe("cloning the conversation", () => {
     // First input of a fresh session. There is no history to carry, which is an
     // answer and not a failure — the copy still runs on the main model and
     // system prompt, and still makes the call.
-    buildSessionContext.mockReturnValue({ messages: [], thinkingLevel: "medium", model: null } as any);
-    const o = opts();
-    const session = cloneSession(callsAgent());
+    const ctx = mainCtx({ sessionManager: { buildContextEntries: vi.fn(() => []) } });
+    cloneSession(callsAgent());
 
-    const result = await runMentionClone(o);
+    const result = await runMentionClone(opts({ ctx }));
 
     expect(result).toEqual({ spawned: true });
-    expect(session.agent.state.messages).toEqual([]);
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    expect(inMemory).toHaveBeenCalledWith("/repo", undefined, []);
   });
 
-  it("carries the live system prompt rather than the one it rebuilt", async () => {
-    // createAgentSession derives a prompt from cwd and agentDir. Close, but not
-    // what the user's model is working under — extensions add to it per turn.
-    const session = cloneSession(callsAgent());
+  it("seeds the parent's transcript so the live system prompt carries over", async () => {
+    // Pi 0.86+ records the prompt and tool declarations as system messages in
+    // the transcript, so restoring the parent's entries carries the prompt the
+    // user's model is working under — extensions included. Pi 0.87 no longer
+    // honors a post-construction `agent.state.systemPrompt` assignment, which
+    // was the pre-0.87 way to copy it.
+    const ctx = mainCtx();
+    cloneSession(callsAgent());
 
-    await runMentionClone(opts());
+    await runMentionClone(opts({ ctx }));
 
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    expect(inMemory).toHaveBeenCalledWith("/repo", undefined, CONTEXT_ENTRIES);
   });
 
   it("inherits the parent's model, thinking level and providers", async () => {

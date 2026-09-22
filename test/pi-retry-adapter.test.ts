@@ -38,6 +38,7 @@ function fakeSession(initialModel = model("one", "a")) {
   const appendModelChange = vi.fn();
   const appendThinkingLevelChange = vi.fn();
   const emitModelSelect = vi.fn(async () => {});
+  const omitRecoveryAttempt = vi.fn();
   const raw = {
     agent: { state },
     sessionManager: { appendModelChange, appendThinkingLevelChange, getBranch: vi.fn(() => []) },
@@ -51,6 +52,7 @@ function fakeSession(initialModel = model("one", "a")) {
     _lastAssistantMessage: failure,
     _willRetryAfterAgentEnd: vi.fn(() => false),
     _isRetryableError: vi.fn(() => true),
+    _omitRecoveryAttempt: omitRecoveryAttempt,
     _emit: vi.fn(),
     _emitModelSelect: emitModelSelect,
     _handlePostAgentRun: vi.fn(async function(this: { _lastAssistantMessage?: unknown }) {
@@ -65,12 +67,13 @@ function fakeSession(initialModel = model("one", "a")) {
     appendModelChange,
     appendThinkingLevelChange,
     emitModelSelect,
+    omitRecoveryAttempt,
   };
 }
 
 describe("Pi retry adapter", () => {
   it("switches after Pi exhausts a retryable failure even on a future Pi version", async () => {
-    const { session, raw, appendModelChange } = fakeSession();
+    const { session, raw, appendModelChange, omitRecoveryAttempt, failure } = fakeSession();
     const next = model("two", "b");
     const cleanup = beginModelFallbackInvocation(session, {
       candidates: [
@@ -81,7 +84,9 @@ describe("Pi retry adapter", () => {
     });
 
     await expect(raw._handlePostAgentRun()).resolves.toBe(true);
-    expect(raw.agent.state.messages).toEqual([]);
+    // Pi 0.87: the failed attempt is omitted from the session projection, not
+    // deleted from raw agent state.
+    expect(omitRecoveryAttempt).toHaveBeenCalledWith(failure);
     expect(raw.agent.state.model).toMatchObject({ provider: "two", id: "b" });
     expect(appendModelChange).toHaveBeenCalledWith("two", "b");
     expect(getSessionModelCandidates(session)?.currentIndex).toBe(1);
@@ -99,7 +104,7 @@ describe("Pi retry adapter", () => {
     expect(getSessionModelCandidates(session)).toMatchObject({ currentIndex: 0 });
   });
 
-  it.each(["_handlePostAgentRun", "_isRetryableError", "_emitModelSelect"] as const)(
+  it.each(["_handlePostAgentRun", "_isRetryableError", "_omitRecoveryAttempt", "_emitModelSelect"] as const)(
     "rejects incompatible sessions missing %s rather than disabling fallback",
     async method => {
       const { session, raw } = fakeSession();
@@ -138,7 +143,7 @@ describe("Pi retry adapter", () => {
   });
 
   it("does not switch after the runner's turn limit aborted the session", async () => {
-    const { session, raw, failure } = fakeSession();
+    const { session, raw, failure, omitRecoveryAttempt } = fakeSession();
     beginModelFallbackInvocation(session, {
       candidates: [
         { input: "one/a", model: raw.agent.state.model },
@@ -150,6 +155,7 @@ describe("Pi retry adapter", () => {
 
     await expect(raw._handlePostAgentRun()).resolves.toBe(false);
     expect(raw.agent.state.messages).toEqual([failure]);
+    expect(omitRecoveryAttempt).not.toHaveBeenCalled();
     expect(raw.agent.state.model.provider).toBe("one");
   });
 

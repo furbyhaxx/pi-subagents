@@ -47,14 +47,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   type AssistantMessage,
-  type Context,
   type FauxContentBlock,
   type FauxResponseStep,
   fauxAssistantMessage,
   fauxText,
   fauxToolCall,
+  getCurrentTools,
   type Model,
   type ToolCall,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
@@ -189,10 +190,10 @@ export function agentCall(
 }
 
 function resolveReply(
-  reply: FauxReply | ((ctx: Context) => FauxReply),
-  ctx: Context,
+  reply: FauxReply | ((ctx: TranscriptContext) => FauxReply),
+  ctx: TranscriptContext,
 ): FauxReply {
-  return typeof reply === "function" ? (reply as (c: Context) => FauxReply)(ctx) : reply;
+  return typeof reply === "function" ? (reply as (c: TranscriptContext) => FauxReply)(ctx) : reply;
 }
 
 /**
@@ -205,12 +206,15 @@ function resolveReply(
  * Each route may be a value or a `(ctx) => value` function.
  */
 export function routeBySession(routes: {
-  parentInitial: FauxReply | ((ctx: Context) => FauxReply);
-  parentFinal?: FauxReply | ((ctx: Context) => FauxReply);
-  subagent: FauxReply | ((ctx: Context) => FauxReply);
+  parentInitial: FauxReply | ((ctx: TranscriptContext) => FauxReply);
+  parentFinal?: FauxReply | ((ctx: TranscriptContext) => FauxReply);
+  subagent: FauxReply | ((ctx: TranscriptContext) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = (context.tools ?? []).some((t) => t.name === "Agent");
+    // Pi 0.86+ hands providers a TranscriptContext: the prompt and tool set are
+    // replayed from system messages, so `context.tools` no longer exists. Read
+    // the current declarations the same way pi's own providers do.
+    const isParent = getCurrentTools(context.messages).some((t) => t.name === "Agent");
     if (!isParent) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
       (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",

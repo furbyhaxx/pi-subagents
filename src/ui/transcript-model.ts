@@ -149,6 +149,8 @@ function messageSignature(message: TranscriptMessage): string {
       return `${message.role}|${message.timestamp}|${message.tokensBefore}|${message.summary}`;
     case "branchSummary":
       return `${message.role}|${message.timestamp}|${message.fromId}|${message.summary}`;
+    case "system":
+      return `${message.role}|${message.timestamp}|${textContent(message.content)}|${stableStringify(message.sections)}|${stableStringify(message.toolsAdded)}`;
     case "user":
       return `${message.role}|${message.timestamp}|${textContent(message.content)}`;
   }

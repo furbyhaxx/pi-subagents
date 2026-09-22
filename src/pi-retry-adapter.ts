@@ -30,6 +30,7 @@ interface PrivateAgentSession {
   _handlePostAgentRun(): Promise<boolean>;
   _lastAssistantMessage?: AssistantFailure;
   _isRetryableError(message: AssistantFailure): boolean;
+  _omitRecoveryAttempt(message: AssistantFailure): void;
   _emit(event: { type: "thinking_level_changed"; level: ModelThinkingLevel }): void;
   _emitModelSelect(next: Model<Api>, previous: Model<Api> | undefined, source: "set"): Promise<void>;
 }
@@ -131,6 +132,7 @@ function installAdapter(session: AgentSession): InstalledAdapter {
   if (
     typeof privateSession._handlePostAgentRun !== "function"
     || typeof privateSession._isRetryableError !== "function"
+    || typeof privateSession._omitRecoveryAttempt !== "function"
     || typeof privateSession._emitModelSelect !== "function"
   ) {
     throw new Error("Model fallback is incompatible with this pi AgentSession implementation.");
@@ -158,9 +160,12 @@ function installAdapter(session: AgentSession): InstalledAdapter {
     }
     if (!(await advanceCandidate(session, adapter))) return shouldContinue;
 
-    const messages = session.agent.state.messages;
-    if (messages[messages.length - 1] === failure) {
-      session.agent.state.messages = messages.slice(0, -1);
+    // Pi 0.87 made the SessionManager canonical for provider context: the failed
+    // attempt must be omitted through the session projection, not by mutating
+    // `agent.state.messages`. Reuse Pi's own recovery omission so the raw
+    // transcript, accounting, and UI history stay intact.
+    if (terminalFailureRemains(session, failure)) {
+      privateSession._omitRecoveryAttempt(failure);
     }
     return true;
   };

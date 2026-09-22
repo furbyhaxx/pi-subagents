@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Preloaded skill discovery now follows symlinks like Pi.** Symlinked roots, flat skill files, skill directories, and inner `SKILL.md` files are discoverable, with canonical-directory tracking preventing cycles. Skill-name path-traversal validation is unchanged.
+- **Updated for Pi 0.87.** 0.87 made the SessionManager canonical for an `AgentSession`'s provider context, so the mention clone now seeds its in-memory `SessionManager` from the parent's active branch entries instead of pushing onto `agent.state.messages`, and the model-fallback adapter omits a failed attempt through Pi's `_omitRecoveryAttempt` instead of splicing raw history. `SessionEntry` consumers handle the new `context_edit` entry, and the faux-model test helpers read prompt and tool declarations with `getCurrentSystemPrompt`/`getCurrentTools`.
 
 ### Fixed
 - **`Agent({resume})` now reaches an evicted agent instead of reporting it cleaned up.** Its lookup consulted only the live record map, so roughly ten minutes after an agent settled the id stopped working — while `@handle` reopened the very same conversation from disk. Resume now accepts an id or a handle and reopens a stored session in the background, sharing one code path with the mention.

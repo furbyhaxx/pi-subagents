@@ -27,8 +27,8 @@
  * against a Pi that does not aggregate, this fails rather than skipping, which
  * is how the range stays honest. `peerDependencies` moved to `>=0.81.0` for
  * exactly this reason, so the CI floor job runs it too. The floor has since moved
- * on past it (the Workflow tool needs 0.84.0), so this no longer pins the range's
- * lower edge — it still pins the behaviour that made 0.80.x unsupportable.
+ * on past it (now 0.87.0), so this no longer pins the range's lower edge — it
+ * still pins the behaviour that made 0.80.x unsupportable.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -115,19 +115,20 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
   });
 
   it("leaves the context-window percentage alone", async () => {
-    // pi derives context usage from assistant messages only. If that ever
-    // changed, a delegating session would look like it was filling its context
-    // with work that happened somewhere else entirely — and users would compact
-    // for no reason.
+    // A delegating session must not look like it is filling its context with
+    // work that happened somewhere else entirely, or users would compact for no
+    // reason. Pi 0.87 estimates context usage from the projected transcript, so
+    // the tool-result message's own few tokens count (~0.002% of 200k); the
+    // 150k reported inside its nested `usage` must not, which would read as
+    // ~75%. Assert the magnitude rather than exact equality so the estimate's
+    // own small contribution is allowed.
     const session = await realSession();
     try {
-      const before = session.getSessionStats().contextUsage?.percent ?? null;
-
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
       session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(session.getSessionStats().contextUsage?.percent ?? 0).toBeLessThan(1);
     } finally {
       session.dispose?.();
     }

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Context, fauxToolCall } from "@earendil-works/pi-ai";
+import { type Context, fauxToolCall, getCurrentTools } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESSAGING_ENTRY_TYPE, type MessageCardData } from "../src/messaging/entry.js";
@@ -242,7 +242,7 @@ describe("agent messaging e2e", () => {
       live: false,
       respond: (context: Context) => {
         if (promptText(context).includes("isolated-child")) {
-          isolatedTools = (context.tools ?? []).map(tool => tool.name);
+          isolatedTools = getCurrentTools(context.messages).map(tool => tool.name);
           return "ISOLATED_DONE";
         }
         if (toolResults(context, "Agent").length > 0) return "PROBE_DONE";
@@ -287,7 +287,7 @@ describe("agent messaging e2e", () => {
       respond: async (context: Context) => {
         const prompt = promptText(context);
         if (prompt.includes("nested-child")) {
-          nestedTools = (context.tools ?? []).map(tool => tool.name);
+          nestedTools = getCurrentTools(context.messages).map(tool => tool.name);
           markNestedEntered?.();
           await nestedRelease;
           return "NESTED_DONE";

@@ -79,7 +79,9 @@ describe("mention clone tool reachability against real pi-mono", () => {
       // mention-clone reads the runtime off the registry facade, the same shim
       // agent-runner carries for Pi >= 0.80.8.
       modelRegistry: { ...backend.modelRegistry, runtime: backend.modelRuntime },
-      sessionManager: { getEntries: () => [], getLeafId: () => undefined },
+      // Pi 0.87 seeds the clone's in-memory SessionManager from the parent's
+      // active branch entries, so the facade must expose buildContextEntries().
+      sessionManager: { buildContextEntries: () => [] },
     };
 
     // Never called: the assertion is on what the session exposes, not on the
