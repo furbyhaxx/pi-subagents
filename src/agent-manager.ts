@@ -448,6 +448,7 @@ export class AgentManager {
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   private worktreeApis = new Map<string, ExtensionAPI>();
+  private defaultApi?: ExtensionAPI;
   /** Includes settlement/gates, even after a record has a terminal display status. */
   private activeRuns = new Set<string>();
   private runCompletions = new Map<string, { generation: number; promise: Promise<void>; resolve: () => void }>();
@@ -514,6 +515,10 @@ export class AgentManager {
     factory: ((caller: { agentId: string; sessionId: string }) => ToolDefinition[]) | undefined,
   ): void {
     this.messagingToolFactory = factory;
+  }
+
+  setDefaultApi(api: ExtensionAPI): void {
+    this.defaultApi = api;
   }
 
   /** Update the max concurrent background agents limit. */
@@ -1444,7 +1449,7 @@ export class AgentManager {
     if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") return undefined;
     // A runtime may have been installed since the original run. Never turn a
     // prior true into false; this flag is the record's settlement safety memory.
-    record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id));
+    record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id) ?? this.defaultApi);
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1590,7 +1595,7 @@ export class AgentManager {
 
   private async finishWorktreeResume(record: AgentRecord, generation: number): Promise<void> {
     const worktree = record.worktree!;
-    const pi = this.worktreeApis.get(record.id);
+    const pi = this.worktreeApis.get(record.id) ?? this.defaultApi;
     const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
     if (record.runGeneration !== generation || !this.isRunActive(record.id)) return;
     if (!this.claimWorktreeSettlement(record, generation)) return;
@@ -1643,10 +1648,11 @@ export class AgentManager {
     // The current registry catches a runtime installed after the original
     // spawn. The record's true value is intentionally sticky for the opposite
     // case: a runtime disappearing after launch must retain the tree.
-    record.jobsPossible ||= backgroundJobsPossible(pi);
+    const runtime = this.worktreeApis.get(record.id) ?? pi ?? this.defaultApi;
+    record.jobsPossible ||= backgroundJobsPossible(runtime);
     if (!record.jobsPossible) return undefined;
 
-    const result = await stopWorktreeJobs(pi?.events, worktree.path);
+    const result = await stopWorktreeJobs(runtime?.events, worktree.path);
     if (result.outcome === "unavailable") {
       return {
         outcome: "failed",
@@ -1657,7 +1663,7 @@ export class AgentManager {
   }
 
   private async prepareWorktreeResume(record: AgentRecord): Promise<void> {
-    const pi = this.worktreeApis.get(record.id);
+    const pi = this.worktreeApis.get(record.id) ?? this.defaultApi;
     if (!pi || !record.worktree) throw new Error("Cannot resume: worktree scope is unavailable.");
     if (!isWorktreeIsolationEnabled() || agentIsolation(record.type, record.configCwd, record.parentAgentId) === "off") {
       throw new Error("Cannot resume a worktree: worktree isolation is disabled.");
@@ -1686,7 +1692,7 @@ export class AgentManager {
     record.status = "running";
     record.startedAt = Date.now();
     this.recordInvocation(record, id);
-    record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id));
+    record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id) ?? this.defaultApi);
     this.activateRun(record, generation, occupiesPoolSlot(record) ? "background" : undefined);
     const currentRun = () => this.isRunActive(id) && record.runGeneration === generation;
 
@@ -1972,7 +1978,7 @@ export class AgentManager {
 
     const worktree = record.worktree;
     if (worktree && this.claimWorktreeSettlement(record, generation)) {
-      const pi = this.worktreeApis.get(record.id);
+      const pi = this.worktreeApis.get(record.id) ?? this.defaultApi;
       if (!pi) {
         record.worktreeQuiescenceError = "worktree runtime is unavailable; termination could not be confirmed";
         record.worktreeResult = retainedWorktreeResult(worktree);

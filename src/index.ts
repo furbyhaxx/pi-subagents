@@ -910,6 +910,7 @@ export default function (pi: ExtensionAPI) {
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
   });
+  manager.setDefaultApi(pi);
   if (messagingSettings.enabled !== false && isSqliteAvailable()) {
     manager.setMessagingToolFactory(caller =>
       createMessagingTools(() => messagingService, () => caller));
