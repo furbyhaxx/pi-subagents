@@ -259,6 +259,7 @@ describe("Agent tool — background resume wiring", () => {
     expect(resumeAgent).toHaveBeenCalledTimes(1);
     const text = resultText(second);
     expect(text).toContain("still running");
+    expect(text).toContain("stop_subagent first");
     expect(text).toContain("steer_subagent");
 
     await lifecycle.get("session_shutdown")?.({}, ctx);

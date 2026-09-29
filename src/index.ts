@@ -5,6 +5,7 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   stop_subagent         — LLM-callable: stop and detach a running agent
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -239,6 +240,7 @@ export function restoredRecordFromSession(
   }
   return {
     id: `restored-${info.id}`,
+    ...(agentId !== undefined ? { originalId: agentId } : {}),
     type,
     description: prompt?.split("\n").find(line => line.trim())?.trim().slice(0, 120) || info.name || type,
     taskPrompt: prompt,
@@ -992,10 +994,10 @@ export default function (pi: ExtensionAPI) {
   };
 
   /**
-   * Resolve a tool's `agent_id` as an id OR a handle, so the model addresses
-   * agents by the same names the user types. Ids are tried first, keeping the
-   * existing behaviour exact — a handle is only consulted when the string is
-   * not an id at all. Only live records: a tombstone has nothing to steer and
+   * Resolve a tool's `agent_id` as a current/original ID OR a handle, so the
+   * model addresses agents by the same names the user types. Current IDs are
+   * tried first; a handle is consulted only when neither ID matches. Only live
+   * records: a tombstone has nothing to steer and
    * no result to read. Callers still enforce the nested-ownership rejection.
    */
   const resolveAgentRef = (ref: string): AgentRecord | undefined => {
@@ -2007,9 +2009,9 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls — they run concurrently.
-- Background by default; completion notifies you. Pass run_in_background: false only when your next action depends on the result and no independent work remains. Never invent pending results; say the agent is still running.
+- Background by default, with completion notices. Use run_in_background: false only when the next action needs the result. Never invent results; say when the agent is still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
+- resume continues a previous agent by ID; steer_subagent steers; stop_subagent stops and keeps it resumable.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -2035,6 +2037,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
+- Use stop_subagent to stop a running or queued agent; resume it later with Agent({resume: agent_id}).
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Omit model to use the agent's configured fallback list. For an agent with configured models, override it only to recover or resume when that selection is unavailable; an explicit "provider/modelId[:thinking]" or fuzzy name replaces the list.
@@ -2156,7 +2159,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID or handle to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run. An agent whose in-memory record has been evicted still resumes, reopening its stored session in the background.",
+          description: "Optional agent ID or handle to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. A genuinely running agent must be stopped with stop_subagent before it can be resumed. An agent whose in-memory record has been evicted still resumes, reopening its stored session in the background.",
         }),
       ),
       isolated: Type.Optional(
@@ -2552,6 +2555,13 @@ Terse command-style prompts produce shallow, generic work.
           }
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
+        if (existing.status === "running" || existing.status === "queued" || manager.isRunActive(existing.id)) {
+          const runState = existing.status === "queued" ? "queued" : "running";
+          return textResult(
+            `Agent "${params.resume}" is still ${runState} and cannot be resumed yet. Use stop_subagent first to stop or detach it.\n` +
+            `Use steer_subagent to send a message mid-run, or get_subagent_result to wait for it.`,
+          );
+        }
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
@@ -2570,18 +2580,6 @@ Terse command-style prompts produce shallow, generic work.
         // so a resumed agent always blocked the main loop until it finished.
         if (runInBackground) {
           const id = existing.id;
-          // A detached resume hands control back while the record stays
-          // "running", so nothing stops the model from resuming the same agent
-          // again mid-run. manager.resume() refuses that (it would orphan the
-          // live run's abort controller); say why here, where the model can act
-          // on it, instead of letting it read as a generic failure.
-          if (existing.status === "running" || existing.status === "queued") {
-            return textResult(
-              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
-            );
-          }
-
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
             maxTurns: effectiveMaxTurns,
@@ -3401,7 +3399,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelNudge(record.id);
       }
 
       // Verbose: include full conversation
@@ -3470,6 +3468,42 @@ Terse command-style prompts produce shallow, generic work.
       } catch (err) {
         return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+  }));
+
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description:
+      "Stop a running or queued agent without removing its record. If a run does not settle within 10 seconds, detach it so it can be resumed.",
+    promptSnippet: "Stop a running or queued agent while preserving resumability",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID to stop. Its handle or original ID also works.",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+      const active = record.status === "running" || record.status === "queued" || manager.isRunActive(record.id);
+      const stopped = record.status === "stopped" || active
+        ? await manager.stop(record.id)
+        : false;
+      const status = stopped ? record.status : `not running (status: ${record.status})`;
+      const workspaceChanges = record.worktree
+        ? record.worktreeResult
+          ? record.worktreeResult.hasChanges ? "changes detected" : "no changes detected"
+          : record.worktree.initialDirty ? "changes present at acquisition; current state not verified" : "current state not verified"
+        : undefined;
+      return textResult(
+        `Agent ${record.id}: ${status}.\n` + formatWorkspace(record) +
+        (workspaceChanges ? `Workspace changes: ${workspaceChanges}\n` : "") +
+        `Resumable with Agent({resume: "${record.id}"}).`,
+      );
     },
   }));
 

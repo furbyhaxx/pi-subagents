@@ -3,7 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../src/agent-runner.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
+  return { ...actual, resumeAgent: vi.fn() };
+});
+
 import { AgentManager } from "../src/agent-manager.js";
+import { resumeAgent } from "../src/agent-runner.js";
 import subagentsExtension, { restoredRecordFromSession } from "../src/index.js";
 import { createOutputFilePath } from "../src/output-file.js";
 import { resolveSubagentSessionDir } from "../src/session-dir.js";
@@ -120,6 +127,8 @@ describe("persisted subagent session restore", () => {
     ]));
 
     expect(record).toMatchObject({
+      id: `restored-${info.id}`,
+      originalId: "full-agent-id-9999",
       status: "stopped",
       error: "user stop",
       startedAt: 100,
@@ -355,6 +364,97 @@ describe("persisted subagent restore under the session-root override", () => {
     expect((binding as { data?: { artifactRoot?: string } }).data?.artifactRoot?.startsWith(container)).toBe(true);
     expect(createOutputFilePath(parentCwd, "agent-1", "session-1").startsWith(container)).toBe(true);
     expect(existsSync(join(agentDir, "sessions"))).toBe(false);
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("resolves restored agents by current and original IDs across result, steer, and resume", async () => {
+    const container = resolveSubagentSessionDir()!;
+    const parent = SessionManager.create(parentCwd, sessionRoot);
+    const parentSession = parent.getSessionFile()!;
+    const originalId = "persisted-agent-id-1234";
+    parent.appendCustomEntry("subagents:record", {
+      id: originalId,
+      status: "stopped",
+      error: "stopped by caller",
+      startedAt: 1,
+    });
+    const child = persistedChild({ dir: container, cwd: worktreeCwd, parentSession, agentId: originalId, task: "continue this task" });
+    const childFile = child.getSessionFile()!;
+    const { tools, lifecycle, ctx } = boot(parent);
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "continued" } as never);
+
+    await lifecycle.get("session_start")?.({}, ctx);
+
+    const childInfo = (await SessionManager.listAll(container)).find(info => info.path === childFile)!;
+    const currentId = `restored-${childInfo.id}`;
+    const resultByOriginalId = await tools.get("get_subagent_result").execute(
+      "tc-original-result", { agent_id: originalId }, undefined, undefined, ctx,
+    );
+    const resultByCurrentId = await tools.get("get_subagent_result").execute(
+      "tc-current-result", { agent_id: currentId }, undefined, undefined, ctx,
+    );
+    const steered = await tools.get("steer_subagent").execute(
+      "tc-steer", { agent_id: originalId, message: "continue" }, undefined, undefined, ctx,
+    );
+
+    expect(resultByOriginalId.content[0].text).toContain("Status: stopped");
+    expect(resultByCurrentId.content[0].text).toContain(`Agent: ${currentId}`);
+    expect(steered.content[0].text).toContain("not running (status: stopped)");
+    expect(steered.content[0].text).not.toContain("Agent not found");
+    const stoppedByOriginalId = await tools.get("stop_subagent").execute(
+      "tc-stop", { agent_id: originalId }, undefined, undefined, ctx,
+    );
+    expect(stoppedByOriginalId.content[0].text).toContain(`Agent ${currentId}: stopped`);
+
+    const resumed = await tools.get("Agent").execute("tc-resume", {
+      prompt: "continue",
+      description: "Resume task",
+      subagent_type: "general-purpose",
+      resume: originalId,
+      run_in_background: true,
+    }, undefined, undefined, ctx);
+    expect(resumed.content[0].text).toContain("resumed in background");
+    expect(resumeAgent).toHaveBeenCalledWith(expect.anything(), "continue", expect.anything());
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("reports restored workspace and dirty-state hints when stopped by original ID", async () => {
+    const container = resolveSubagentSessionDir()!;
+    const parent = SessionManager.create(parentCwd, sessionRoot);
+    const parentSession = parent.getSessionFile()!;
+    const originalId = "workspace-agent-id";
+    parent.appendCustomEntry("subagents:record", {
+      id: originalId,
+      status: "stopped",
+      startedAt: 1,
+    });
+    const child = persistedChild({ dir: container, cwd: worktreeCwd, parentSession, agentId: originalId, task: "stopped workspace" });
+    child.appendCustomEntry("subagents:workspace", {
+      worktree: {
+        lifecycle: "retained",
+        sourceRoot: parentCwd,
+        commonDir: join(parentCwd, ".git"),
+        reused: false,
+        initialDirty: true,
+        path: join(root, "retained-worktree"),
+        branch: "feat/restored",
+        baseSha: "abc",
+        workPath: join(root, "retained-worktree"),
+      },
+    });
+    const { tools, lifecycle, ctx } = boot(parent);
+
+    await lifecycle.get("session_start")?.({}, ctx);
+    const stopped = await tools.get("stop_subagent").execute(
+      "tc-stop-workspace", { agent_id: originalId }, undefined, undefined, ctx,
+    );
+
+    expect(stopped.content[0].text).toContain(`Workspace: ${join(root, "retained-worktree")}`);
+    expect(stopped.content[0].text).toContain("Branch: feat/restored");
+    expect(stopped.content[0].text).toContain("Workspace changes: changes present at acquisition");
+    expect(stopped.content[0].text).toContain("Resumable with Agent({resume:");
 
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });

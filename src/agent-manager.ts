@@ -129,6 +129,7 @@ const DEFAULT_MAX_CONCURRENT = 10;
  * cache (#253) — opt in; everyone else keeps today's behaviour exactly.
  */
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
+const STOP_GRACE_PERIOD_MS = 10_000;
 
 /**
  * How many evicted agents stay addressable by name. Only a bound on memory —
@@ -449,6 +450,8 @@ export class AgentManager {
   private worktreeApis = new Map<string, ExtensionAPI>();
   /** Includes settlement/gates, even after a record has a terminal display status. */
   private activeRuns = new Set<string>();
+  private runCompletions = new Map<string, { generation: number; promise: Promise<void>; resolve: () => void }>();
+  private runDetachers = new Map<string, { generation: number; detach: () => void }>();
 
   /**
    * Startup phases, keyed by agent id. `spawn()` still returns synchronously,
@@ -720,21 +723,25 @@ export class AgentManager {
    *   handle goes back.
    */
   private launch(id: string, record: AgentRecord, args: SpawnArgs, queuedPool: Pool | undefined): Promise<void> {
-    const startup = this.startAgent(id, record, args).then(
+    const generation = (record.runGeneration ?? 0) + 1;
+    record.runGeneration = generation;
+    const startup = this.startAgent(id, record, args, generation).then(
       () => { this.startups.delete(id); },
       (err) => {
         this.startups.delete(id);
-        if (queuedPool !== undefined) {
-          // Mirrors settleRun: an inline caller gets this failure as a throw
-          // out of spawnAndWait, so an unconsumed record would ALSO nudge the
-          // session about it — the same failure reported twice.
-          if (queuedPool === "foreground") record.resultConsumed = true;
-          record.status = "error";
-          record.error = err instanceof Error ? err.message : String(err);
-          record.completedAt = Date.now();
-          this.onComplete?.(record);
-        } else {
-          this.agents.delete(id);
+        if (record.runGeneration === generation) {
+          if (queuedPool !== undefined) {
+            // Mirrors settleRun: an inline caller gets this failure as a throw
+            // out of spawnAndWait, so an unconsumed record would ALSO nudge the
+            // session about it — the same failure reported twice.
+            if (queuedPool === "foreground") record.resultConsumed = true;
+            record.status = "error";
+            record.error = err instanceof Error ? err.message : String(err);
+            record.completedAt = Date.now();
+            this.onComplete?.(record);
+          } else {
+            this.agents.delete(id);
+          }
         }
         // The agent never kept its slot (startAgent gives it back on failure),
         // so anything queued behind it can go now.
@@ -767,6 +774,7 @@ export class AgentManager {
     id: string,
     record: AgentRecord,
     { pi, ctx, type, prompt, options }: SpawnArgs,
+    generation: number,
   ) {
     // Re-validate a caller-supplied cwd: queued spawns can start minutes after
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
@@ -793,16 +801,12 @@ export class AgentManager {
     // never reach `settleRun`, so they hand the slot back themselves.
     const pool = this.poolFor(record);
     const releaseSlot = () => {
-      this.activeRuns.delete(id);
-      if (pool === "background") this.runningBackground--;
-      else if (pool === "foreground") this.runningForeground--;
+      if (this.releaseRun(record, generation)) this.drainQueue();
     };
     record.status = "running";
     record.startedAt = Date.now();
     record.startGate = undefined;
-    this.activeRuns.add(id);
-    if (pool === "background") this.runningBackground++;
-    else if (pool === "foreground") this.runningForeground++;
+    this.activateRun(record, generation, pool);
     // A queued record may start after the parent runtime was installed. Keep
     // the per-record flag conservative without replacing a prior true value.
     record.jobsPossible ||= backgroundJobsPossible(pi);
@@ -852,6 +856,10 @@ export class AgentManager {
         }
       } catch (error) {
         if (isWorktreeAcquisitionError(error)) {
+          if (record.runGeneration !== generation || !this.isRunActive(id)) {
+            await cleanupWorktree(pi, baseCwd, error.worktree, options.description);
+            return;
+          }
           record.worktree = error.worktree;
           record.worktreeResult = retainedWorktreeResult(error.worktree);
           record.effectiveCwd = error.worktree.workPath;
@@ -860,6 +868,10 @@ export class AgentManager {
         }
         releaseSlot();
         throw error;
+      }
+      if (record.runGeneration !== generation || !this.isRunActive(id)) {
+        await cleanupWorktree(pi, baseCwd, wt, options.description);
+        return;
       }
       record.worktree = wt;
       // The registry may have become available while the copy was being
@@ -923,6 +935,8 @@ export class AgentManager {
       }
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    this.runDetachers.set(id, { generation, detach });
+    const currentRun = () => this.isRunActive(id) && record.runGeneration === generation;
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -956,22 +970,26 @@ export class AgentManager {
       configCwd: record.configCwd,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
+        if (!currentRun()) return;
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
       onAssistantUsage: (usage) => {
+        if (!currentRun()) return;
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
+        if (!currentRun()) return;
         record.compactionCount++;
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
       },
       onModelTransition: (transition) => {
+        if (!currentRun()) return;
         applyModelTransition(record, transition);
         options.onModelTransition?.(transition);
       },
@@ -982,6 +1000,10 @@ export class AgentManager {
         maxSubagentDepth: record.maxSubagentDepth,
       },
       onSessionCreated: (session) => {
+        if (!currentRun()) {
+          void shutdownChildSession(session);
+          return;
+        }
         record.session = session;
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
@@ -1049,6 +1071,7 @@ export class AgentManager {
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
+        if (!this.isRunActive(id) || record.runGeneration !== generation) return responseText;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -1082,19 +1105,24 @@ export class AgentManager {
 
         // Nested tools may still be writing the same workspace. Stop and join
         // them before running a gate or releasing the branch's writer lease.
-        if (record.worktree) await this.stopOwnedChildren(id);
+        if (record.worktree) {
+          await this.stopOwnedChildren(id);
+          if (!this.isRunActive(id) || record.runGeneration !== generation) return responseText;
+        }
 
         // Quiesce, gate, verify, report, and release the worktree lease if used.
         if (record.worktree) {
           const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
+          if (!this.isRunActive(id) || record.runGeneration !== generation) return responseText;
           if (jobs?.outcome === "failed") {
             // A gate cannot certify a workspace that may still be changing.
             // Keep a machine-readable failure so workflow hosts do not mistake
             // the skipped hook for a gate they should run after lease release.
+            if (!this.claimWorktreeSettlement(record, generation)) return responseText;
             record.worktreeQuiescenceError = jobs.error;
             record.worktreeResult = retainedWorktreeResult(record.worktree);
-            releaseWorktreeLease(record.worktree);
             record.result = (record.result ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
+            releaseWorktreeLease(record.worktree);
           } else {
             if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
               record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
@@ -1106,7 +1134,10 @@ export class AgentManager {
                 await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
               } catch { /* ignore — never block settlement */ }
             }
+            if (!this.isRunActive(id) || record.runGeneration !== generation) return responseText;
+            if (!this.claimWorktreeSettlement(record, generation)) return responseText;
             const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, id);
+            if (!this.isRunActive(id) || record.runGeneration !== generation) return responseText;
             record.worktreeResult = wtResult;
             // Appended to prose only. Structured output remains machine-readable.
             record.result = (record.result ?? "") + worktreeRetainedNote(record.worktree, wtResult);
@@ -1115,10 +1146,11 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, true, pool);
+        this.settleRun(record, true, generation);
         return responseText;
       })
       .catch(async (err) => {
+        if (!this.isRunActive(id) || record.runGeneration !== generation) return "";
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           record.status = "error";
@@ -1137,32 +1169,38 @@ export class AgentManager {
         // Best-effort worktree settlement on error
         if (record.worktree) {
           await this.stopOwnedChildren(id);
+          if (!this.isRunActive(id) || record.runGeneration !== generation) return "";
           const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
+          if (!this.isRunActive(id) || record.runGeneration !== generation) return "";
           if (jobs?.outcome === "failed") {
+            if (!this.claimWorktreeSettlement(record, generation)) return "";
             record.worktreeQuiescenceError = jobs.error;
             record.worktreeResult = retainedWorktreeResult(record.worktree);
-            releaseWorktreeLease(record.worktree);
             record.error = (record.error ?? "") + worktreeJobsRetainedNote(record.worktree, jobs.error);
+            releaseWorktreeLease(record.worktree);
           } else {
             // Record confirmed stops before settlement: a Git failure must not
             // erase the fact that jobs were terminated from the error report.
             if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
               record.error = (record.error ?? "") + stoppedJobsNote(jobs.stopped);
             }
+            if (!this.claimWorktreeSettlement(record, generation)) return "";
             try {
               const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, id);
+              if (!this.isRunActive(id) || record.runGeneration !== generation) return "";
               record.worktreeResult = wtResult;
               record.error = (record.error ?? "") + worktreeRetainedNote(record.worktree, wtResult);
             } catch {
+              if (!this.isRunActive(id) || record.runGeneration !== generation) return "";
               record.worktreeResult = retainedWorktreeResult(record.worktree);
               record.error = (record.error ?? "") + worktreeRetainedNote(record.worktree, record.worktreeResult);
-            } finally { releaseWorktreeLease(record.worktree); }
+            }
           }
         }
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, false, pool);
+        this.settleRun(record, false, generation);
         return "";
       });
 
@@ -1181,29 +1219,55 @@ export class AgentManager {
     }
   }
 
-  /**
-   * The shared tail of both settle paths: release whatever pool slot the run
-   * held, notify, and let the queue drain into the freed slot.
-   *
-   * The decrement lives HERE and nowhere else. `abort()` on a running record
-   * only fires its controller and leaves the run to settle normally, so
-   * decrementing there too would double-free — permanently lifting the limit.
-   *
-   * Foreground agents fire `onComplete` for lifecycle symmetry, with
-   * `resultConsumed` set so the callback skips notifications the inline result
-   * already delivered.
-   *
-   * @param guardCallback swallow a throwing `onComplete` (the success path does;
-   *   the error path historically did not, and keeps not doing so).
-   * @param pool the pool this run was CHARGED TO at start time — passed in, not
-   *   recomputed, so a mid-run change to `maxConcurrentForeground` can't make
-   *   the release disagree with the acquire.
-   */
-  private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
-    this.activeRuns.delete(record.id);
+  private activateRun(record: AgentRecord, generation: number, pool: Pool | undefined): void {
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    this.runCompletions.set(record.id, { generation, promise, resolve });
+    record.activeRunPool = pool;
+    record.worktreeSettlementGeneration = undefined;
+    record.worktreeResult = undefined;
+    record.worktreeQuiescenceError = undefined;
+    this.activeRuns.add(record.id);
+    if (pool === "background") this.runningBackground++;
+    else if (pool === "foreground") this.runningForeground++;
+  }
+
+  private releaseRun(record: AgentRecord, generation: number): boolean {
+    if (record.runGeneration !== generation || !this.activeRuns.delete(record.id)) return false;
+    this.detachRunSignal(record.id, generation);
+    if (record.activeRunPool === "background") this.runningBackground--;
+    else if (record.activeRunPool === "foreground") this.runningForeground--;
+    record.activeRunPool = undefined;
+    const completion = this.runCompletions.get(record.id);
+    if (completion?.generation === generation) {
+      this.runCompletions.delete(record.id);
+      completion.resolve();
+    }
+    return true;
+  }
+
+  private detachRunSignal(id: string, generation: number): void {
+    const detacher = this.runDetachers.get(id);
+    if (detacher?.generation !== generation) return;
+    this.runDetachers.delete(id);
+    detacher.detach();
+  }
+
+  isRunActive(id: string): boolean {
+    return this.activeRuns.has(id);
+  }
+
+  private claimWorktreeSettlement(record: AgentRecord, generation: number): boolean {
+    if (record.worktreeSettlementGeneration === generation) return false;
+    record.worktreeSettlementGeneration = generation;
+    return true;
+  }
+
+  /** Release the run's captured pool slot, notify, and drain the queue. */
+  private settleRun(record: AgentRecord, guardCallback: boolean, generation: number): void {
+    const pool = record.activeRunPool;
+    if (!this.releaseRun(record, generation)) return;
     if (!record.isBackground) record.resultConsumed = true;
-    if (pool === "background") this.runningBackground--;
-    else if (pool === "foreground") this.runningForeground--;
 
     if (guardCallback) {
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
@@ -1226,15 +1290,23 @@ export class AgentManager {
    * parent would burn tokens unseen with no way to reach it. Grandchildren are
    * covered transitively — each abort lands in that child's own settle path.
    */
-  private async stopOwnedChildren(parentId: string): Promise<void> {
+  private async stopOwnedChildren(parentId: string, force = false): Promise<void> {
     const children = [...this.agents.values()].filter(record => record.parentAgentId === parentId);
     this.abortOwnedChildren(parentId);
     await Promise.allSettled(children.map(async child => {
-      await this.awaitStartup(child.id);
-      await child.promise;
-      // A child without its own worktree shares ours; its grandchildren must
-      // also stop before the ancestor's workspace can be released.
-      await this.stopOwnedChildren(child.id);
+      const generation = child.runGeneration;
+      if (force && generation !== undefined && this.isRunActive(child.id)) {
+        await this.forceDetachRun(child, generation);
+      } else if (force) {
+        await this.stopOwnedChildren(child.id, true);
+      } else {
+        const completion = this.runCompletions.get(child.id);
+        if (completion) await completion.promise;
+        else if (child.promise) await child.promise;
+        // A child without its own worktree shares ours; its grandchildren must
+        // also stop before the ancestor's workspace can be released.
+        await this.stopOwnedChildren(child.id);
+      }
     }));
   }
 
@@ -1336,7 +1408,10 @@ export class AgentManager {
     // undefined when it was aborted while queued, or stopped mid-copy, and so
     // never ran — the record is already terminal with a completedAt, which is
     // what the caller renders.
-    if (record.promise) await record.promise;
+    if (record.promise) {
+      const completion = this.runCompletions.get(id);
+      await (completion ? Promise.race([record.promise, completion.promise]) : record.promise);
+    }
 
     // A record that ended "error" without ever getting a promise never ran: the
     // same startup failure spawn() rethrows on the immediate path (#179). Keep
@@ -1350,7 +1425,7 @@ export class AgentManager {
 
   private recordInvocation(record: AgentRecord, id: string): void {
     record.session?.sessionManager?.appendCustomEntry?.("subagents:invocation", {
-      agentId: id,
+      agentId: record.originalId ?? id,
       startedAt: record.startedAt,
     });
   }
@@ -1423,7 +1498,11 @@ export class AgentManager {
     }
 
     // Foreground resume: run inline and return the settled record.
-    this.activeRuns.add(id);
+    const generation = (record.runGeneration ?? 0) + 1;
+    record.runGeneration = generation;
+    this.activateRun(record, generation, undefined);
+    const completion = this.runCompletions.get(id)!;
+    const currentRun = () => this.isRunActive(id) && record.runGeneration === generation;
     record.status = "running";
     record.startedAt = Date.now();
     this.recordInvocation(record, id);
@@ -1436,6 +1515,10 @@ export class AgentManager {
     const onAbort = () => this.abort(id);
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
+    this.runDetachers.set(id, {
+      generation,
+      detach: () => signal?.removeEventListener("abort", onAbort),
+    });
     const run = async () => {
       let acquired = false;
       try {
@@ -1448,26 +1531,31 @@ export class AgentManager {
           worktree: record.worktree,
           cwd: record.effectiveCwd,
           onToolActivity: (activity) => {
+            if (!currentRun()) return;
             if (activity.type === "end") record.toolUses++;
             options?.onToolActivity?.(activity);
           },
           onAssistantUsage: (usage) => {
+            if (!currentRun()) return;
             addUsage(record.lifetimeUsage, usage);
             this.onUsage?.(record, usage);
             options?.onAssistantUsage?.(usage);
           },
           onCompaction: (info) => {
+            if (!currentRun()) return;
             record.compactionCount++;
             this.onCompact?.(record, info);
             options?.onCompaction?.(info);
           },
           modelCandidates: options?.modelCandidates,
           onModelTransition: (transition) => {
+            if (!currentRun()) return;
             applyModelTransition(record, transition);
             options?.onModelTransition?.(transition);
           },
           signal: abortController.signal,
         });
+        if (!currentRun()) return record.result ?? "";
         // Same contract as spawn: a failed final turn is an error, while its
         // partial text remains available to the caller.
         if (record.status !== "stopped") record.status = failure ? "error" : "completed";
@@ -1475,45 +1563,58 @@ export class AgentManager {
         record.result = text;
         record.completedAt = Date.now();
       } catch (err) {
-        if (record.status !== "stopped") record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt = Date.now();
+        if (currentRun()) {
+          if (record.status !== "stopped") record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+        }
       } finally {
-        signal?.removeEventListener("abort", onAbort);
-        if (acquired) {
-          await this.stopOwnedChildren(id);
-          await this.finishWorktreeResume(record);
-        } else this.abortOwnedChildren(id);
-        this.activeRuns.delete(id);
+        this.detachRunSignal(id, generation);
+        if (this.isRunActive(id) && record.runGeneration === generation) {
+          if (acquired) {
+            await this.stopOwnedChildren(id);
+            if (this.isRunActive(id) && record.runGeneration === generation) {
+              await this.finishWorktreeResume(record, generation);
+            }
+          } else this.abortOwnedChildren(id);
+          this.releaseRun(record, generation);
+        }
       }
       return record.result ?? "";
     };
-    record.promise = run();
-    await record.promise;
+    const runPromise = run();
+    record.promise = runPromise;
+    await Promise.race([runPromise, completion.promise]);
     return record;
   }
 
-  private async finishWorktreeResume(record: AgentRecord): Promise<void> {
+  private async finishWorktreeResume(record: AgentRecord, generation: number): Promise<void> {
     const worktree = record.worktree!;
+    const pi = this.worktreeApis.get(record.id);
+    const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
+    if (record.runGeneration !== generation || !this.isRunActive(record.id)) return;
+    if (!this.claimWorktreeSettlement(record, generation)) return;
     delete record.worktreeQuiescenceError;
-    const jobs = await this.stopEphemeralWorktreeJobs(this.worktreeApis.get(record.id), record);
     if (jobs?.outcome === "failed") {
       // Same rule as the spawn paths: no confirmed termination, no verification.
       record.worktreeQuiescenceError = jobs.error;
       record.worktreeResult = retainedWorktreeResult(worktree);
-      releaseWorktreeLease(worktree);
       const note = worktreeJobsRetainedNote(worktree, jobs.error);
       if (record.status === "error") record.error = (record.error ?? "") + note;
       else record.result = (record.result ?? "") + note;
+      releaseWorktreeLease(worktree);
       return;
     }
     try {
-      record.worktreeResult = await cleanupWorktree(this.worktreeApis.get(record.id)!, worktree.sourceRoot, worktree, record.description, record.id);
-      let note = worktreeRetainedNote(worktree, record.worktreeResult);
+      const result = await cleanupWorktree(pi!, worktree.sourceRoot, worktree, record.description, record.id);
+      if (record.runGeneration !== generation || !this.isRunActive(record.id)) return;
+      record.worktreeResult = result;
+      let note = worktreeRetainedNote(worktree, result);
       if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) note = stoppedJobsNote(jobs.stopped) + note;
       if (record.status === "error") record.error = (record.error ?? "") + note;
       else record.result = (record.result ?? "") + note;
     } catch (error) {
+      if (record.runGeneration !== generation || !this.isRunActive(record.id)) return;
       record.status = "error";
       record.worktreeResult = retainedWorktreeResult(worktree);
       record.error = `${error instanceof Error ? error.message : String(error)}${worktreeRetainedNote(worktree, record.worktreeResult)}`;
@@ -1580,12 +1681,14 @@ export class AgentManager {
   ) {
     if (!record.session) return;
 
+    const generation = (record.runGeneration ?? 0) + 1;
+    record.runGeneration = generation;
     record.status = "running";
     record.startedAt = Date.now();
     this.recordInvocation(record, id);
     record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id));
-    this.activeRuns.add(id);
-    if (occupiesPoolSlot(record)) this.runningBackground++;
+    this.activateRun(record, generation, occupiesPoolSlot(record) ? "background" : undefined);
+    const currentRun = () => this.isRunActive(id) && record.runGeneration === generation;
 
     // Fresh abort controller so /agents stop and steering target THIS run rather
     // than the previous one's settled controller.
@@ -1602,11 +1705,13 @@ export class AgentManager {
       else parentSignal.addEventListener("abort", onParentAbort, { once: true });
       detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
     }
+    const detachParent = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    this.runDetachers.set(id, { generation, detach: detachParent });
 
     let acquired = false;
     const settle = async () => {
-      detachParentSignal?.();
-      detachParentSignal = undefined;
+      if (!currentRun()) return;
+      detachParent();
       // Final flush of streaming output file
       if (record.outputCleanup) {
         try { record.outputCleanup(); } catch { /* ignore */ }
@@ -1615,10 +1720,10 @@ export class AgentManager {
       // Release only after every nested writer has settled.
       if (acquired) {
         await this.stopOwnedChildren(id);
-        await this.finishWorktreeResume(record);
+        if (!this.isRunActive(id) || record.runGeneration !== generation) return;
+        await this.finishWorktreeResume(record, generation);
       } else this.abortOwnedChildren(id);
-      this.activeRuns.delete(id);
-      if (occupiesPoolSlot(record)) this.runningBackground--;
+      if (!this.releaseRun(record, generation)) return;
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
     };
@@ -1631,21 +1736,25 @@ export class AgentManager {
         worktree: record.worktree,
         cwd: record.effectiveCwd,
         onToolActivity: (activity) => {
+          if (!currentRun()) return;
           if (activity.type === "end") record.toolUses++;
           options.onToolActivity?.(activity);
         },
         onAssistantUsage: (usage) => {
+          if (!currentRun()) return;
           addUsage(record.lifetimeUsage, usage);
           this.onUsage?.(record, usage);
           options.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
+          if (!currentRun()) return;
           record.compactionCount++;
           this.onCompact?.(record, info);
           options.onCompaction?.(info);
         },
         modelCandidates: options.modelCandidates,
         onModelTransition: (transition) => {
+          if (!currentRun()) return;
           applyModelTransition(record, transition);
           options.onModelTransition?.(transition);
         },
@@ -1661,6 +1770,7 @@ export class AgentManager {
       : run();
     const promise = execution
       .then(async ({ text, failure }) => {
+        if (!this.isRunActive(id) || record.runGeneration !== generation) return text;
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
@@ -1674,6 +1784,7 @@ export class AgentManager {
         return text;
       })
       .catch(async (err) => {
+        if (!this.isRunActive(id) || record.runGeneration !== generation) return "";
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
@@ -1751,7 +1862,7 @@ export class AgentManager {
    * Resolve an `@name` from the prompt. Matches a top-level agent's handle
    * case-insensitively, preferring one that can still be steered and otherwise
    * the most recently started (which is the one a resume should continue), then
-   * falls back to an exact agent id so `@<agentId>` works too.
+   * falls back to the current or original agent id so `@<agentId>` works too.
    */
   resolveMention(name: string): MentionResolution | undefined {
     const wanted = name.toLowerCase();
@@ -1765,7 +1876,7 @@ export class AgentManager {
       if (!fallback || record.startedAt > fallback.startedAt) fallback = record;
     }
     if (fallback) return { kind: "live", record: fallback };
-    const byId = this.agents.get(name);
+    const byId = this.agents.get(name) ?? [...this.agents.values()].find(record => record.originalId === name);
     if (byId?.parentAgentId === undefined && byId !== undefined) return { kind: "live", record: byId };
     // Only once nothing live answers: a tombstone is a conversation to reopen,
     // and reopening one while its record still exists would fork the session.
@@ -1822,6 +1933,76 @@ export class AgentManager {
     return true;
   }
 
+  async stop(id: string, gracePeriodMs = STOP_GRACE_PERIOD_MS): Promise<boolean> {
+    const record = this.agents.get(id);
+    if (!record) return false;
+    if (record.status === "queued") return this.abort(id);
+    if (record.status === "stopped" && !this.activeRuns.has(id)) return true;
+    if (!this.activeRuns.has(id)) return false;
+
+    const generation = record.runGeneration;
+    const completion = this.runCompletions.get(id);
+    if (generation === undefined || !completion) return false;
+    this.abort(id);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      completion.promise,
+      new Promise<void>(resolve => { timeout = setTimeout(resolve, gracePeriodMs); }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    if (!this.isRunActive(id) || record.runGeneration !== generation) return true;
+    await this.forceDetachRun(record, generation);
+    return true;
+  }
+
+  private async forceDetachRun(record: AgentRecord, generation: number): Promise<void> {
+    if (!this.isRunActive(record.id) || record.runGeneration !== generation) return;
+    record.status = "stopped";
+    record.completedAt = Date.now();
+    if (!this.releaseRun(record, generation)) return;
+    record.runGeneration = generation + 1;
+    record.promise = Promise.resolve(record.result ?? "");
+    this.drainQueue();
+
+    if (record.outputCleanup) {
+      try { record.outputCleanup(); } catch { /* ignore */ }
+      record.outputCleanup = undefined;
+    }
+    await this.stopOwnedChildren(record.id, true);
+
+    const worktree = record.worktree;
+    if (worktree && this.claimWorktreeSettlement(record, generation)) {
+      const pi = this.worktreeApis.get(record.id);
+      if (!pi) {
+        record.worktreeQuiescenceError = "worktree runtime is unavailable; termination could not be confirmed";
+        record.worktreeResult = retainedWorktreeResult(worktree);
+        releaseWorktreeLease(worktree);
+        record.result = (record.result ?? "") + worktreeJobsRetainedNote(worktree, record.worktreeQuiescenceError);
+      } else {
+        const jobs = await this.stopEphemeralWorktreeJobs(pi, record);
+        if (jobs?.outcome === "failed") {
+          record.worktreeQuiescenceError = jobs.error;
+          record.worktreeResult = retainedWorktreeResult(worktree);
+          releaseWorktreeLease(worktree);
+          record.result = (record.result ?? "") + worktreeJobsRetainedNote(worktree, jobs.error);
+        } else {
+          if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
+            record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
+          }
+          try {
+            record.worktreeResult = await cleanupWorktree(pi, worktree.sourceRoot, worktree, record.description);
+            record.result = (record.result ?? "") + worktreeRetainedNote(worktree, record.worktreeResult);
+          } catch {
+            record.worktreeResult = retainedWorktreeResult(worktree);
+            record.result = (record.result ?? "") + worktreeRetainedNote(worktree, record.worktreeResult);
+          }
+        }
+      }
+    }
+
+    try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+  }
+
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
@@ -1875,6 +2056,8 @@ export class AgentManager {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
       if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued" || record.restoredSession) continue;
+      // Without a persisted file, this is the only session from which a terminal run can resume.
+      if (!record.sessionFile && record.session && (record.status === "stopped" || record.status === "error" || record.status === "aborted")) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }

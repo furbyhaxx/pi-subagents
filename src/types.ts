@@ -181,6 +181,14 @@ export type MentionResolution =
 
 export interface AgentRecord {
   id: string;
+  /** Original invocation identity retained when a persisted session gets a local restored id. */
+  originalId?: string;
+  /** Generation token for the current run; stale settlements cannot mutate later runs. */
+  runGeneration?: number;
+  /** Pool charged by the current run, if any. */
+  activeRunPool?: "background" | "foreground";
+  /** Worktree settlement already started for this run generation. */
+  worktreeSettlementGeneration?: number;
   type: SubagentType;
   /**
    * Typeable name for the `@handle message` prompt mention, derived from the

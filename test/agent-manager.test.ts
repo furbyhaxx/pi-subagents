@@ -1299,6 +1299,72 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     expect(record.worktreeResult).toEqual({ hasChanges: false, path: "/wt/jobs", retained: true });
   });
 
+  it("force-detaches a wedged run after stopping jobs and releasing its lease once", async () => {
+    const bus = createTestEventBus();
+    const { stops } = companion(bus, [{ kind: "ok", stopped: ["job-stop"] }]);
+    const { createWorktree, cleanupWorktree, releaseWorktreeLease } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(releaseWorktreeLease).mockClear();
+    vi.mocked(cleanupWorktree).mockImplementationOnce(async () => {
+      releaseWorktreeLease(wt as never);
+      return { hasChanges: false, path: wt.path, retained: true };
+    });
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(mockSession());
+      return new Promise(() => {});
+    });
+
+    manager = new AgentManager();
+    const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "X", "wedged", {
+      description: "wedged worktree run",
+      isBackground: true,
+      isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+
+    await manager.stop(id, 0);
+
+    expect(stops.map(entry => entry.path)).toEqual(["/wt/jobs"]);
+    expect(cleanupWorktree).toHaveBeenCalledTimes(1);
+    expect(releaseWorktreeLease).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)?.status).toBe("stopped");
+    expect(manager.getRecord(id)?.result).toContain("Stopped 1 background job(s)");
+  });
+
+  it("force-detaches when a worktree cleanup gate wedges", async () => {
+    const bus = createTestEventBus();
+    companion(bus);
+    const { createWorktree, cleanupWorktree, releaseWorktreeLease } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(releaseWorktreeLease).mockClear();
+    vi.mocked(cleanupWorktree).mockImplementationOnce(async () => {
+      releaseWorktreeLease(wt as never);
+      return { hasChanges: false, path: wt.path, retained: true };
+    });
+    resolvedRun();
+    let enterGate!: () => void;
+    const gateEntered = new Promise<void>(resolve => { enterGate = resolve; });
+
+    manager = new AgentManager();
+    const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "X", "wedged gate", {
+      description: "wedged gate",
+      isBackground: true,
+      isolation: "worktree",
+      onBeforeWorktreeCleanup: () => {
+        enterGate();
+        return new Promise<void>(() => {});
+      },
+    });
+    await manager.awaitStartup(id);
+    await gateEntered;
+
+    await manager.stop(id, 0);
+
+    expect(cleanupWorktree).toHaveBeenCalledTimes(1);
+    expect(releaseWorktreeLease).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)?.status).toBe("stopped");
+  });
+
   it("retains the worktree and reports the failure when jobs cannot be stopped", async () => {
     const bus = createTestEventBus();
     companion(bus, [{ kind: "error", error: "cannot signal pid" }]);
