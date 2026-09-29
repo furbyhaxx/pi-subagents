@@ -91,7 +91,7 @@ import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
-import { isWorktreeAutoCommitEnabled, isWorktreeIsolationEnabled, setWorktreeAutoCommitEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
+import { isWorktreeAutoCommitEnabled, isWorktreeIsolationEnabled, listWorktreeRows, pruneWorktrees, setWorktreeAutoCommitEnabled, setWorktreeIsolationEnabled, type WorktreeRow } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
@@ -1109,6 +1109,8 @@ export default function (pi: ExtensionAPI) {
       }
       origin = top.stdout.trim();
     }
+
+    await pruneWorktrees(pi, origin);
     const artifacts = sessionArtifacts({ ...ctx, cwd: origin });
     manager.clearCompleted(true);
 
@@ -3541,6 +3543,8 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Running agents (${agents.length}) — ${running} running, ${done} done`);
     }
 
+    options.push("Worktrees");
+
     // Agent types list
     if (allNames.length > 0) {
       options.push(`Agent types (${allNames.length})`);
@@ -3602,6 +3606,9 @@ Terse command-style prompts produce shallow, generic work.
 
     if (choice.startsWith("Running agents (")) {
       await showRunningAgents(ctx);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Worktrees") {
+      await showWorktrees(ctx);
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
@@ -3713,6 +3720,61 @@ Terse command-style prompts produce shallow, generic work.
       await showAgentDetail(ctx, selected);
       await showAllAgentsList(ctx);
     }
+  }
+
+  async function showWorktrees(ctx: ExtensionCommandContext) {
+    const baseRefs = new Map<string, string>();
+    for (const record of manager.listAgents()) {
+      if (record.worktree) baseRefs.set(record.worktree.branch, record.worktree.baseRef);
+    }
+
+    let rows: WorktreeRow[];
+    try {
+      rows = await listWorktreeRows((command, args, options) => pi.exec(command, args, options), ctx.cwd, baseRefs);
+    } catch (error) {
+      ctx.ui.notify(`Could not list worktrees: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      return;
+    }
+    if (rows.length === 0) {
+      ctx.ui.notify("No retained worktrees or legacy pi-agent branches.", "info");
+      return;
+    }
+
+    const items: SettingItem[] = rows.map(row => {
+      if (row.kind === "legacy") {
+        return {
+          id: `legacy:${row.branch}`,
+          label: `${row.branch} · legacy`,
+          currentValue: "not checked out",
+          description: row.path,
+          values: ["not checked out"],
+        };
+      }
+      const upstream = row.upstream
+        ? `${row.upstream.branch} · ${row.upstream.fullyPushed ? "fully pushed" : "not fully pushed"} (${row.upstream.ahead} ahead, ${row.upstream.behind} behind)`
+        : "no upstream";
+      const summary = `dirty ${row.dirty ? "yes" : "no"} · ${row.ahead} ahead / ${row.behind} behind ${row.baseRef} · ${upstream}`;
+      return {
+        id: `worktree:${row.branch}:${row.path}`,
+        label: row.branch,
+        currentValue: summary,
+        description: row.path,
+        values: [summary],
+      };
+    });
+
+    await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+      const list = new SettingsList(items, Math.min(items.length, 12), getSettingsListTheme(), () => {}, () => done(undefined));
+      const container = new Container();
+      container.addChild(new Text("Worktrees · read only", 0, 0));
+      container.addChild(new Spacer(1));
+      container.addChild(list);
+      return {
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => list.handleInput?.(data),
+      };
+    });
   }
 
   async function showRunningAgents(ctx: ExtensionCommandContext) {
@@ -4047,7 +4109,7 @@ Guidelines for choosing settings:
 - Use prompt_mode: replace for fully custom agents with their own personality/instructions
 - Set inherit_context: true if the agent needs to know what was discussed in the parent conversation
 - Set isolated: true if the agent should NOT have access to MCP servers or other extensions
-- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session, isolation: worktree commits, and memory still write) — set those too if that's the goal
+- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session, retained worktrees, and memory still write). Dirty worktrees are committed only when worktreeAutoCommit is enabled; the extension never pushes, merges or removes them — set the other persistence options too if that's the goal
 - Only include frontmatter fields that differ from defaults — omit fields where the default is fine
 
 Write the file using the write tool. Only write the file, nothing else.`;
