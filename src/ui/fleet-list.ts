@@ -13,7 +13,7 @@
 
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
-import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { type AgentManager, getAgentStallStatus, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode, ViewerViewMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
@@ -148,6 +148,7 @@ export class FleetList {
     private viewerMode?: () => ViewerViewMode,
     /** Persist a view chosen with `Tab` in that overlay. */
     private onViewerMode?: (mode: ViewerViewMode) => void,
+    private stallThresholdMinutes: () => number = () => 5,
   ) {}
 
   // ---- Lifecycle ----
@@ -483,9 +484,16 @@ export class FleetList {
     // (e.g. on terminal resize) never loses the selection marker.
     const sel = Math.min(this.selectedIndex, rows.length);
 
-    const hint = this.active
-      ? "↑↓ select · enter view · esc back"
-      : "esc to interrupt · ← for agents · ↓ to manage";
+    const hasStalledAgent = rows.some(row => row.kind === "agent" && row.record.status === "running" && getAgentStallStatus(
+      row.record.lastActivityAt ?? row.record.startedAt,
+      this.stallThresholdMinutes(),
+      Date.now(),
+    ).stalled);
+    const hint = hasStalledAgent
+      ? "stalled: steer_subagent · update_subagent {interrupt: true} · stop_subagent"
+      : this.active
+        ? "↑↓ select · enter view · esc back"
+        : "esc to interrupt · ← for agents · ↓ to manage";
     const lines: string[] = [];
     lines.push(truncateToWidth("  " + theme.fg("dim", hint), width));
     lines.push("");
@@ -555,7 +563,11 @@ export class FleetList {
     const tokens = getLifetimeTotal(record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    const stall = record.status === "running"
+      ? getAgentStallStatus(record.lastActivityAt ?? record.startedAt, this.stallThresholdMinutes(), Date.now())
+      : undefined;
+    const idle = stall ? `${stall.stalled ? "STALLED · " : ""}idle ${stall.idleTime} · ` : "";
+    const stats = `${idle}${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

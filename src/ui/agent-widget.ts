@@ -7,7 +7,7 @@
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
-import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
+import { type AgentManager, getAgentStallStatus, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
@@ -290,6 +290,7 @@ export class AgentWidget {
      * conversation viewer unconditionally.
      */
     private showModel: () => boolean = () => false,
+    private stallThresholdMinutes: () => number = () => 5,
   ) {}
 
   /**
@@ -450,6 +451,7 @@ export class AgentWidget {
       const modeLabel = getPromptModeLabel(a.type);
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
       const elapsed = formatMs(Date.now() - a.startedAt);
+      const stall = getAgentStallStatus(a.lastActivityAt ?? a.startedAt, this.stallThresholdMinutes(), Date.now());
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
@@ -476,10 +478,13 @@ export class AgentWidget {
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
       if (costText) parts.push(costText);
-      parts.push(elapsed);
+      parts.push(elapsed, `idle ${stall.idleTime}`);
+      if (stall.stalled) parts.push("STALLED");
       const statsText = parts.join(" · ");
 
-      const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
+      const activity = stall.stalled
+        ? "Stalled: use steer_subagent, update_subagent {interrupt: true}, or stop_subagent."
+        : bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       runningLines.push([
         truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),

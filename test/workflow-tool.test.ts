@@ -1553,7 +1553,7 @@ describe("collisions with another extension", () => {
   it("toggles worktree auto-commit from the /agents settings menu", async () => {
     try {
       const booted = boot({ worktreeAutoCommit: false });
-      await changeAnUnrelatedSetting(booted, 19);
+      await changeAnUnrelatedSetting(booted, 20);
 
       expect(isWorktreeAutoCommitEnabled()).toBe(true);
       expect(savedSettings().worktreeAutoCommit).toBe(true);

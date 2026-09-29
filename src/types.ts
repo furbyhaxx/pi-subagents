@@ -216,6 +216,7 @@ export interface AgentRecord {
   error?: string;
   toolUses: number;
   startedAt: number;
+  lastActivityAt?: number;
   completedAt?: number;
   session?: AgentSession;
   abortController?: AbortController;
