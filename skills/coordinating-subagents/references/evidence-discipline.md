@@ -56,7 +56,7 @@ criterion, not a request in prose.
   output."*
 - In a workflow: `agent(prompt, { gate: 'npm test' })` — the gate runs in the
   child's effective working directory after it finishes and before worktree
-  settlement or lease release. For anonymous worktrees, background jobs are
+  settlement or lease release. For agent-created worktrees, background jobs are
   quiesced first; if quiescence cannot be confirmed, the gate does not run.
   Named worktrees skip implicit job control. A non-zero exit fails the agent
   and the command output becomes the error.
@@ -68,8 +68,8 @@ told to run the tests may run them, read a failure, conclude it is unrelated, an
 report success.
 
 Gate caveats: a resumed child does not inherit its gate, so re-verification needs
-a fresh gated call in the same workspace. If anonymous-worktree quiescence cannot
-be confirmed, the gate does not run — that is not a pass. And a gate proves the
+a fresh gated call in the same workspace. If agent-created-worktree quiescence
+cannot be confirmed, the gate does not run — that is not a pass. And a gate proves the
 command passed — not that the command tests the thing you cared about.
 
 ## Adversarial verification
