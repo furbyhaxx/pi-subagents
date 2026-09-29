@@ -23,15 +23,13 @@
  *     (`{ok: false}` → `null`), not as an unhandled rejection that takes the
  *     run down.
  *   - **when a `gate` runs.** For an isolated child it cannot wait until the
- *     spawn resolves: the manager commits an anonymous worktree to a branch and
- *     deletes the copy inside the child's own settle, so the only tree left to
- *     run `npm test` in is the main one — which would report on code the child
- *     never wrote. So the gate runs from `onBeforeWorktreeCleanup`, inside that
- *     settle (before lease release for retained trees), and the verdict travels
- *     back on the spawn result. If prerequisite quiescence fails, that failure
- *     travels as the verdict instead. `runGate` still exists for a child that
- *     had no worktree; the runtime uses whichever outcome the host reports,
- *     never both.
+ *     spawn resolves: its linked worktree remains on a real branch after settle,
+ *     so the gate must inspect that copy before its lease is released. The gate
+ *     runs from `onBeforeWorktreeCleanup`; automatic commits happen only when
+ *     `worktreeAutoCommit` is enabled, and the extension never pushes, merges or
+ *     removes worktrees. If prerequisite quiescence fails, that failure travels
+ *     as the verdict instead. `runGate` still exists for a child that had no
+ *     worktree; the runtime uses whichever outcome the host reports, never both.
  */
 
 import { existsSync } from "node:fs";
@@ -80,13 +78,11 @@ export interface WorkflowHostOptions {
 /**
  * Where the child worked, when that directory still exists.
  *
- * The guard is not defensive padding. `cleanupWorktree` commits the child's
- * changes to a branch and *removes* the copy before `spawnAndWait` resolves, so
- * an anonymous child's worktree is normally already gone by the time a result is
- * built. That is exactly why a gate cannot wait until here — it runs from
- * `onBeforeWorktreeCleanup` instead — and why this reports nothing rather than
- * a path that no longer exists: handing a stale path to a command would fail
- * every gated worktree agent with a spawn error instead of a test result.
+ * A retained worktree stays on its real branch after settlement; only
+ * `worktreeAutoCommit` opts into committing dirty changes, and the extension
+ * never pushes, merges or removes it. This reports nothing for a path that no
+ * longer exists, so handing a stale path to a command cannot turn a gated run
+ * into a spawn error instead of a test result.
  */
 function childCwd(record: AgentRecord): string | undefined {
   const path = record.effectiveCwd ?? record.worktree?.workPath ?? record.worktree?.path;

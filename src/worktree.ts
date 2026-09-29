@@ -30,6 +30,38 @@ export interface WorktreeOptions {
   originCwd?: string;
 }
 
+export interface WorktreeListingExecResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+  killed: boolean;
+}
+
+export type WorktreeListingExec = (
+  command: string,
+  args: string[],
+  options: { cwd: string; timeout: number },
+) => Promise<WorktreeListingExecResult>;
+
+export interface WorktreeListingRow {
+  kind: "worktree";
+  branch: string;
+  path: string;
+  dirty: boolean;
+  baseRef: string;
+  ahead: number;
+  behind: number;
+  upstream: { branch: string; ahead: number; behind: number; fullyPushed: boolean } | null;
+}
+
+export interface LegacyWorktreeBranchRow {
+  kind: "legacy";
+  branch: string;
+  path: "(not checked out)";
+}
+
+export type WorktreeRow = WorktreeListingRow | LegacyWorktreeBranchRow;
+
 export interface WorktreeInfo {
   lifecycle: "retained";
   /** Whether the caller supplied the branch name. */
@@ -147,6 +179,80 @@ async function registrations(pi: ExtensionAPI, cwd: string): Promise<Registratio
     else if (entry && (field === "prunable" || field.startsWith("prunable "))) entry.prunable = true;
   }
   return entries;
+}
+
+/** Read retained worktrees and unchecked-out legacy agent branches without mutating Git state. */
+export async function listWorktreeRows(
+  exec: WorktreeListingExec,
+  cwd: string,
+  baseRefs: ReadonlyMap<string, string> = new Map(),
+): Promise<WorktreeRow[]> {
+  const runGit = async (directory: string, args: string[]): Promise<string> => {
+    const result = await exec("git", args, { cwd: directory, timeout: 5000 });
+    if (result.killed || result.code !== 0) {
+      throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
+    }
+    return result.stdout.trim();
+  };
+  const listing = await exec("git", ["worktree", "list", "--porcelain", "-z"], { cwd, timeout: 5000 });
+  if (listing.killed || listing.code !== 0) throw new Error(listing.stderr.trim() || "Cannot list Git worktrees");
+
+  const entries: { path: string; branch?: string }[] = [];
+  let entry: { path: string; branch?: string } | undefined;
+  for (const field of listing.stdout.split("\0")) {
+    if (field.startsWith("worktree ")) {
+      entry = { path: field.slice(9) };
+      entries.push(entry);
+    } else if (entry && field.startsWith("branch ")) {
+      entry.branch = field.slice(7);
+    }
+  }
+  const mainPath = entries[0]?.path;
+  const currentBranch = await runGit(cwd, ["branch", "--show-current"]);
+  const defaultBase = currentBranch || await runGit(cwd, ["rev-parse", "HEAD"]);
+  const checkedOut = new Set(entries.flatMap(item => item.branch?.startsWith("refs/heads/") ? [item.branch.slice(11)] : []));
+  const rows: WorktreeRow[] = [];
+
+  for (const item of entries) {
+    if (item.path === mainPath) continue;
+    const branch = item.branch?.startsWith("refs/heads/") ? item.branch.slice(11) : "(detached)";
+    const baseRef = baseRefs.get(branch) ?? defaultBase;
+    const status = await runGit(item.path, ["status", "--porcelain"]);
+    const comparison = await runGit(item.path, ["rev-list", "--left-right", "--count", `${baseRef}...HEAD`]);
+    const [behindText, aheadText] = comparison.split(/\s+/);
+    const behind = Number(behindText);
+    const ahead = Number(aheadText);
+    if (!Number.isInteger(behind) || !Number.isInteger(ahead)) throw new Error(`Cannot parse commit counts for ${branch}`);
+
+    const upstreamResult = await exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
+      cwd: item.path,
+      timeout: 5000,
+    });
+    let upstream: WorktreeListingRow["upstream"] = null;
+    if (!upstreamResult.killed && upstreamResult.code === 0 && upstreamResult.stdout.trim()) {
+      const upstreamBranch = upstreamResult.stdout.trim();
+      const counts = await runGit(item.path, ["rev-list", "--left-right", "--count", `${upstreamBranch}...HEAD`]);
+      const [upstreamBehindText, upstreamAheadText] = counts.split(/\s+/);
+      const upstreamBehind = Number(upstreamBehindText);
+      const upstreamAhead = Number(upstreamAheadText);
+      if (!Number.isInteger(upstreamBehind) || !Number.isInteger(upstreamAhead)) {
+        throw new Error(`Cannot parse upstream commit counts for ${branch}`);
+      }
+      upstream = {
+        branch: upstreamBranch,
+        ahead: upstreamAhead,
+        behind: upstreamBehind,
+        fullyPushed: upstreamAhead === 0,
+      };
+    }
+    rows.push({ kind: "worktree", branch, path: item.path, dirty: status.length > 0, baseRef, ahead, behind, upstream });
+  }
+
+  const legacy = await runGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads/pi-agent-*"]);
+  for (const branch of legacy.split("\n").filter(name => name.startsWith("pi-agent-") && !checkedOut.has(name))) {
+    rows.push({ kind: "legacy", branch, path: "(not checked out)" });
+  }
+  return rows;
 }
 
 function hash(value: string): string { return createHash("sha256").update(value).digest("hex").slice(0, 16); }
