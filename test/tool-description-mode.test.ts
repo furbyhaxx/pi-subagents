@@ -325,10 +325,10 @@ describe("toolDescriptionMode", () => {
       expect(props(tools)).toContain("branch");
       const description: string = tools.get("Agent").description;
       expect(description).toContain('Use isolation: "worktree"');
-      expect(description).toContain("fresh detached linked worktree retained after every outcome");
+      expect(description).toContain("fresh linked worktree on its own branch");
       expect(description).toContain("completion reports its path");
-      expect(description).toContain("no automatic commit, branch creation, merge, reset, stash, clean or removal");
-      expect(description).toContain("either integrate its changes and then remove it, or discard and remove it");
+      expect(description).toContain("The agent is told to commit its work on that branch");
+      expect(description).toContain("either integrate it (merge, rebase or cherry-pick) and then remove the worktree, or discard and remove it");
       expect(description).toContain("reusable named workspace");
       expect(description).not.toContain("disposable");
       expect(description).not.toContain("reported pi-agent-*");
@@ -349,9 +349,9 @@ describe("toolDescriptionMode", () => {
       const enabled = setup({ toolDescriptionMode: "compact" });
       const description: string = enabled.get("Agent").description;
       expect(description).toContain('isolation: "worktree"');
-      expect(description).toContain("fresh detached linked worktree retained after every outcome");
+      expect(description).toContain("fresh linked worktree on its own branch");
       expect(description).toContain("reports its path");
-      expect(description).toContain("review, then integrate and remove it or discard/remove it");
+      expect(description).toContain("review, integrate the branch, then remove the worktree, or discard it");
       expect(description).toContain("reusable named workspace");
       expect(description).not.toContain("disposable");
     });

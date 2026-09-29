@@ -132,10 +132,10 @@ describe("the examples it ships", () => {
 
 describe("the worktree lifecycle it documents", () => {
   it("retains anonymous worktrees for explicit review and releases leases after gates", () => {
-    expect(description).toContain("fresh detached linked worktree retained after every outcome");
-    expect(description).toContain("Completion reports its path");
-    expect(description).toContain("No automatic commit, branch creation, merge, reset, stash, clean or removal occurs");
-    expect(description).toContain("either integrate its changes then remove it, or discard and remove it");
+    expect(description).toContain("fresh linked worktree on its own branch");
+    expect(description).toContain("Completion reports its path and branch");
+    expect(description).toContain("no push, merge, reset, stash, clean or removal ever occurs");
+    expect(description).toContain("either integrate it then remove the worktree, or discard and remove it");
     expect(description).toContain("reusable named linked worktree");
     expect(description).toContain("before workspace lease release");
     expect(description).not.toContain("disposable detached");

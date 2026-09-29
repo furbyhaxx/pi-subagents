@@ -19,14 +19,14 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 
 describe("isolationParam", () => {
-  it("documents retained detached worktrees and explicit orchestration", () => {
+  it("documents retained branch worktrees and explicit orchestration", () => {
     const shape = isolationParam(true);
     const description = shape.isolation?.description ?? "";
 
-    expect(description).toContain("fresh detached linked worktree retained after every outcome");
+    expect(description).toContain("fresh linked worktree on its own branch");
     expect(description).toContain("completion reports its path");
-    expect(description).toContain("No automatic commit, branch creation, merge, reset, stash, clean, or removal occurs");
-    expect(description).toContain("either integrate its changes and then remove it, or discard and remove it");
+    expect(description).toContain("The agent is told to commit its work on that branch");
+    expect(description).toContain("either integrate it and then remove the worktree, or discard and remove it");
     expect(description).toContain("reusable named workspace");
     expect(description).not.toContain("disposable");
     expect(description).not.toContain("reported pi-agent-*");

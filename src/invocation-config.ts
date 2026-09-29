@@ -33,7 +33,7 @@ const isolationParamShape = {
   isolation: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
       description:
-        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" without branch creates a fresh detached linked worktree retained after every outcome; completion reports its path. No automatic commit, branch creation, merge, reset, stash, clean, or removal occurs. The orchestrating agent must review it and explicitly either integrate its changes and then remove it, or discard and remove it. With branch, the checked-out workspace is a reusable named workspace. New worktrees cannot see uncommitted or staged changes in the caller; reused named worktrees keep their existing changes.',
+        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" without branch creates a fresh linked worktree on its own branch pi/<agentId>, retained after every outcome; completion reports its path and branch. The agent is told to commit its work on that branch. The extension never pushes, merges, resets, stashes, cleans, or removes anything, and commits on its own only when worktreeAutoCommit is enabled. The orchestrating agent must review the branch and explicitly either integrate it and then remove the worktree, or discard and remove it. With branch, the checked-out workspace is a reusable named workspace. New worktrees cannot see uncommitted or staged changes in the caller; reused named worktrees keep their existing changes.',
     }),
   ),
 };
