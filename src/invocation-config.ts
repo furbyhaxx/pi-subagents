@@ -28,7 +28,7 @@ import type { AgentConfig, IsolationMode, JoinMode, ModelThinkingLevel } from ".
 const isolationParamShape = {
   branch: Type.Optional(Type.String({
     minLength: 1,
-    description: 'Exact local Git branch, e.g. "feat/x". Implies worktree isolation. Reuses its existing linked worktree or creates one; a missing branch starts at the caller\'s HEAD. This is a reusable named workspace; no automatic commit, merge, reset, stash, clean, or removal occurs. Reuses files, not conversation. Cannot combine with resume or isolation "off". Fails when worktrees are disabled or the branch is busy.',
+    description: 'Exact local Git branch, e.g. "feat/x". Implies worktree isolation. Reuses its existing linked worktree or creates one; a missing branch starts at the caller\'s HEAD. This is a reusable named workspace; the agent commits on it, and nothing is pushed, merged, reset, stashed, cleaned, or removed for you. Reuses files, not conversation. Cannot combine with resume or isolation "off". Fails when worktrees are disabled or the branch is busy.',
   })),
   isolation: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
