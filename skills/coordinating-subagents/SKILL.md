@@ -99,8 +99,9 @@ a message after the current tool call. Use it the moment you see an agent
 working from a wrong premise — a restart throws away everything it has learned,
 and its context is the expensive part.
 
-**Stop when the premise is dead**, not when the agent is merely slow. `x` twice
-in `/agents` or the viewer; a stopped agent still reports partial output.
+**Stop when the premise is dead**, not when the agent is merely slow. Use
+`stop_subagent` or press `x` twice in `/agents` or the viewer; the tool preserves
+the record and detaches a wedged run after 10 seconds so it can be resumed.
 
 Watching, steering, stopping, resuming and what each costs:
 [`references/supervision-and-steering.md`](references/supervision-and-steering.md).
@@ -155,6 +156,7 @@ disagreement: [`references/evidence-discipline.md`](references/evidence-discipli
 | Result contradicts another agent's | Both are claims | Verify with a command, or a third agent given both |
 | Agent edited files outside its scope | Scope was prose, not enforcement | Use a worktree or branch next time |
 | Two agents both claim to have fixed it | They shared a write scope | Inspect the tree; re-run one on a clean base |
+| Running agent is marked `STALLED` | Idle time exceeded `stallThresholdMinutes` (default 5; `0` disables the marker); no automatic action is taken | Follow the recovery order in [supervision and steering](references/supervision-and-steering.md#stall-recovery): steer → interrupt-update → stop → resume the same ID |
 | Nothing arrives for a long time | It may be queued behind `maxConcurrent` | `/agents → Running agents` shows `queued` |
 
 ## Reporting back

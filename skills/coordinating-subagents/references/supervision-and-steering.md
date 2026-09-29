@@ -10,6 +10,7 @@ What to watch, when to intervene, and what each intervention costs.
 - [Steering](#steering)
 - [Stopping](#stopping)
 - [Resuming](#resuming)
+- [Stall recovery](#stall-recovery)
 - [Handles and addressing](#handles-and-addressing)
 - [Notifications and join modes](#notifications-and-join-modes)
 - [Queueing and concurrency](#queueing-and-concurrency)
@@ -23,7 +24,7 @@ What to watch, when to intervene, and what each intervention costs.
 | Widget (above the editor) | Every running background agent: spinner, live tool activity, turns, tool uses, tokens, context %, elapsed | Always on (`widgetMode`) |
 | FleetView (below the editor) | `main` + running agents, workflows as one row | `↓` or `←` at an empty prompt |
 | Conversation viewer | One agent's full live conversation | `Enter` on a FleetView row, or `/agents → Running agents` |
-| `/agents` | Running agents, types, schedules, workflows, blackboard, peers, settings | `/agents` |
+| `/agents` | Running agents, retained worktrees (read-only), types, schedules, workflows, blackboard, peers, settings | `/agents` |
 | Workflow inspector | Phases, per-agent state, stop/pause/skip/retry | `/agents → Workflows`, or `Enter` on the workflow row |
 | Transcript file | Everything, after the fact | Path in the completion notification |
 
@@ -40,6 +41,13 @@ What to watch, when to intervene, and what each intervention costs.
 | `NN%` | Context-window utilization | Above ~85% the agent is losing the start of its task |
 | `⇊N` | Compactions so far | Any compaction means detail has been summarized away |
 | elapsed | Wall time | Only matters against what else is waiting |
+
+The widget and FleetView also show idle duration. When idle exceeds
+`stallThresholdMinutes` (default 5; `0` disables it), running agents are marked
+`STALLED` and the surfaces suggest `steer_subagent`,
+`update_subagent {interrupt: true}`, or `stop_subagent`. `get_subagent_result`
+reports idle time and the same hint. Stall detection is informational; nothing
+acts automatically.
 
 Statuses on completion: `completed` (`✓`), `steered` (`✓` yellow — hit the turn
 limit and wrapped up), `aborted` (`✗` — blew the grace period), `stopped` (`■`).
@@ -84,9 +92,11 @@ either way); it is delivered when the agent starts.
 
 ## Stopping
 
-`x` twice in `/agents → Running agents` or in the conversation viewer. A global
-Esc cannot unambiguously target a background agent, which is why the explicit key
-exists.
+Use `stop_subagent({ agent_id })`, or press `x` twice in `/agents → Running
+agents` or in the conversation viewer. A global Esc cannot unambiguously target
+a background agent, which is why the explicit control exists. `stop_subagent` is
+idempotent and leaves the record intact. If the run has not settled after 10
+seconds, it detaches the run so the same conversation can be resumed.
 
 Stop when the premise is dead, not when the agent is slow. A stopped agent
 reports whatever partial output it had, labelled incomplete — so a stop is a way
@@ -98,21 +108,42 @@ throws away everything it spent). Held time is subtracted from the run clock.
 
 ## Resuming
 
-A finished agent is a resumable conversation, not a corpse.
+A terminal agent is a resumable conversation, not a corpse — including stopped,
+aborted and errored agents.
 
 - `@handle message` resumes it in the background, continuing where it left off —
   even long after its in-memory record was evicted, as long as `rememberAgents`
   was on (the default).
 - `Agent({ resume: "<id or handle>", prompt })` does the same from a tool call.
-  It resumes detached by default; `run_in_background: false` blocks.
+  It resumes detached by default; `run_in_background: false` blocks. After a Pi
+  restart, restored records also resolve by their original agent ID.
 - Only the *definition* is re-resolved, so a resumed agent runs under the agent
   type's current frontmatter. If the type was deleted or disabled, the resume is
   refused rather than silently falling back.
 - `resume` cannot be combined with `branch` or with `schedule`.
 
 Resume when you want the agent's context: a follow-up question, a correction, a
-second pass over the same material. Spawn fresh when the task is different — a
-resumed agent drags its whole previous context into the new job.
+second pass over the same material. Do not kill-and-respawn when resuming that
+conversation works; a fresh spawn loses its context. Stopped or wedged runs can
+be continued with `Agent({ resume, model, thinking })`.
+
+## Stall recovery
+
+A `STALLED` marker is a hint, not an automatic intervention. Recover the same
+conversation in order:
+
+1. Detect the stall in the widget, FleetView or `get_subagent_result`.
+2. Try `steer_subagent` with the missing constraint or next action.
+3. If the current model call is stuck or the selection is wrong, use
+   `update_subagent({ agent_id, model?, thinking?, interrupt: true })` to stop
+   the turn and resume that conversation on the new selection.
+4. If it still cannot settle, use `stop_subagent`; after 10 seconds it forcibly
+   detaches a wedged run while preserving its record.
+5. Resume the same ID with `Agent({ resume: agent_id, model?, thinking? })`.
+
+Do not kill-and-respawn when the conversation can be resumed. A fresh agent
+loses the accumulated context; a stopped agent remains addressable, including
+through its original ID after a Pi restart.
 
 ## Handles and addressing
 

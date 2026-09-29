@@ -101,8 +101,8 @@ so `.filter(Boolean)` before using results.
 | `agentType` | Which agent definition; defaults to `general-purpose`. **An unknown name falls back silently** — option keys are validated, values are not |
 | `model` | `provider/modelId[:thinking]` or fuzzy. Replaces the definition's fallback list; omit normally |
 | `effort` | `minimal`…`max`; omitted, the definition's `thinking` decides, then the parent's. Use `low` for mechanical stages, high tiers for verify/judge |
-| `isolation: "worktree"` | Retained detached copy — expensive; use when parallel edits would collide |
-| `branch` | Retained workspace on an exact local branch |
+| `isolation: "worktree"` | Retained worktree on `pi/<agentId>` — expensive; use when parallel edits would collide |
+| `branch` | Retained workspace on an exact caller-selected local branch |
 | `gate` | Shell command run after the agent finishes, in its effective cwd |
 | `resume` | Continue the child that ran under that label |
 | `schema` | JSON Schema with an object root; resolves to the validated object |
@@ -121,7 +121,7 @@ const fixed = await agent('Fix the failing test in src/parser.ts.', { label: 'fi
 ```
 
 The gate runs in the child's effective working directory after it finishes and
-**before** worktree settlement and lease release. For anonymous worktrees,
+**before** worktree settlement and lease release. For agent-created worktrees,
 background jobs are quiesced before the gate; if quiescence cannot be
 confirmed, the gate does not run. Named worktrees skip implicit job control.
 A non-zero exit marks the agent failed and the command output becomes the
@@ -188,12 +188,13 @@ await agent('Review src/x.ts and report remaining issues. Do not edit.', { branc
 
 Sequential calls on one branch share files, not conversation. The same lease
 applies: never give two concurrent calls the same branch. Gates hold the lease
-while verifying. Success, turn limit, abort, stop, failure, cancellation and
-shutdown release it without committing, creating a preservation branch, merging,
-resetting, stashing, cleaning, deleting or pruning anything. The completion reports the retained path
-and change state. The orchestrating agent must review it, choose integration or
-discard, create any needed branch/commit deliberately inside it, then remove and
-prune it.
+while verifying. Every settlement path releases the lease and retains the
+worktree. The prompt asks the agent to commit logical conventional commits unless
+the task says not to; `worktreeAutoCommit` can also stage and commit dirty trees
+at settlement. The extension never pushes, merges or removes worktrees. Completion
+reports the retained branch, path and change state. Review the branch, choose
+integration or discard, rebase with `git -C <worktree> rebase <baseRef>` if the
+base moved, then remove and prune only when safe.
 
 ## Patterns
 
