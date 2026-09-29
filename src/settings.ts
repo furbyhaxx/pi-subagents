@@ -55,6 +55,8 @@ export interface SubagentsSettings {
    * several blocking resumes in one message can still exceed the limit.
    */
   maxConcurrentForeground?: number;
+  /** Minutes of inactivity before a running agent is marked stalled. 0 disables the marker. Defaults to 5. */
+  stallThresholdMinutes?: number;
   /**
    * 0 = unlimited — the extension's single source of truth for that convention:
    * `normalizeMaxTurns()` in agent-runner.ts treats 0 → `undefined`, and the
@@ -345,6 +347,7 @@ export interface SettingsAppliers {
   setWorktreeDirectory: (value: WorktreeDirectory) => void;
   setMaxConcurrent: (n: number) => void;
   setMaxConcurrentForeground: (n: number) => void;
+  setStallThresholdMinutes: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setMaxRetries: (n: number) => void;
   setMaxModelWraparounds: (n: number) => void;
@@ -454,6 +457,9 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.maxConcurrentForeground as number) <= MAX_CONCURRENT_CEILING
   ) {
     out.maxConcurrentForeground = r.maxConcurrentForeground as number;
+  }
+  if (Number.isInteger(r.stallThresholdMinutes) && (r.stallThresholdMinutes as number) >= 0) {
+    out.stallThresholdMinutes = r.stallThresholdMinutes as number;
   }
   if (
     Number.isInteger(r.defaultMaxTurns) &&
@@ -620,6 +626,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.maxConcurrentForeground === "number") {
     appliers.setMaxConcurrentForeground(s.maxConcurrentForeground);
   }
+  if (typeof s.stallThresholdMinutes === "number") appliers.setStallThresholdMinutes(s.stallThresholdMinutes);
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.maxRetries === "number") appliers.setMaxRetries(s.maxRetries);
   if (typeof s.maxModelWraparounds === "number") {

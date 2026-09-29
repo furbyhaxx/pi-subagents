@@ -129,7 +129,25 @@ const DEFAULT_MAX_CONCURRENT = 10;
  * cache (#253) — opt in; everyone else keeps today's behaviour exactly.
  */
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
+const DEFAULT_STALL_THRESHOLD_MINUTES = 5;
 const STOP_GRACE_PERIOD_MS = 10_000;
+
+export function getAgentStallStatus(
+  lastActivityAt: number,
+  thresholdMinutes: number,
+  now: number,
+): { idleMs: number; idleTime: string; stalled: boolean } {
+  const idleMs = Math.max(0, now - lastActivityAt);
+  const idleSeconds = Math.floor(idleMs / 1_000);
+  const idleMinutes = Math.floor(idleSeconds / 60);
+  const idleHours = Math.floor(idleMinutes / 60);
+  const idleTime = idleHours > 0
+    ? `${idleHours}h ${idleMinutes % 60}m`
+    : idleMinutes > 0
+      ? `${idleMinutes}m ${idleSeconds % 60}s`
+      : `${idleSeconds}s`;
+  return { idleMs, idleTime, stalled: thresholdMinutes > 0 && idleMs > thresholdMinutes * 60_000 };
+}
 
 /**
  * How many evicted agents stay addressable by name. Only a bound on memory —
@@ -390,6 +408,8 @@ interface ResumeOptions {
   isBackground?: boolean;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
+  /** Called on streamed assistant text. */
+  onTextDelta?: (delta: string, fullText: string) => void;
   /** Called once per assistant message_end with that message's usage delta. */
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
@@ -447,6 +467,7 @@ export class AgentManager {
   private onUsage?: OnAgentUsage;
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
+  private stallThresholdMinutes = DEFAULT_STALL_THRESHOLD_MINUTES;
   private worktreeApis = new Map<string, ExtensionAPI>();
   /** Includes settlement/gates, even after a record has a terminal display status. */
   private activeRuns = new Set<string>();
@@ -540,6 +561,14 @@ export class AgentManager {
     return this.maxConcurrentForeground;
   }
 
+  setStallThresholdMinutes(n: number): void {
+    this.stallThresholdMinutes = Math.max(0, n);
+  }
+
+  getStallThresholdMinutes(): number {
+    return this.stallThresholdMinutes;
+  }
+
   /**
    * Which pool a spawn is charged to, or undefined for one that is charged to
    * neither (nested children, detached non-background spawns).
@@ -618,6 +647,7 @@ export class AgentManager {
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
+      lastActivityAt: Date.now(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
@@ -805,6 +835,7 @@ export class AgentManager {
     };
     record.status = "running";
     record.startedAt = Date.now();
+    record.lastActivityAt = record.startedAt;
     record.startGate = undefined;
     this.activateRun(record, generation, pool);
     // A queued record may start after the parent runtime was installed. Keep
@@ -971,11 +1002,16 @@ export class AgentManager {
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (!currentRun()) return;
+        record.lastActivityAt = Date.now();
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
       onTurnEnd: options.onTurnEnd,
-      onTextDelta: options.onTextDelta,
+      onTextDelta: (delta, fullText) => {
+        if (!currentRun()) return;
+        record.lastActivityAt = Date.now();
+        options.onTextDelta?.(delta, fullText);
+      },
       onAssistantUsage: (usage) => {
         if (!currentRun()) return;
         addUsage(record.lifetimeUsage, usage);
@@ -1505,6 +1541,7 @@ export class AgentManager {
     const currentRun = () => this.isRunActive(id) && record.runGeneration === generation;
     record.status = "running";
     record.startedAt = Date.now();
+    record.lastActivityAt = record.startedAt;
     this.recordInvocation(record, id);
     record.completedAt = undefined;
     record.result = undefined;
@@ -1532,8 +1569,14 @@ export class AgentManager {
           cwd: record.effectiveCwd,
           onToolActivity: (activity) => {
             if (!currentRun()) return;
+            record.lastActivityAt = Date.now();
             if (activity.type === "end") record.toolUses++;
             options?.onToolActivity?.(activity);
+          },
+          onTextDelta: (delta, fullText) => {
+            if (!currentRun()) return;
+            record.lastActivityAt = Date.now();
+            options?.onTextDelta?.(delta, fullText);
           },
           onAssistantUsage: (usage) => {
             if (!currentRun()) return;
@@ -1685,6 +1728,7 @@ export class AgentManager {
     record.runGeneration = generation;
     record.status = "running";
     record.startedAt = Date.now();
+    record.lastActivityAt = record.startedAt;
     this.recordInvocation(record, id);
     record.jobsPossible ||= backgroundJobsPossible(this.worktreeApis.get(id));
     this.activateRun(record, generation, occupiesPoolSlot(record) ? "background" : undefined);
@@ -1737,8 +1781,14 @@ export class AgentManager {
         cwd: record.effectiveCwd,
         onToolActivity: (activity) => {
           if (!currentRun()) return;
+          record.lastActivityAt = Date.now();
           if (activity.type === "end") record.toolUses++;
           options.onToolActivity?.(activity);
+        },
+        onTextDelta: (delta, fullText) => {
+          if (!currentRun()) return;
+          record.lastActivityAt = Date.now();
+          options.onTextDelta?.(delta, fullText);
         },
         onAssistantUsage: (usage) => {
           if (!currentRun()) return;

@@ -263,6 +263,17 @@ describe("settings persistence", () => {
     expect(existsSync(projectFile())).toBe(true);
   });
 
+  it("round-trips stallThresholdMinutes, including zero to disable", () => {
+    saveSettings({ stallThresholdMinutes: 5 }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ stallThresholdMinutes: 5 });
+    saveSettings({ stallThresholdMinutes: 0 }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ stallThresholdMinutes: 0 });
+    writeProject({ stallThresholdMinutes: -1 });
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ stallThresholdMinutes: 1.5 });
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("round-trips defaultMaxTurns: 0 (unlimited marker)", () => {
     saveSettings({ defaultMaxTurns: 0 }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ defaultMaxTurns: 0 });
@@ -551,6 +562,7 @@ describe("settings persistence", () => {
       appliers = {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
+        setStallThresholdMinutes: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setMaxRetries: vi.fn(),
         setMaxModelWraparounds: vi.fn(),
@@ -576,6 +588,16 @@ describe("settings persistence", () => {
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
       };
+    });
+
+    it("applies stallThresholdMinutes, including zero, and skips absence", () => {
+      applySettings({ stallThresholdMinutes: 5 }, appliers);
+      expect(appliers.setStallThresholdMinutes).toHaveBeenCalledWith(5);
+      applySettings({ stallThresholdMinutes: 0 }, appliers);
+      expect(appliers.setStallThresholdMinutes).toHaveBeenCalledWith(0);
+      vi.mocked(appliers.setStallThresholdMinutes).mockClear();
+      applySettings({}, appliers);
+      expect(appliers.setStallThresholdMinutes).not.toHaveBeenCalled();
     });
 
     // 0 is a real value here, so `if (s.x)` truthiness would silently skip it.
@@ -820,6 +842,7 @@ describe("settings persistence", () => {
       appliers = {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
+        setStallThresholdMinutes: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setMaxRetries: vi.fn(),
         setMaxModelWraparounds: vi.fn(),

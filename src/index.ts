@@ -14,13 +14,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { clampThinkingLevel, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type SessionEntry, type SessionInfo, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, getAgentStallStatus, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getMaxModelWraparounds, getMaxRetries, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setMaxModelWraparounds, setMaxRetries, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { registerPrepareShutdownEndpoint } from "./background-jobs-rpc.js";
@@ -45,7 +46,7 @@ import { describeModel, type ModelRegistry, parseCanonicalModelId, type Resolved
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, getSessionArtifactDirectory, getWorktreeDirectory, sessionArtifactRoot, sessionTaskDir, setOutputTranscriptDefault, setSessionArtifactDirectory, setWorktreeDirectory, streamToOutputFile, writeInitialEntry } from "./output-file.js";
-import type { RetryModelCandidate } from "./pi-retry-adapter.js";
+import { getSessionModelCandidates, type RetryModelCandidate, replaceSessionModelCandidates } from "./pi-retry-adapter.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { resolveSubagentSessionDir } from "./session-dir.js";
@@ -1560,7 +1561,7 @@ export default function (pi: ExtensionAPI) {
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled, () => manager.getStallThresholdMinutes());
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
@@ -1569,7 +1570,8 @@ export default function (pi: ExtensionAPI) {
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
     (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
     getViewerMode,
-    (mode) => chooseViewerMode(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+    (mode) => chooseViewerMode(mode, currentCtx as unknown as ExtensionCommandContext | undefined),
+    () => manager.getStallThresholdMinutes());
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1825,6 +1827,7 @@ export default function (pi: ExtensionAPI) {
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
       onToolActivity: bgCallbacks.onToolActivity,
+      onTextDelta: bgCallbacks.onTextDelta,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       modelCandidates: opts.modelCandidates,
       // Fires when the run actually starts — immediately, or on queue
@@ -1927,6 +1930,7 @@ export default function (pi: ExtensionAPI) {
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
+      setStallThresholdMinutes: (n) => manager.setStallThresholdMinutes(n),
       setDefaultMaxTurns,
       setMaxRetries,
       setMaxModelWraparounds,
@@ -2009,9 +2013,9 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls — they run concurrently.
-- Background by default, with completion notices. Use run_in_background: false only when the next action needs the result. Never invent results; say when the agent is still running.
-- The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent steers; stop_subagent stops and keeps it resumable.${isolationCompactGuideline}`;
+- Background by default; use run_in_background:false only when the next step needs the result. Never invent results.
+- Summarize results for the user; verify changes before reporting them.
+- resume continues a previous agent by ID; steer_subagent steers; stop_subagent preserves resumability; update_subagent changes live model/thinking; interrupt:true resumes context.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -2117,6 +2121,7 @@ Terse command-style prompts produce shallow, generic work.
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
+      "Use update_subagent to change a live model/thinking; interrupt:true resumes its conversation on that selection. For stalled work, steer, interrupt-update, or stop then resume with Agent({resume, model, thinking}).",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
@@ -3381,6 +3386,10 @@ Terse command-style prompts produce shallow, generic work.
       }
       if (contextPercent !== null) statsParts.push(`Context: ${Math.round(contextPercent)}%`);
       if (record.compactionCount) statsParts.push(`Compactions: ${record.compactionCount}`);
+      const stall = record.status === "running"
+        ? getAgentStallStatus(record.lastActivityAt ?? record.startedAt, manager.getStallThresholdMinutes(), Date.now())
+        : undefined;
+      if (stall) statsParts.push(`Idle: ${stall.idleTime}${stall.stalled ? " (stalled)" : ""}`);
       statsParts.push(`Duration: ${duration}`);
 
       let output =
@@ -3389,7 +3398,9 @@ Terse command-style prompts produce shallow, generic work.
         `Description: ${record.description}\n` + formatWorkspace(record) + "\n";
 
       if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
+        output += stall?.stalled
+          ? "Agent is stalled. Use steer_subagent, update_subagent {interrupt: true}, or stop_subagent."
+          : "Agent is still running. Use wait: true or check back later.";
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}`;
       } else {
@@ -3503,6 +3514,138 @@ Terse command-style prompts produce shallow, generic work.
         `Agent ${record.id}: ${status}.\n` + formatWorkspace(record) +
         (workspaceChanges ? `Workspace changes: ${workspaceChanges}\n` : "") +
         `Resumable with Agent({resume: "${record.id}"}).`,
+      );
+    },
+  }));
+
+  // ---- update_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.UPDATE,
+    label: "Update Agent",
+    description:
+      "Change a running agent's model and/or thinking level. interrupt: true stops the current turn and resumes the same conversation on the new selection. For stopped agents, use Agent({resume, model, thinking}).",
+    promptSnippet: "Change the model or thinking level of a running agent",
+    parameters: Type.Object({
+      agent_id: Type.String({ description: "Agent ID, handle, or original ID." }),
+      model: Type.Optional(Type.String({ description: "Model name or provider/modelId[:thinking], resolved like Agent.model." })),
+      thinking: Type.Optional(Type.String({ description: `Thinking level: ${THINKING_LEVELS.join(", ")}.` })),
+      interrupt: Type.Optional(Type.Boolean({ description: "Stop the current run and resume with context on the new selection." })),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      if (params.model === undefined && params.thinking === undefined) {
+        return { ...textResult("Provide at least one of model or thinking."), isError: true };
+      }
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return { ...textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`), isError: true };
+      }
+      if (record.status !== "running" || !manager.isRunActive(record.id)) {
+        return textResult(
+          `Agent ${record.id} is not running (status: ${record.status}). Use Agent({resume, model, thinking}) to continue it with the desired settings.`,
+        );
+      }
+      const session = record.session;
+      if (!session) {
+        return { ...textResult(`Agent ${record.id} is running but its session is not ready yet.`), isError: true };
+      }
+      if (params.thinking !== undefined && !THINKING_LEVELS.includes(params.thinking as typeof THINKING_LEVELS[number])) {
+        return { ...textResult(`Unknown thinking level: "${params.thinking}".`), isError: true };
+      }
+
+      let resolvedModel: ResolvedModelCandidate | undefined;
+      if (params.model !== undefined) {
+        const resolution = resolveModelCandidates([params.model], ctx.modelRegistry, true);
+        resolvedModel = resolution.candidates[0];
+        if (!resolvedModel) return { ...textResult(resolution.errors.join("\n")), isError: true };
+        const scopeVerdict = checkModelScope({
+          model: resolvedModel.model,
+          cwd: ctx.cwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: true,
+          agentLabel: getDisplayName(record.type),
+          modelInput: resolvedModel.input,
+        });
+        if (scopeVerdict.kind === "error") return { ...textResult(scopeVerdict.message), isError: true };
+      }
+
+      const targetModel = resolvedModel?.model ?? session.model;
+      if (!targetModel) {
+        return { ...textResult(`Agent ${record.id} has no resolved model; pass model to select one.`), isError: true };
+      }
+      const requestedThinking = params.thinking as ModelThinkingLevel | undefined;
+      const effectiveThinking = clampThinkingLevel(
+        targetModel,
+        requestedThinking ?? resolvedModel?.thinking ?? session.thinkingLevel,
+      );
+      let modelCandidates: RetryModelCandidate[];
+      if (resolvedModel) {
+        modelCandidates = [{
+          input: resolvedModel.input,
+          model: resolvedModel.model,
+          ...(requestedThinking ?? resolvedModel.thinking ? { thinking: requestedThinking ?? resolvedModel.thinking } : {}),
+        }];
+      } else {
+        const retained = getSessionModelCandidates(session)?.candidates;
+        modelCandidates = (retained ?? [{ input: `${targetModel.provider}/${targetModel.id}`, model: targetModel }])
+          .map(candidate => requestedThinking === undefined ? candidate : { ...candidate, thinking: requestedThinking });
+      }
+
+      const updateInvocation = () => {
+        record.invocation ??= {};
+        Object.assign(record.invocation, describeModel(session.model ?? targetModel));
+        record.invocation.thinking = session.thinkingLevel ?? effectiveThinking;
+        record.invocation.modelCandidates = modelCandidates.map(candidate => candidate.input);
+        if (requestedThinking && requestedThinking !== record.invocation.thinking) {
+          record.invocation.requestedThinking = requestedThinking;
+        } else {
+          delete record.invocation.requestedThinking;
+        }
+      };
+
+      if (params.interrupt === true) {
+        if (!(await manager.stop(record.id))) {
+          return { ...textResult(`Could not stop agent ${record.id} to switch its selection.`), isError: true };
+        }
+        record.invocation ??= {};
+        Object.assign(record.invocation, describeModel(targetModel));
+        record.invocation.thinking = effectiveThinking;
+        record.invocation.modelCandidates = modelCandidates.map(candidate => candidate.input);
+        const config = getAgentConfig(record.type);
+        const resumed = await startBackgroundResume(ctx, record,
+          "Continue where you left off.\n\nThe previous turn was interrupted to switch model.",
+          {
+            outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+            maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
+            modelCandidates,
+          },
+        );
+        if (!resumed) {
+          return { ...textResult(`Agent ${record.id} stopped but could not be resumed.`), isError: true };
+        }
+      } else {
+        try {
+          if (resolvedModel) {
+            await replaceSessionModelCandidates(session, [modelCandidates[0]], undefined, transition => {
+              record.invocation ??= {};
+              Object.assign(record.invocation, describeModel(transition.candidate.model));
+              record.invocation.thinking = transition.thinking;
+              record.invocation.modelCandidates = transition.selection ?? [transition.candidate.input];
+            });
+          }
+          if (requestedThinking !== undefined) {
+            session.setThinkingLevel(clampThinkingLevel(session.model ?? targetModel, requestedThinking));
+          }
+          updateInvocation();
+        } catch (error) {
+          return { ...textResult(`Failed to update agent selection: ${error instanceof Error ? error.message : String(error)}`), isError: true };
+        }
+      }
+
+      const model = params.interrupt === true ? targetModel : session.model ?? targetModel;
+      const thinking = params.interrupt === true ? effectiveThinking : session.thinkingLevel ?? effectiveThinking;
+      return textResult(
+        `Agent ${record.id} updated.\nModel: ${describeModel(model).modelId}\nThinking: ${thinking}\nInterrupted: ${params.interrupt === true ? "yes" : "no"}\n` + formatWorkspace(record),
       );
     },
   }));
@@ -4175,6 +4318,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       maxConcurrent: manager.getMaxConcurrent(),
       // 0 = unlimited, and the default — see SubagentsSettings.
       maxConcurrentForeground: manager.getMaxConcurrentForeground(),
+      stallThresholdMinutes: manager.getStallThresholdMinutes(),
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
@@ -4231,7 +4375,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set([
-    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "maxRetries", "maxModelWraparounds", "graceTurns", "maxSubagentDepth",
+    "maxConcurrent", "maxConcurrentForeground", "stallThresholdMinutes", "defaultMaxTurns", "maxRetries", "maxModelWraparounds", "graceTurns", "maxSubagentDepth",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -4252,6 +4396,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     function buildItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
       const mcf = manager.getMaxConcurrentForeground();
+      const stm = manager.getStallThresholdMinutes();
       const dmt = getDefaultMaxTurns() ?? 0;
       const retries = getMaxRetries();
       const wraps = getMaxModelWraparounds();
@@ -4279,6 +4424,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Max concurrent foreground (blocking) agents (0 = unlimited, Enter to type)",
           currentValue: String(mcf),
           values: [String(mcf)],
+        },
+        {
+          id: "stallThresholdMinutes",
+          label: "Stall threshold",
+          description: "Mark a running agent stalled after this many idle minutes (0 = disabled, Enter to type)",
+          currentValue: String(stm),
+          values: [String(stm)],
         },
         {
           id: "defaultMaxTurns",
@@ -4516,6 +4668,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
           notifyApplied(ctx, n === 0
             ? "Max foreground concurrency set to unlimited"
             : `Max foreground concurrency set to ${n}`);
+        }
+      } else if (id === "stallThresholdMinutes") {
+        const n = parseInt(value, 10);
+        if (n >= 0) {
+          manager.setStallThresholdMinutes(n);
+          notifyApplied(ctx, n === 0 ? "Stall visibility disabled" : `Stall threshold set to ${n} minutes`);
+          widget.update();
+          fleet.update();
         }
       } else if (id === "defaultMaxTurns") {
         const n = parseInt(value, 10);
@@ -4771,8 +4931,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
         ? String(manager.getMaxConcurrent())
         : result === "maxConcurrentForeground"
           ? String(manager.getMaxConcurrentForeground())
-          : result === "defaultMaxTurns"
-            ? String(getDefaultMaxTurns() ?? 0)
+          : result === "stallThresholdMinutes"
+            ? String(manager.getStallThresholdMinutes())
+            : result === "defaultMaxTurns"
+              ? String(getDefaultMaxTurns() ?? 0)
             : result === "maxRetries"
               ? String(getMaxRetries())
               : result === "maxModelWraparounds"
@@ -4785,8 +4947,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
         ? "Max concurrency (1+)"
         : result === "maxConcurrentForeground"
           ? "Max foreground concurrency (0 = unlimited)"
-          : result === "defaultMaxTurns"
-            ? "Default max turns (0 = unlimited)"
+          : result === "stallThresholdMinutes"
+            ? "Stall threshold (minutes, 0 = disabled)"
+            : result === "defaultMaxTurns"
+              ? "Default max turns (0 = unlimited)"
             : result === "maxRetries"
               ? "Model retries (0–100)"
               : result === "maxModelWraparounds"

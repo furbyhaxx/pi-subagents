@@ -56,6 +56,7 @@ export const SUBAGENT_TOOL_NAMES = {
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
   STOP: "stop_subagent",
+  UPDATE: "update_subagent",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -1396,6 +1397,7 @@ export async function resumeAgent(
     cwd?: string;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
     modelCandidates?: RetryModelCandidate[];
@@ -1447,8 +1449,14 @@ export async function resumeAgent(
 
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  let currentMessageText = "";
+  const unsubEvents = (options.onToolActivity || options.onTextDelta || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "message_start" && event.message.role === "assistant") currentMessageText = "";
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+          currentMessageText += event.assistantMessageEvent.delta;
+          options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+        }
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
