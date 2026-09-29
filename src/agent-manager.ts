@@ -857,7 +857,7 @@ export class AgentManager {
       } catch (error) {
         if (isWorktreeAcquisitionError(error)) {
           if (record.runGeneration !== generation || !this.isRunActive(id)) {
-            await cleanupWorktree(pi, baseCwd, error.worktree, options.description);
+            await cleanupWorktree(pi, baseCwd, error.worktree, options.description, id);
             return;
           }
           record.worktree = error.worktree;
@@ -870,7 +870,7 @@ export class AgentManager {
         throw error;
       }
       if (record.runGeneration !== generation || !this.isRunActive(id)) {
-        await cleanupWorktree(pi, baseCwd, wt, options.description);
+        await cleanupWorktree(pi, baseCwd, wt, options.description, id);
         return;
       }
       record.worktree = wt;
@@ -1990,7 +1990,7 @@ export class AgentManager {
             record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
           }
           try {
-            record.worktreeResult = await cleanupWorktree(pi, worktree.sourceRoot, worktree, record.description);
+            record.worktreeResult = await cleanupWorktree(pi, worktree.sourceRoot, worktree, record.description, record.id);
             record.result = (record.result ?? "") + worktreeRetainedNote(worktree, record.worktreeResult);
           } catch {
             record.worktreeResult = retainedWorktreeResult(worktree);
