@@ -1,8 +1,9 @@
 /**
  * worktree.ts — Git worktree isolation for agents.
  *
- * Anonymous copies are detached and retained in place after settlement.
- * Explicit branches acquire reusable retained workspaces.
+ * Every worktree checks out a real local branch and remains after settlement.
+ * Explicit branches acquire reusable named workspaces; anonymous agents get
+ * their own `pi/<agentId>` branch.
  * Leases serialize extension-owned writers across processes through settlement.
  *
  * Every git call goes through `pi.exec` (async) rather than `execFileSync`: a
@@ -30,7 +31,11 @@ export interface WorktreeOptions {
 }
 
 export interface WorktreeInfo {
-  lifecycle: "ephemeral" | "retained";
+  lifecycle: "retained";
+  /** Whether the caller supplied the branch name. */
+  named: boolean;
+  /** Caller branch at acquisition, or its HEAD SHA when detached. */
+  baseRef: string;
   /** Origin repository root used for relative placement and configuration. */
   sourceRoot: string;
   /** Canonical common Git directory shared by all linked worktrees. */
@@ -40,7 +45,7 @@ export interface WorktreeInfo {
   initialDirty: boolean;
   /** Absolute path to the worktree directory (the copied repo's root). */
   path: string;
-  /** Exact checked-out branch for retained scopes; descriptive slug for anonymous copies. */
+  /** Exact checked-out local branch. */
   branch: string;
   /** HEAD at acquisition, including the existing tip when reusing a branch. */
   baseSha: string;
@@ -64,6 +69,7 @@ export interface WorktreeInfo {
  * passes.
  */
 let worktreeIsolationEnabled = true;
+let worktreeAutoCommitEnabled = false;
 
 export function setWorktreeIsolationEnabled(enabled: boolean): void {
   worktreeIsolationEnabled = enabled;
@@ -73,11 +79,21 @@ export function isWorktreeIsolationEnabled(): boolean {
   return worktreeIsolationEnabled;
 }
 
+export function setWorktreeAutoCommitEnabled(enabled: boolean): void {
+  worktreeAutoCommitEnabled = enabled;
+}
+
+export function isWorktreeAutoCommitEnabled(): boolean {
+  return worktreeAutoCommitEnabled;
+}
+
 export interface WorktreeCleanupResult {
   /** Whether changes were found, or conservatively assumed after verification failed. */
   hasChanges: boolean;
-  /** Exact branch name for a named retained worktree. */
+  /** Exact checked-out branch name. */
   branch?: string;
+  /** Why opt-in automatic staging or commit did not complete. */
+  commitError?: string;
   /** Retained worktree path. */
   path?: string;
   retained?: true;
@@ -219,7 +235,7 @@ export async function acquireWorktreeLease(worktree: WorktreeInfo, agentId: stri
   if (leases.has(worktree)) throw new Error("Branch busy; this worktree already has an active lease");
   const directory = join(worktree.commonDir, "pi-subagents-leases");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const key = worktree.lifecycle === "retained" ? `branch:${worktree.branch}` : `path:${worktree.path}`;
+  const key = worktree.named ? `branch:${worktree.branch}` : `path:${worktree.path}`;
   const owner: LeaseOwner = {
     pid: process.pid, host: hostname(), boot: bootIdentity(), start: processStart(process.pid),
     token: randomUUID(), agentId,
@@ -244,12 +260,12 @@ async function verifyWorktree(pi: ExtensionAPI, worktree: WorktreeInfo): Promise
   const entries = await registrations(pi, worktree.path);
   const matches = entries.filter(entry => resolve(entry.path) === worktree.path);
   if (matches.length !== 1 || matches[0].prunable) throw new Error(`Stale or ambiguous worktree registration: ${worktree.path}; inspect git worktree list`);
-  if (worktree.lifecycle === "retained" && resolve(entries[0].path) === worktree.path) {
+  if (resolve(entries[0].path) === worktree.path) {
     throw new Error(`Retained worktree is now the main checkout: ${worktree.path}`);
   }
   const branch = await git(pi, worktree.path, ["rev-parse", "--symbolic-full-name", "HEAD"], 5000);
-  const expected = worktree.lifecycle === "retained" ? `refs/heads/${worktree.branch}` : "HEAD";
-  if (branch !== expected || (worktree.lifecycle === "retained" && matches[0].branch !== expected)) {
+  const expected = `refs/heads/${worktree.branch}`;
+  if (branch !== expected || matches[0].branch !== expected) {
     throw new Error(`Worktree branch changed at ${worktree.path}; expected ${expected}`);
   }
   if (!inside(worktree.path, worktree.workPath) || !existsSync(worktree.workPath) ||
@@ -265,24 +281,27 @@ export async function resumeWorktree(pi: ExtensionAPI, worktree: WorktreeInfo, a
   catch (error) { releaseWorktreeLease(worktree); throw error; }
 }
 
-/** Create an anonymous detached copy, or acquire a retained exact local branch. */
+/** Create an agent branch, or acquire a caller-selected exact local branch. */
 export async function createWorktree(
   pi: ExtensionAPI,
   cwd: string,
   agentId: string,
   options: WorktreeOptions = {},
 ): Promise<WorktreeInfo | undefined> {
-  const retained = options.branch !== undefined;
-  if (retained && !worktreeIsolationEnabled) throw new Error("Branch requires worktree isolation, which is disabled");
+  const named = options.branch !== undefined;
+  if (named && !worktreeIsolationEnabled) throw new Error("Branch requires worktree isolation, which is disabled");
   let baseSha: string;
+  let baseRef: string;
   let callerRoot: string;
   let commonDir: string;
   try {
     baseSha = await git(pi, cwd, ["rev-parse", "HEAD"], 5000);
+    const callerBranch = await git(pi, cwd, ["branch", "--show-current"], 5000);
+    baseRef = callerBranch || baseSha;
     callerRoot = realpathSync(await git(pi, cwd, ["rev-parse", "--show-toplevel"], 5000));
     commonDir = await commonDirectory(pi, cwd);
   } catch (error) {
-    if (retained) throw error;
+    if (named) throw error;
     return undefined;
   }
   const entries = await registrations(pi, cwd);
@@ -300,19 +319,17 @@ export async function createWorktree(
     } catch { /* Keep the target repository anchor. */ }
   }
   const subdir = relative(callerRoot, realpathSync(cwd));
-  const branch = options.branch ?? `pi-agent-${agentId}`;
-  if (retained) {
-    const validated = await git(pi, cwd, ["check-ref-format", "--branch", branch], 5000);
-    if (validated !== branch) throw new Error("Branch must be an exact local branch name, not a revision shortcut");
-    await git(pi, cwd, ["check-ref-format", `refs/heads/${branch}`], 5000);
-  }
+  const branch = options.branch ?? `pi/${agentId}`;
+  const validated = await git(pi, cwd, ["check-ref-format", "--branch", branch], 5000);
+  if (validated !== branch) throw new Error("Branch must be an exact local branch name, not a revision shortcut");
+  await git(pi, cwd, ["check-ref-format", `refs/heads/${branch}`], 5000);
   const scope: WorktreeInfo = {
-    path: "", workPath: "", branch, baseSha, sourceRoot, commonDir,
-    lifecycle: retained ? "retained" : "ephemeral", reused: false, initialDirty: false,
+    path: "", workPath: "", branch, baseSha, baseRef, named, sourceRoot, commonDir,
+    lifecycle: "retained", reused: false, initialDirty: false,
   };
-  if (retained) await acquireWorktreeLease(scope, agentId);
+  if (named) await acquireWorktreeLease(scope, agentId);
   try {
-    if (retained) {
+    if (named) {
       const matches = (await registrations(pi, cwd)).filter(entry => entry.branch === `refs/heads/${branch}`);
       if (matches.length > 1) throw new Error(`Ambiguous worktree registrations for branch ${branch}`);
       if (matches.length === 1) {
@@ -348,19 +365,43 @@ export async function createWorktree(
     }
     mkdirSync(container, { recursive: true, mode: 0o700 });
     const slug = branch.replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 64) || "branch";
-    scope.path = join(container, retained ? `${slug}-${hash(`${commonDir}\0${branch}`)}` : `${slug}-${randomUUID().slice(0, 8)}`);
+    scope.path = join(container, named ? `${slug}-${hash(`${commonDir}\0${branch}`)}` : `${slug}-${randomUUID().slice(0, 8)}`);
     scope.workPath = join(scope.path, subdir);
-    if (!retained) await acquireWorktreeLease(scope, agentId);
+    if (!named) await acquireWorktreeLease(scope, agentId);
     let args: string[];
-    if (retained) {
+    if (named) {
       const exists = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
       if (exists.killed || (exists.code !== 0 && exists.code !== 1)) throw new Error(exists.stderr || "Cannot resolve local branch");
       args = exists.code === 0 ? ["worktree", "add", scope.path, branch]
         : ["worktree", "add", "-b", branch, scope.path, baseSha];
-    } else args = ["worktree", "add", "--detach", scope.path, baseSha];
+    } else {
+      const parentBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", "refs/heads/pi"], { cwd, timeout: 5000 });
+      if (parentBranch.killed || (parentBranch.code !== 0 && parentBranch.code !== 1)) {
+        throw new Error(parentBranch.stderr || "Cannot check whether local branch `pi` exists");
+      }
+      if (parentBranch.code === 0) {
+        throw new Error(`Cannot create generated branch ${branch}: local branch 'pi' prevents refs under 'pi/'; rename it or request an explicit branch`);
+      }
+      const generatedBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
+      if (generatedBranch.killed || (generatedBranch.code !== 0 && generatedBranch.code !== 1)) {
+        throw new Error(generatedBranch.stderr || `Cannot check whether generated branch ${branch} exists`);
+      }
+      if (generatedBranch.code === 0) {
+        throw new Error(`Generated branch ${branch} already exists; use a different agent id or request an explicit branch`);
+      }
+      args = ["worktree", "add", "-b", branch, scope.path, baseSha];
+    }
     try { await git(pi, cwd, args, 30000); }
     catch (error) {
-      if (retained) throw error;
+      if (named) throw error;
+      const parentBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", "refs/heads/pi"], { cwd, timeout: 5000 });
+      if (parentBranch.code === 0) {
+        throw new Error(`Cannot create generated branch ${branch}: local branch 'pi' prevents refs under 'pi/'; rename it or request an explicit branch`, { cause: error });
+      }
+      const generatedBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
+      if (generatedBranch.code === 0) {
+        throw new Error(`Generated branch ${branch} already exists; use a different agent id or request an explicit branch`, { cause: error });
+      }
       releaseWorktreeLease(scope);
       return undefined;
     }
@@ -378,32 +419,40 @@ export async function createWorktree(
 }
 
 /**
- * Verify and report a settled worktree, then release its writer lease.
- * Settlement never stages, commits, creates a branch, resets, stashes, cleans,
- * or removes the workspace. Anonymous worktrees remain detached in place.
- *
- * A named workspace keeps its strict verification behavior. An anonymous
- * workspace reports changes conservatively when its state cannot be verified:
- * the retained path is still the authoritative recovery location.
+ * Optionally commit dirty work and report a settled worktree before releasing
+ * its writer lease. Verification failures are strict for named worktrees and
+ * conservative for agent-owned branches, which remain recovery locations.
  */
 export async function cleanupWorktree(
   pi: ExtensionAPI,
   _cwd: string,
   worktree: WorktreeInfo,
-  _agentDescription: string,
+  description: string,
+  agentId: string,
 ): Promise<WorktreeCleanupResult> {
   try {
     const dirty = await verifyWorktree(pi, worktree);
+    let commitError: string | undefined;
+    if (dirty && worktreeAutoCommitEnabled) {
+      try {
+        await git(pi, worktree.path, ["add", "-A"], 30000);
+        await git(pi, worktree.path, ["commit", "-m", `pi-subagents: ${description} (agent ${agentId})`], 30000);
+      } catch (error) {
+        commitError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const stillDirty = await verifyWorktree(pi, worktree);
     const head = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
     return {
-      hasChanges: dirty || head !== worktree.baseSha,
-      ...(worktree.lifecycle === "retained" ? { branch: worktree.branch } : {}),
+      hasChanges: stillDirty || head !== worktree.baseSha,
+      branch: worktree.branch,
+      ...(commitError ? { commitError } : {}),
       path: worktree.path,
       retained: true,
     };
   } catch (error) {
-    if (worktree.lifecycle === "retained") throw error;
-    return { hasChanges: true, path: worktree.path, retained: true };
+    if (worktree.named) throw error;
+    return { hasChanges: true, branch: worktree.branch, path: worktree.path, retained: true };
   } finally {
     releaseWorktreeLease(worktree);
   }

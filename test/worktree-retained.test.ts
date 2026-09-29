@@ -65,7 +65,7 @@ describe("retained branch worktrees", () => {
     const head = git(repo, "rev-parse", "HEAD");
     writeFileSync(join(repo, "parent-only.txt"), "parent dirty");
     const scope = await create("feat/one", join(repo, "packages", "api"));
-    expect(scope).toMatchObject({ lifecycle: "retained", reused: false, initialDirty: false, sourceRoot: repo, commonDir: join(repo, ".git"), baseSha: head });
+    expect(scope).toMatchObject({ lifecycle: "retained", named: true, baseRef: "main", reused: false, initialDirty: false, sourceRoot: repo, commonDir: join(repo, ".git"), baseSha: head });
     expect(scope.path.startsWith(join(sessionRoot, "worktrees"))).toBe(true);
     expect(scope.workPath).toBe(join(scope.path, "packages", "api"));
     expect(git(scope.path, "branch", "--show-current")).toBe("feat/one");
@@ -76,7 +76,7 @@ describe("retained branch worktrees", () => {
     writeFileSync(join(scope.workPath, "index.txt"), "unstaged\n");
     writeFileSync(join(scope.path, "untracked.txt"), "retain me");
     const before = git(scope.path, "status", "--porcelain");
-    expect(await cleanupWorktree(pi, repo, scope, "done")).toEqual({ hasChanges: true, branch: "feat/one", path: scope.path, retained: true });
+    expect(await cleanupWorktree(pi, repo, scope, "done", "agent-0")).toEqual({ hasChanges: true, branch: "feat/one", path: scope.path, retained: true });
     expect(git(scope.path, "status", "--porcelain")).toBe(before);
     expect(git(scope.path, "rev-parse", "HEAD")).toBe(head);
     expect(git(scope.path, "show", ":packages/api/index.txt")).toBe("staged");
@@ -95,7 +95,7 @@ describe("retained branch worktrees", () => {
     expect(scope.reused).toBe(true);
     expect(scope.initialDirty).toBe(true);
     expect(scope.baseSha).toBe(git(existing, "rev-parse", "HEAD"));
-    await cleanupWorktree(pi, repo, scope, "no edits");
+    await cleanupWorktree(pi, repo, scope, "no edits", "agent-1");
     expect(readFileSync(join(existing, "extra.txt"), "utf8")).toBe("dirty");
   });
 
@@ -138,7 +138,7 @@ describe("retained branch worktrees", () => {
     expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
     const scope = scopes[0];
     await expect(acquireWorktreeLease({ ...scope }, "other-process-record")).rejects.toThrow(/busy/);
-    await cleanupWorktree(pi, repo, scope, "settled");
+    await cleanupWorktree(pi, repo, scope, "settled", "agent-2");
     writeFileSync(join(scope.path, "resumed.txt"), "dirty before resume");
     await resumeWorktree(pi, scope, "resume-agent");
     expect(scope.initialDirty).toBe(true);
@@ -152,8 +152,11 @@ describe("retained branch worktrees", () => {
 
   it("reacquires a settled anonymous worktree and releases retained leases even when status fails", async () => {
     const anonymous = await create();
-    expect(await cleanupWorktree(pi, repo, anonymous, "done")).toEqual({
-      hasChanges: false, path: anonymous.path, retained: true,
+    const key = createHash("sha256").update(`path:${anonymous.path}`).digest("hex").slice(0, 16);
+    expect(existsSync(join(anonymous.commonDir, "pi-subagents-leases", `${key}.lock`))).toBe(true);
+    expect(anonymous).toMatchObject({ named: false, branch: expect.stringMatching(/^pi\//), baseRef: "main" });
+    expect(await cleanupWorktree(pi, repo, anonymous, "done", "agent-0")).toEqual({
+      hasChanges: false, branch: anonymous.branch, path: anonymous.path, retained: true,
     });
     expect(existsSync(anonymous.path)).toBe(true);
     await resumeWorktree(pi, anonymous, "resume");
@@ -162,7 +165,7 @@ describe("retained branch worktrees", () => {
     const scope = await create("broken");
     writeFileSync(join(scope.path, "keep.txt"), "do not delete");
     writeFileSync(join(scope.path, ".git"), "gitdir: /missing/git-dir");
-    await expect(cleanupWorktree(pi, repo, scope, "failure")).rejects.toThrow();
+    await expect(cleanupWorktree(pi, repo, scope, "failure", "agent-1")).rejects.toThrow();
     expect(readFileSync(join(scope.path, "keep.txt"), "utf8")).toBe("do not delete");
     const unlock = await acquireWorktreeLease({ ...scope }, "next");
     unlock();

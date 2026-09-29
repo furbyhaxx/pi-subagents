@@ -28,6 +28,7 @@ import type { AgentRecord } from "../src/types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
+import { isWorktreeAutoCommitEnabled, setWorktreeAutoCommitEnabled } from "../src/worktree.js";
 import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 /* ------------------------------------------------------------------------- *
@@ -1483,7 +1484,7 @@ describe("collisions with another extension", () => {
    * matter — row 0 is `Max concurrency`, whose single-value list re-applies the
    * value it already had. What matters is that the file gets written at all.
    */
-  async function changeAnUnrelatedSetting(booted: ReturnType<typeof boot>) {
+  async function changeAnUnrelatedSetting(booted: ReturnType<typeof boot>, selectedIndex = 0) {
     // The settings list asks for a real theme, which only the TUI normally sets up.
     initTheme(undefined, false);
     let built: any;
@@ -1501,6 +1502,7 @@ describe("collisions with another extension", () => {
         }),
         custom: vi.fn(async (factory: any) => {
           built = factory({ requestRender: () => {} }, {}, {}, () => {});
+          for (let i = 0; i < selectedIndex; i++) built.handleInput("\x1b[B");
           built.handleInput(" ");
           return undefined;
         }),
@@ -1508,7 +1510,7 @@ describe("collisions with another extension", () => {
       },
     });
     await booted.commands.get("agents").handler("", context);
-    return context;
+    return { context, menu: built.render(120).join("\n") };
   }
 
   const savedSettings = () =>
@@ -1534,6 +1536,30 @@ describe("collisions with another extension", () => {
     await changeAnUnrelatedSetting(booted);
 
     expect(savedSettings().workflowsEnabled).toBe(false);
+  });
+
+  it("exposes and preserves worktree auto-commit in the /agents settings menu", async () => {
+    try {
+      const booted = boot({ worktreeAutoCommit: true });
+      const { menu } = await changeAnUnrelatedSetting(booted);
+
+      expect(menu).toContain("Worktree auto-commit");
+      expect(savedSettings().worktreeAutoCommit).toBe(true);
+    } finally {
+      setWorktreeAutoCommitEnabled(false);
+    }
+  });
+
+  it("toggles worktree auto-commit from the /agents settings menu", async () => {
+    try {
+      const booted = boot({ worktreeAutoCommit: false });
+      await changeAnUnrelatedSetting(booted, 19);
+
+      expect(isWorktreeAutoCommitEnabled()).toBe(true);
+      expect(savedSettings().worktreeAutoCommit).toBe(true);
+    } finally {
+      setWorktreeAutoCommitEnabled(false);
+    }
   });
 
   it("ignores tool names that merely contain the word", async () => {

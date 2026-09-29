@@ -37,7 +37,7 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, releaseWor
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 
-/** Result note after background jobs in an ephemeral worktree were confirmed stopped. */
+/** Result note after background jobs in an agent-created worktree were confirmed stopped. */
 function stoppedJobsNote(ids: string[]): string {
   return `\n\nStopped ${ids.length} background job(s) still running in the worktree: ${ids.join(", ")}.`;
 }
@@ -48,12 +48,7 @@ function stoppedJobsNote(ids: string[]): string {
  * verified clean, so nothing may treat it as a discarded/empty copy.
  */
 function retainedWorktreeResult(worktree: WorktreeInfo): WorktreeCleanupResult {
-  return {
-    hasChanges: true,
-    ...(worktree.lifecycle === "retained" ? { branch: worktree.branch } : {}),
-    path: worktree.path,
-    retained: true,
-  };
+  return { hasChanges: true, branch: worktree.branch, path: worktree.path, retained: true };
 }
 
 /** Narrow the typed post-add failure without requiring runtime mock wiring. */
@@ -66,10 +61,8 @@ function isWorktreeAcquisitionError(error: unknown): error is WorktreeAcquisitio
 /** Human-readable settlement note without claiming unverified Git state. */
 function worktreeRetainedNote(worktree: WorktreeInfo, result: WorktreeCleanupResult): string {
   const state = result.hasChanges ? "Changes are present or could not be ruled out." : "No changes were detected.";
-  if (worktree.lifecycle === "retained") {
-    return `\n\nWorkspace retained on branch \`${worktree.branch}\` at \`${worktree.path}\`. ${state} No automatic commit or merge performed.`;
-  }
-  return `\n\nWorkspace retained at \`${worktree.path}\` on its detached HEAD. ${state} No automatic commit, branch, or removal performed.`;
+  const commitError = result.commitError ? ` Automatic commit failed: ${result.commitError}` : "";
+  return `\n\nWorkspace retained on branch \`${worktree.branch}\` at \`${worktree.path}\`. ${state}${commitError}`;
 }
 
 /**
@@ -878,7 +871,7 @@ export class AgentManager {
       // behavior (agent at the copy's root) — moving them to workPath would
       // also move .pi config discovery when the parent session sits in a repo
       // subdirectory, silently dropping extensions/skills.
-      worktreeCwd = wt.lifecycle === "retained" || customCwd !== undefined ? wt.workPath : wt.path;
+      worktreeCwd = wt.named || customCwd !== undefined ? wt.workPath : wt.path;
       this.worktreeApis.set(id, pi);
 
       // No longer "running" means a stop landed while the copy was being made
@@ -887,7 +880,7 @@ export class AgentManager {
       // burn tokens on work nobody is waiting for. Retain and report the copy.
       if (record.status !== "running") {
         releaseSlot();
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description, id);
         this.drainQueue();
         return;
       }
@@ -895,20 +888,20 @@ export class AgentManager {
 
     if (options.signal?.aborted) {
       this.abort(id);
-      if (record.worktree) record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+      if (record.worktree) record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, id);
       releaseSlot();
       this.drainQueue();
       return;
     }
     record.effectiveCwd = worktreeCwd ?? baseCwd;
-    record.configCwd = options.configCwd ?? (customCwd !== undefined || record.worktree?.lifecycle === "retained" ? ctx.cwd : undefined);
+    record.configCwd = options.configCwd ?? (customCwd !== undefined || record.worktree?.named ? ctx.cwd : undefined);
     try {
       this.onStart?.(record);
     } catch (error) {
       try {
-        if (record.worktree) record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+        if (record.worktree) record.worktreeResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, id);
       } finally {
-        if (record.worktree?.lifecycle === "retained") releaseWorktreeLease(record.worktree);
+        if (record.worktree) releaseWorktreeLease(record.worktree);
         releaseSlot();
       }
       const retained = record.worktree && record.worktreeResult
@@ -1106,14 +1099,14 @@ export class AgentManager {
             if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
               record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
             }
-            // Anonymous jobs are now stopped; named worktrees deliberately skip
-            // implicit job control. In both cases the lease remains held here.
+            // Agent-created branches have their jobs stopped; named worktrees
+            // deliberately skip implicit job control. The lease remains held here.
             if (options.onBeforeWorktreeCleanup) {
               try {
                 await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
               } catch { /* ignore — never block settlement */ }
             }
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, id);
             record.worktreeResult = wtResult;
             // Appended to prose only. Structured output remains machine-readable.
             record.result = (record.result ?? "") + worktreeRetainedNote(record.worktree, wtResult);
@@ -1157,7 +1150,7 @@ export class AgentManager {
               record.error = (record.error ?? "") + stoppedJobsNote(jobs.stopped);
             }
             try {
-              const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+              const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, id);
               record.worktreeResult = wtResult;
               record.error = (record.error ?? "") + worktreeRetainedNote(record.worktree, wtResult);
             } catch {
@@ -1515,7 +1508,7 @@ export class AgentManager {
       return;
     }
     try {
-      record.worktreeResult = await cleanupWorktree(this.worktreeApis.get(record.id)!, worktree.sourceRoot, worktree, record.description);
+      record.worktreeResult = await cleanupWorktree(this.worktreeApis.get(record.id)!, worktree.sourceRoot, worktree, record.description, record.id);
       let note = worktreeRetainedNote(worktree, record.worktreeResult);
       if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) note = stoppedJobsNote(jobs.stopped) + note;
       if (record.status === "error") record.error = (record.error ?? "") + note;
@@ -1530,9 +1523,9 @@ export class AgentManager {
   }
 
   /**
-   * Stop the background jobs of an ephemeral worktree before its lease is released.
+   * Stop the background jobs of an agent-created branch before lease release.
    *
-   * Undefined when there is nothing to gate: no worktree, a retained tree
+   * Undefined when there is nothing to gate: no worktree, a named tree
    * (never implicitly stopped), or a record whose parent never exposed the
    * recognized family. A `failed` result means the caller must retain conservatively;
    * `unavailable` is a no-op only for a never-possible record. Once jobs were
@@ -1544,7 +1537,7 @@ export class AgentManager {
     record: AgentRecord,
   ): Promise<StopWorktreeResult | undefined> {
     const worktree = record.worktree;
-    if (!worktree || worktree.lifecycle !== "ephemeral") return undefined;
+    if (!worktree || worktree.named) return undefined;
 
     // The current registry catches a runtime installed after the original
     // spawn. The record's true value is intentionally sticky for the opposite

@@ -437,7 +437,7 @@ describe("buildAgentPrompt", () => {
 
   it("puts verified retained branch scope after custom and inherited instructions in both modes", () => {
     const worktree: WorktreeInfo = {
-      lifecycle: "retained", sourceRoot: "/repo", commonDir: "/repo/.git", reused: true, initialDirty: true,
+      lifecycle: "retained", named: true, baseRef: "main", sourceRoot: "/repo", commonDir: "/repo/.git", reused: true, initialDirty: true,
       branch: "feat/x", path: "/worktrees/x", workPath: "/worktrees/x/packages/api", baseSha: "abc",
     };
     for (const promptMode of ["append", "replace"] as const) {
@@ -446,27 +446,35 @@ describe("buildAgentPrompt", () => {
       expect(prompt).toContain("Checked-out branch: feat/x");
       expect(prompt).toContain("Workspace: reused; retained after this run");
       expect(prompt).toContain("existing uncommitted changes are present");
-      expect(prompt).toContain("reusable workspace");
-      expect(prompt).toContain("No automatic commit, merge, reset, stash, clean or removal occurs");
+      expect(prompt).toContain("Branch kind: caller-selected");
+      expect(prompt).toContain("Base ref: main");
+      expect(prompt).toContain("Commit work in logical conventional commits on this branch before finishing unless the task says not to.");
+      expect(prompt).toContain("You may run `git rebase main` if the base ref has moved.");
+      expect(prompt).toContain("Do not push, merge, switch to or create other branches, or create/remove worktrees.");
+      expect(prompt).toContain("Final report states the branch, HEAD SHA, commit list, dirty state");
       expect(prompt.indexOf("<worktree_scope>")).toBeGreaterThan(prompt.indexOf("Custom instructions."));
       expect(prompt.endsWith("</worktree_scope>")).toBe(true);
     }
   });
 
-  it("tells anonymous worktree agents that detached workspaces remain for explicit review", () => {
+  it("gives agent-created worktrees a real branch and commit/rebase guidance", () => {
     const worktree: WorktreeInfo = {
-      lifecycle: "ephemeral", sourceRoot: "/repo", commonDir: "/repo/.git", reused: false, initialDirty: false,
-      branch: "fix-tests", path: "/worktrees/fix-tests", workPath: "/worktrees/fix-tests", baseSha: "abc",
+      lifecycle: "retained", named: false, baseRef: "main", sourceRoot: "/repo", commonDir: "/repo/.git", reused: false, initialDirty: false,
+      branch: "pi/agent-id", path: "/worktrees/pi-agent-id", workPath: "/worktrees/pi-agent-id", baseSha: "abc",
     };
     const prompt = buildAgentPrompt(getDefaultConfig("general-purpose"), worktree.path, env, undefined, { worktree });
 
-    expect(prompt).toContain("Checkout: detached HEAD");
+    expect(prompt).toContain("Checked-out branch: pi/agent-id");
+    expect(prompt).toContain("Branch kind: agent-created");
+    expect(prompt).toContain("Base ref: main");
     expect(prompt).toContain("Workspace: created; retained after this run");
-    expect(prompt).toContain("No automatic commit, branch creation, merge, reset, stash, clean or removal occurs");
-    expect(prompt).toContain("either integrate its changes and then remove it, or discard and remove it");
-    expect(prompt).toContain("Report the worktree path");
-    expect(prompt).not.toContain("disposable");
-    expect(prompt).not.toContain("automatically preserved");
+    expect(prompt).toContain("Commit work in logical conventional commits");
+    expect(prompt).toContain("git rebase main");
+    expect(prompt).toContain("Do not push");
+    expect(prompt).toContain("HEAD SHA, commit list, dirty state");
+    expect(prompt).toContain("Final report states the branch");
+    expect(prompt).toContain("worktree-relative changes");
+    expect(prompt).not.toContain("detached HEAD");
   });
 
   describe("workflow child block", () => {

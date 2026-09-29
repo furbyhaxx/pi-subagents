@@ -101,7 +101,7 @@ describe("completion workspace metadata", () => {
     const { task } = runningTask();
     const workspace: WorktreeInfo = {
       path: "/trees/feat&x", workPath: "/trees/feat&x/packages/api",
-      branch: "feat/x", baseSha: "abc123", lifecycle: "retained",
+      branch: "feat/x", baseSha: "abc123", baseRef: "main", named: true, lifecycle: "retained",
       sourceRoot: "/repo", commonDir: "/repo/.git", reused: true, initialDirty: true,
     };
     const value = { summary: "x".repeat(5000) };

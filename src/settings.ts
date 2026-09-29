@@ -209,7 +209,7 @@ export interface SubagentsSettings {
    * The drop is deliberately silent — there is no per-result note, because the
    * setting exists for projects whose model asks for a worktree on every call,
    * where a note would be noise on every result. What keeps the orchestrator
-   * from claiming a `pi-agent-*` branch anyway is that it is never told the
+   * from claiming a `pi/<agentId>` branch anyway is that it is never told the
    * capability exists: `isolationParam` (invocation-config.ts) drops the field
    * from both tool schemas, and `isolationGuideline` (index.ts) drops the
    * matching prose from the full and compact descriptions — a custom one opts
@@ -223,6 +223,8 @@ export interface SubagentsSettings {
    * scheduler and the unvalidated cross-extension RPC path.
    */
   worktreeIsolation?: boolean;
+  /** Automatically stage and commit dirty worktrees when agents settle. Defaults to false. */
+  worktreeAutoCommit?: boolean;
   /**
    * Master switch for scripted workflows. Defaults to `true`.
    *
@@ -360,6 +362,7 @@ export interface SettingsAppliers {
   setWidgetMode: (mode: WidgetMode) => void;
   setOutputTranscript: (b: boolean) => void;
   setWorktreeIsolation: (b: boolean) => void;
+  setWorktreeAutoCommit: (b: boolean) => void;
   setWorkflowsEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
@@ -530,6 +533,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.worktreeIsolation === "boolean") {
     out.worktreeIsolation = r.worktreeIsolation;
   }
+  if (typeof r.worktreeAutoCommit === "boolean") {
+    out.worktreeAutoCommit = r.worktreeAutoCommit;
+  }
   if (typeof r.reportUsage === "boolean") {
     out.reportUsage = r.reportUsage;
   }
@@ -635,6 +641,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (s.widgetMode) appliers.setWidgetMode(s.widgetMode);
   if (typeof s.outputTranscript === "boolean") appliers.setOutputTranscript(s.outputTranscript);
   if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation(s.worktreeIsolation);
+  if (typeof s.worktreeAutoCommit === "boolean") appliers.setWorktreeAutoCommit(s.worktreeAutoCommit);
   if (typeof s.reportUsage === "boolean") appliers.setReportUsage(s.reportUsage);
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);

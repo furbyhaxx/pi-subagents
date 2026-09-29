@@ -16,7 +16,7 @@ vi.mock("../src/worktree.js", () => ({
 }));
 
 const scope: WorktreeInfo = {
-  lifecycle: "retained", path: "/worktrees/feature", branch: "feat/x",
+  lifecycle: "retained", named: true, baseRef: "main", path: "/worktrees/feature", branch: "feat/x",
   workPath: "/worktrees/feature/packages/api", sourceRoot: "/repo", commonDir: "/repo/.git",
   baseSha: "abc", reused: true, initialDirty: true,
 };
