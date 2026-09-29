@@ -107,6 +107,18 @@ describe("AgentManager — record GC", () => {
     expect(emit.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0]);
   });
 
+  it.each(["stopped", "error", "aborted"] as const)("keeps an in-memory %s session resumable", async status => {
+    manager = new AgentManager();
+    const { id, record } = await settled(status);
+    record.status = status;
+    record.sessionFile = undefined;
+    record.completedAt = Date.now() - TEN_MINUTES - 1;
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(manager.getRecord(id)).toBe(record);
+  });
+
   it("never evicts a running agent, however old its timestamp looks", async () => {
     // A live agent's session being disposed mid-run is the worst failure this
     // guard prevents, and `completedAt` on a running record is meaningless.
@@ -193,6 +205,20 @@ describe("AgentManager — tombstones outliving the GC", () => {
     expect(resolved?.kind).toBe("tombstone");
     expect(resolved).toMatchObject({
       entry: { handle: "explore", type: "Explore", description: "audit the RPC path", sessionFile: "/sessions/explore.jsonl" },
+    });
+  });
+
+  it.each(["stopped", "error", "aborted"] as const)("keeps a %s session resumable after GC", async status => {
+    manager = new AgentManager();
+    const { id, record } = await evictable("Explore", `${status} result`, `/sessions/${status}.jsonl`);
+    record.status = status;
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(manager.getRecord(id)).toBeUndefined();
+    expect(manager.resolveMention(id)).toMatchObject({
+      kind: "tombstone",
+      entry: { id, sessionFile: `/sessions/${status}.jsonl` },
     });
   });
 
