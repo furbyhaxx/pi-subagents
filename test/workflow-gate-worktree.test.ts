@@ -415,7 +415,7 @@ describe("an isolated child with no gate", () => {
     vi.mocked(runAgent).mockReset();
   });
 
-  it("is untouched: nothing runs, and the detached worktree remains in place", async () => {
+  it("is untouched: nothing runs, and the agent branch worktree remains in place", async () => {
     const { pi, gateRuns } = makePi();
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
@@ -426,9 +426,9 @@ describe("an isolated child with no gate", () => {
     const record = manager.listAgents()[0];
     expect(record.worktreeResult?.hasChanges).toBe(true);
     expect(record.worktreeResult).toMatchObject({
-      path: record.worktree!.path, retained: true,
+      path: record.worktree!.path, branch: record.worktree!.branch, retained: true,
     });
-    expect(record.worktreeResult?.branch).toBeUndefined();
+    expect(record.worktree!.branch).toMatch(/^pi\//);
     expect(existsSync(join(record.worktree!.path, CHILD_FILE))).toBe(true);
     expect(existsSync(record.worktree!.path)).toBe(true);
   });

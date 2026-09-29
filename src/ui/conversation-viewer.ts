@@ -577,7 +577,7 @@ export class ConversationViewer implements Component {
     const task = this.snapshot.task ?? "";
     const spawn: string[] = [];
     if (this.record.worktree) {
-      spawn.push(`worktree ${this.record.worktree.branch}`, `path ${this.record.worktree.path}`, `lifecycle ${this.record.worktree.lifecycle}`);
+      spawn.push(`worktree ${this.record.worktree.branch}`, `path ${this.record.worktree.path}`, `branch type ${this.record.worktree.named ? "caller-selected" : "agent-created"}`);
     } else if (this.record.branch) {
       spawn.push(`branch ${this.record.branch}`);
     }

@@ -7,25 +7,25 @@ import type { WorktreeInfo } from "./worktree.js";
 
 /** Runtime-verified repository scope; kept separate from caller-authored task prose. */
 export function buildWorktreeScope(worktree: WorktreeInfo, cwd: string): string {
-  const retained = worktree.lifecycle === "retained";
   return `<worktree_scope>
 Repository: ${worktree.sourceRoot}
 Worktree root: ${worktree.path}
 Working directory: ${cwd}
-${retained ? `Checked-out branch: ${worktree.branch}` : "Checkout: detached HEAD"}
+Checked-out branch: ${worktree.branch}
+Branch kind: ${worktree.named ? "caller-selected" : "agent-created"}
+Base ref: ${worktree.baseRef}
 Workspace: ${worktree.reused ? "reused" : "created"}; retained after this run
 Initial state at acquisition: ${worktree.initialDirty ? "existing uncommitted changes are present" : "clean"}
 
 Perform repository work in this worktree, not the originating checkout.
 Map repository paths from the task or inherited context to their equivalents here.
 Older cwd/branch statements describe the parent, not this run. Other project rules still apply.
-Do not switch branches or create/remove worktrees to set up this task.
 Preserve pre-existing changes; do not reset, stash or clean them away.
-${retained
-    ? "This named-branch worktree is a reusable workspace. No automatic commit, merge, reset, stash, clean or removal occurs. Follow the task's explicit commit policy."
-    : "No automatic commit, branch creation, merge, reset, stash, clean or removal occurs. The orchestrating agent must review this worktree and explicitly either integrate its changes and then remove it, or discard and remove it."}
+Commit work in logical conventional commits on this branch before finishing unless the task says not to.
+You may run \`git rebase ${worktree.baseRef}\` if the base ref has moved.
+Do not push, merge, switch to or create other branches, or create/remove worktrees.
 Explicitly configured memory and artifact destinations keep their existing semantics.
-Report the worktree path, worktree-relative changes, validation results and remaining work.
+Final report states the branch, HEAD SHA, commit list, dirty state, worktree-relative changes, validation results and remaining work.
 </worktree_scope>`;
 }
 

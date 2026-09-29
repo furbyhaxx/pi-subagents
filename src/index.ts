@@ -90,7 +90,7 @@ import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
-import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
+import { isWorktreeAutoCommitEnabled, isWorktreeIsolationEnabled, setWorktreeAutoCommitEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
@@ -285,7 +285,7 @@ export function renderRunningAgentStatus(
 function formatWorkspace(record: Pick<AgentRecord, "worktree" | "branch" | "effectiveCwd"> | undefined): string {
   const scope = record?.worktree;
   if (!scope) return record?.branch ? `Requested branch: ${record.branch} (workspace pending)\n` : "";
-  return `Workspace: ${scope.path}\nBranch: ${scope.branch}\nWorking directory: ${record?.effectiveCwd ?? scope.workPath}\nLifecycle: ${scope.lifecycle}; ${scope.reused ? "reused" : "created"}${scope.lifecycle === "retained" ? "; changes remain in the worktree" : ""}\n`;
+  return `Workspace: ${scope.path}\nBranch: ${scope.branch}\nWorking directory: ${record?.effectiveCwd ?? scope.workPath}\nWorkspace type: ${scope.named ? "caller-selected" : "agent-created"} branch; ${scope.reused ? "reused" : "created"}; changes remain in the worktree\n`;
 }
 
 /** Format an agent's lifetime token total, or "" when zero. */
@@ -1944,6 +1944,7 @@ export default function (pi: ExtensionAPI) {
       setSessionArtifactDirectory,
       setWorktreeDirectory,
       setWorktreeIsolation: setWorktreeIsolationEnabled,
+      setWorktreeAutoCommit: setWorktreeAutoCommitEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
@@ -4161,6 +4162,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       sessionArtifactDirectory: getSessionArtifactDirectory(),
       worktreeDirectory: getWorktreeDirectory(),
       worktreeIsolation: isWorktreeIsolationEnabled(),
+      worktreeAutoCommit: isWorktreeAutoCommitEnabled(),
       // The user's answer, not the effective one. A stand-down for another
       // extension's workflow tool is scoped to the session it was detected in;
       // writing it here would let an unrelated settings change three menus away
@@ -4364,6 +4366,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description:
             "Allow isolation: worktree to copy the repo. Off refuses worktrees on every path immediately — for repos where a copy costs too much time or disk — and drops the `isolation` param from the Agent tool spec on next pi session.",
           currentValue: isWorktreeIsolationEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "worktreeAutoCommit",
+          label: "Worktree auto-commit",
+          description: "Stage and commit dirty worktrees when agents settle. Commits stay local; nothing is pushed. Off by default.",
+          currentValue: isWorktreeAutoCommitEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -4583,6 +4592,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
           ctx,
           `Worktree isolation ${enabled ? "enabled" : "disabled"}. Tool parameter updates on next pi session.`,
         );
+      } else if (id === "worktreeAutoCommit") {
+        const enabled = value === "on";
+        setWorktreeAutoCommitEnabled(enabled);
+        notifyApplied(ctx, `Worktree auto-commit ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
         notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);

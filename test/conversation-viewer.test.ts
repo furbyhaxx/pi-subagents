@@ -147,6 +147,26 @@ describe("ConversationViewer invocation line", () => {
   });
 });
 
+describe("ConversationViewer worktree label", () => {
+  it("identifies an agent-created branch in spawn details", () => {
+    const record = mockRecord({
+      taskPrompt: "implement parser",
+      worktree: {
+        path: "/worktrees/pi-agent-1", workPath: "/worktrees/pi-agent-1", branch: "pi/agent-1",
+        baseSha: "abc123", baseRef: "main", named: false, lifecycle: "retained",
+        sourceRoot: "/repo", commonDir: "/repo/.git", reused: false, initialDirty: false,
+      },
+    });
+    const viewer = new ConversationViewer(
+      mockTui(30, 200), mockSession([]), record, undefined, ansiTheme(), vi.fn(),
+    );
+
+    viewer.handleInput("t");
+
+    expect(viewer.render(200).join("\n")).toContain("branch type agent-created");
+  });
+});
+
 describe("ConversationViewer cost display", () => {
   /** The header line, with a cost of `cost` on the record and showCost `on`. */
   function header(on: boolean, cost: number): string {

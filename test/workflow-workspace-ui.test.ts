@@ -5,7 +5,7 @@ import type { WorkflowAgentEntry } from "../src/workflow/progress.js";
 const entry: WorkflowAgentEntry = {
   type: "workflow_agent", index: 0, label: "implement", state: "done", branch: "feat/x", cwd: "/worktrees/x/api",
   workspace: {
-    path: "/worktrees/x", workPath: "/worktrees/x/api", branch: "feat/x", baseSha: "abc",
+    path: "/worktrees/x", workPath: "/worktrees/x/api", branch: "feat/x", baseSha: "abc", baseRef: "main", named: true,
     lifecycle: "retained", sourceRoot: "/repo", commonDir: "/repo/.git", reused: true, initialDirty: true,
   },
 };

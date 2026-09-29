@@ -201,6 +201,15 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
+  it("round-trips worktreeAutoCommit; drops non-boolean", () => {
+    saveSettings({ worktreeAutoCommit: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ worktreeAutoCommit: false });
+    saveSettings({ worktreeAutoCommit: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ worktreeAutoCommit: true });
+    writeProject({ worktreeAutoCommit: "on" });
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("round-trips reportUsage and showCost; drops non-boolean", () => {
     saveSettings({ reportUsage: true, showCost: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ reportUsage: true, showCost: true });
@@ -560,6 +569,7 @@ describe("settings persistence", () => {
         setViewerMarkdown: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
+        setWorktreeAutoCommit: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
         setReportUsage: vi.fn(),
@@ -739,6 +749,13 @@ describe("settings persistence", () => {
       expect(appliers.setWorktreeIsolation).toHaveBeenCalledWith(true);
     });
 
+    it("applies worktreeAutoCommit (both true and false)", () => {
+      applySettings({ worktreeAutoCommit: true }, appliers);
+      expect(appliers.setWorktreeAutoCommit).toHaveBeenCalledWith(true);
+      applySettings({ worktreeAutoCommit: false }, appliers);
+      expect(appliers.setWorktreeAutoCommit).toHaveBeenCalledWith(false);
+    });
+
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
       applySettings({ defaultMaxTurns: 0 }, appliers);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
@@ -821,6 +838,7 @@ describe("settings persistence", () => {
         setViewerMarkdown: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
+        setWorktreeAutoCommit: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
         setFallbackSubagent: vi.fn(),
         setReportUsage: vi.fn(),

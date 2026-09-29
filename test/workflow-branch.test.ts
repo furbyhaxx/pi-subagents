@@ -12,6 +12,8 @@ const workspace: WorktreeInfo = {
   commonDir: "/repo/.git",
   branch: "feat/x",
   baseSha: "abc123",
+  baseRef: "main",
+  named: true,
   lifecycle: "retained",
   reused: true,
   initialDirty: true,

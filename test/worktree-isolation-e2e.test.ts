@@ -9,7 +9,7 @@
  * agent-startup-error) mock ../src/worktree.js entirely and assert only the gate
  * and the fail-loud throw. So the chain the feature actually promises was never
  * pinned end to end: spawn → the child's cwd IS the copy → its edits stay out of
- * the main checkout → settlement retains the detached copy and reports its path.
+ * the main checkout → settlement retains its agent branch and reports its path.
  * Every link was tested; the chain was not.
  *
  * Deliberately faux, not live: a live model may decline to spawn at all, which
@@ -126,7 +126,7 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     }
   });
 
-  it("runs the child in a retained detached copy, not the main checkout", async () => {
+  it("runs the child in a retained agent branch, not the main checkout", async () => {
     const repo = initGitRepo();
     repos.push(repo);
 
@@ -143,13 +143,17 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
 
     const result = agentResultText(run.parentSession);
     expect(result).toContain(CHILD_MARKER);
+    expect(result).toContain("Workspace type: agent-created branch");
 
-    const worktree = /Workspace retained at `([^`]+)` on its detached HEAD/.exec(result)?.[1];
+    const workspace = /Workspace retained on branch `([^`]+)` at `([^`]+)`/.exec(result);
+    const branch = workspace?.[1];
+    const worktree = workspace?.[2];
+    expect(branch).toMatch(/^pi\//);
     expect(worktree).toBeTruthy();
-    expect(result).toContain("No automatic commit, branch, or removal performed.");
 
     expect(existsSync(join(worktree!, MARKER_FILE))).toBe(true);
-    expect(git(worktree!, "rev-parse", "--symbolic-full-name", "HEAD")).toBe("HEAD");
+    expect(git(worktree!, "rev-parse", "--symbolic-full-name", "HEAD")).toBe(`refs/heads/${branch}`);
+    expect(git(repo, "for-each-ref", "--format=%(refname)", `refs/heads/${branch}`)).toBe(`refs/heads/${branch}`);
     expect(git(repo, "branch", "--list", "pi-agent-*")).toBe("");
     expect(git(repo, "worktree", "list").split("\n")).toHaveLength(2);
   });
