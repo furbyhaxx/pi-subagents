@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Trusted lifecycle extensions bind under any capability policy.** `pi-blackhole` owns session compaction and the observational-memory ledger, so it now loads for every subagent — including `isolated: true` and `extensions: false` children and children whose `extensions:` allowlist never names it. The binding resolves the parent's own entry path from its tool registry (absolute, non-builtin), which `additionalExtensionPaths` accepts even with discovery off, mirroring the background-jobs exception. A host that has not loaded it binds nothing and warns about nothing: absence is not distinguishable from a host that has no use for it, and the existing "requested but was not loaded" warning still fires for an agent that names it explicitly under `extensions:`. Binding grants session handlers and no tools — `lifecycleOnlyPaths` keeps these extensions out of the child's active tool set in every loader mode. `exclude_extensions: pi-blackhole` is the opt-out, and stays effective under `isolated: true`, where other excludes remain silent as before.
+
 ## [0.20.0] - 2026-09-30
 
 > **⚠️ Breaking: worktrees without a caller-selected branch now use `pi/<agentId>` instead of detached HEAD.** Orchestrators and scripts that expect detached HEAD or an empty `git branch --show-current` must adapt. Unchecked-out legacy `pi-agent-*` branches are untouched and listed in `/agents → Worktrees`.

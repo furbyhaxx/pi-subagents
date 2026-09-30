@@ -63,6 +63,15 @@ export const SUBAGENT_TOOL_NAMES = {
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
 
 /**
+ * Trusted lifecycle extensions that bind even when an agent's capability policy
+ * disables or narrows extensions. They own session events — compaction, the
+ * observational-memory ledger — so a child that silently dropped one would lose
+ * that machinery mid-run. Binding grants handlers and nothing else: the tool gate
+ * keeps their tools out of every scope. `exclude_extensions:` is the opt-out.
+ */
+const REQUIRED_LIFECYCLE_EXTENSION_NAMES = new Set(["pi-blackhole"]);
+
+/**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
  * Lowercased — extension names match case-insensitively so `extensions: [Mcp]`
  * resolves the same as `[mcp]`. Tool names within `ext:foo/bar` are not affected.
@@ -252,6 +261,11 @@ export function installExtensionToolScope(
     extNames: Set<string>;
     narrowing: Map<string, Set<string>>;
     /**
+     * Extension paths bound only as required lifecycle infrastructure. They carry
+     * session handlers but contribute no tools, so they must not widen the scope.
+     */
+    lifecycleOnlyPaths: ReadonlySet<string>;
+    /**
      * Injected `customTools` to keep active regardless of the built-in list.
      *
      * Injected tools do not come from the built-in or extension registries, so
@@ -260,7 +274,7 @@ export function installExtensionToolScope(
     readmitToolNames: Set<string>;
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, lifecycleOnlyPaths } = ctx;
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -271,6 +285,8 @@ export function installExtensionToolScope(
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
       const canons = extensionCanonicalNames(extension.path);
+      // A lifecycle-only binding is never a capability: its tools stay out.
+      if (lifecycleOnlyPaths.has(extension.path)) continue;
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.
@@ -743,11 +759,16 @@ export async function runAgent(
   if (options.worktree) extras.worktree = options.worktree;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
-  // Resolve extensions/skills: isolated overrides to false
+  // Resolve extensions/skills: isolated disables extension capabilities, but
+  // required trusted lifecycle extensions still bind unless explicitly excluded.
   const extensions = options.isolated ? false : config.extensions;
-  // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
-  // isolation is an intentional override, not a misconfiguration.
-  const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
+  const configuredExcludeExtensions = config.excludeExtensions;
+  // Under isolation, non-required excludes are redundant and stay silent — an
+  // intentional capability override, not a misconfiguration. An explicit
+  // required-extension exclusion is the deliberate infrastructure opt-out.
+  const excludeExtensions = options.isolated
+    ? configuredExcludeExtensions?.filter((name) => REQUIRED_LIFECYCLE_EXTENSION_NAMES.has(name.toLowerCase()))
+    : configuredExcludeExtensions;
   const skills = options.isolated ? false : config.skills;
 
   // Skill preloading: when skills is string[], preload their content into prompt
@@ -819,7 +840,9 @@ export async function runAgent(
   const { extNames, narrowing } = parseExtSelectors(
     options.isolated ? [] : (agentConfig?.extSelectors ?? []),
   );
-  const noExtensions = extensions === false;
+  // Extension capabilities can be off while a required lifecycle extension still
+  // binds, so this is settled later — see the required-lifecycle block below.
+  let noExtensions = extensions === false;
 
   const extensionsSpec = Array.isArray(extensions)
     ? parseExtensionsSpec(extensions, configCwd)
@@ -918,6 +941,50 @@ export async function runAgent(
       });
     }
   }
+  // ─── Required lifecycle extensions ───────────────────────────────────────
+  //
+  // pi-blackhole is trusted session infrastructure, not a capability provider:
+  // it owns compaction and the observational-memory ledger, so a child that
+  // silently dropped it would fall back to a native LLM summary the ledger
+  // cannot survive — precisely when a long child session needs it most.
+  //
+  // It binds across every capability mode (`isolated: true`, `extensions: false`,
+  // a restrictive allowlist) by loading the parent's own entry path, which
+  // `additionalExtensionPaths` accepts even under `noExtensions` — the same route
+  // the bash family uses. The path is proven from the parent's tool registry
+  // rather than guessed.
+  //
+  // A host that does not load it is simply a host without it, which is not
+  // distinguishable from a host that has no use for it, so absence stays silent —
+  // exactly as the bash family treats a missing family. The existing
+  // "requested but was not loaded" warning still fails visibly for an agent that
+  // names it explicitly under `extensions:` and does not get it.
+  //
+  // Binding grants handlers and nothing more: `lifecycleOnlyPaths` keeps these
+  // extensions out of the tool scope below, and `noExtensions` stays true so the
+  // static allowlist remains the boundary for a capability-disabled child.
+  const requiredLifecycleNames = new Set(
+    [...REQUIRED_LIFECYCLE_EXTENSION_NAMES].filter((name) => !excludeNames.has(name)),
+  );
+  /** Extension paths bound only as required lifecycle infrastructure. */
+  const lifecycleOnlyPaths = new Set<string>();
+  for (const tool of parentTools ?? []) {
+    if (requiredLifecycleNames.size === 0) break;
+    const path = tool.sourceInfo?.path;
+    if (!path || tool.sourceInfo?.source === "builtin" || !isAbsolute(path)) continue;
+    const canonical = extensionCanonicalName(path);
+    if (!requiredLifecycleNames.has(canonical)) continue;
+    lifecycleOnlyPaths.add(path);
+    // Only the allowlist/capability path needs the include-set entry: that is the
+    // only mode where `extensionsOverride` is installed and could filter this
+    // freshly path-loaded extension back out. Under `noExtensions` no override
+    // runs, and naming it here would arm the "was not loaded" warning below
+    // against an extension the child actually loaded.
+    if (!noExtensions) keepNames.add(canonical);
+    if (!additionalExtensionPaths.includes(path)) additionalExtensionPaths.push(path);
+    requiredLifecycleNames.delete(canonical);
+  }
+
   const hasExcludes = excludeNames.size > 0;
   // Pre-filter discovered set, captured by the override — the exclude-typo warning
   // must compare against this, not the surviving set (absence from survivors is
@@ -1253,6 +1320,7 @@ export async function runAgent(
       extNames,
       narrowing,
       readmitToolNames,
+      lifecycleOnlyPaths,
     });
   }
 

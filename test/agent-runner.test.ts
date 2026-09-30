@@ -2357,6 +2357,166 @@ describe("agent-runner bash family propagation", () => {
   });
 });
 
+// pi-blackhole owns compaction and the observational-memory ledger, so a child
+// that silently dropped it would lose that machinery mid-run. It binds as trusted
+// lifecycle infrastructure even when an agent's capability policy disables or
+// narrows extensions — the same exact-path route the bash family uses — while
+// its tools stay out of every scope, and `exclude_extensions:` is the opt-out.
+describe("agent-runner required lifecycle extensions", () => {
+  const BLACKHOLE_PATH = "/ext/pi-blackhole/index.ts";
+  const BLACKHOLE_TOOLS = ["recall"];
+
+  function piWithBlackhole(tools?: any[]): any {
+    const registry = tools ?? [
+      { name: "recall", sourceInfo: { path: BLACKHOLE_PATH, source: "extension" } },
+    ];
+    return { getAllTools: () => registry };
+  }
+  function setupLifecycleAgent(overrides: Record<string, unknown>) {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig(overrides));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig(overrides));
+  }
+  function extensionErrors(onToolActivity: ReturnType<typeof vi.fn>): string[] {
+    return onToolActivity.mock.calls
+      .map((c) => c[0]?.toolName)
+      .filter((n): n is string => typeof n === "string" && n.startsWith("extension-error:"));
+  }
+
+  it("binds under extensions: false without granting its tools", async () => {
+    // `extensions: false` discovers nothing, so only the explicit path reaches
+    // the child — the binding, not the capability, is what is being added.
+    setupLifecycleAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithBlackhole(), onToolActivity });
+
+    const opts = lastLoaderOpts();
+    expect(opts.noExtensions).toBe(true);
+    expect(opts.additionalExtensionPaths).toEqual([BLACKHOLE_PATH]);
+    // Handler binding only: `recall` must not reach an isolated child.
+    expect(lastToolsPassed()).toEqual(["read"]);
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("binds under a restrictive allowlist that never names it", async () => {
+    // Registered as loaded, not merely path-requested: the override keeps it
+    // because the binding added it to the include set, so the tool-scope guard is
+    // actually reached. Without that guard its `recall` tool is admitted by the
+    // live `inScope()` pass.
+    setupLifecycleAgent({ extensions: ["/ext/pi-searxng/index.ts"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({
+      "/ext/pi-searxng/index.ts": ["web_search"],
+      [BLACKHOLE_PATH]: BLACKHOLE_TOOLS,
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithBlackhole() });
+
+    // The allowlisted path leads (it seeds the list), the lifecycle binding appends.
+    expect(lastLoaderOpts().additionalExtensionPaths).toEqual([
+      "/ext/pi-searxng/index.ts",
+      BLACKHOLE_PATH,
+    ]);
+    // It survived the override...
+    expect(loaderExtensionsRef.current.extensions.map((e) => e.path)).toContain(BLACKHOLE_PATH);
+    // ...but the allowlisted extension keeps its tools and the lifecycle binding
+    // grants none, so `recall` never enters the active set.
+    expect(lastToolsPassed()).toContain("web_search");
+    expect(lastToolsPassed()).not.toContain("recall");
+  });
+
+  it("isolated: true binds it too, with capabilities still off", async () => {
+    setupLifecycleAgent({ extensions: true, excludeExtensions: undefined });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithBlackhole(), isolated: true });
+
+    const opts = lastLoaderOpts();
+    expect(opts.noExtensions).toBe(true);
+    expect(opts.additionalExtensionPaths).toEqual([BLACKHOLE_PATH]);
+    expect(lastToolsPassed()).toEqual(["read"]);
+  });
+
+  it("exclude_extensions: pi-blackhole is the deliberate opt-out", async () => {
+    setupLifecycleAgent({ extensions: true, excludeExtensions: ["pi-blackhole"] });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ [BLACKHOLE_PATH]: BLACKHOLE_TOOLS });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi: piWithBlackhole(), onToolActivity });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+    expect(lastToolsPassed()).not.toContain("recall");
+    // Excluding the extension the agent also named is a deliberate conflict, not
+    // a typo, and is reported as one rather than as "did not match".
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("a host without pi-blackhole binds nothing and warns about nothing", async () => {
+    // Absence is not an error: a host that does not load pi-blackhole is not
+    // distinguishable from one that has no use for it.
+    setupLifecycleAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi: { getAllTools: () => [] }, onToolActivity });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+    expect(lastToolsPassed()).toEqual(["read"]);
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("does not bind a builtin-sourced path claiming the name", async () => {
+    // The path is provenance-proven, not taken on the name: a builtin has no
+    // entry file the loader could load, so it must not be handed one.
+    setupLifecycleAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi: {
+        getAllTools: () => [
+          { name: "recall", sourceInfo: { path: BLACKHOLE_PATH, source: "builtin" } },
+        ],
+      },
+    });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+  });
+
+  it("does not bind a relative path claiming the name", async () => {
+    // `additionalExtensionPaths` is resolved by the host, so only an absolute
+    // entry path is loadable. A relative one is not silently accepted and then
+    // failed somewhere deeper.
+    setupLifecycleAgent({ extensions: false });
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi: {
+        getAllTools: () => [
+          { name: "recall", sourceInfo: { path: "./pi-blackhole/index.ts", source: "extension" } },
+        ],
+      },
+    });
+
+    expect(lastLoaderOpts().additionalExtensionPaths).toBeUndefined();
+  });
+});
+
 // ─── exclude_extensions: denylist (#94) ──────────────────────────────────
 describe("agent-runner exclude_extensions", () => {
   function setupAgent(overrides: Record<string, unknown>) {
