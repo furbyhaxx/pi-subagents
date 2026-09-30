@@ -1,6 +1,6 @@
 ---
 name: authoring-subagents
-description: Design, write, tune and evaluate pi-subagents agent types — .pi/agents/*.md frontmatter, system prompt bodies, tool and extension scoping, model and thinking-level selection across Anthropic/OpenAI/Google/DeepSeek/Z.ai/xAI/Moonshot/MiniMax, memory, preloaded skills, and the subagents.json settings that shape them. Use this whenever someone creates, edits, ejects, debugs or optimizes a subagent or agent type, asks which model or thinking level an agent should run on, writes or rewrites an agent system prompt, or wonders why an agent has the wrong tools, model, context or behavior — including casual asks like "make me an agent that reviews migrations" or "why is Explore so slow".
+description: Design, write, tune and evaluate pi-subagents agent types — .pi/agents/*.md frontmatter, system prompt bodies, tool and extension scoping, model and thinking-level selection across Anthropic/OpenAI/Google/DeepSeek/Z.ai/xAI/Moonshot/MiniMax, memory, preloaded skills, and the subagents.yaml settings that shape them. Use this whenever someone creates, edits, ejects, debugs or optimizes a subagent or agent type, asks which model or thinking level an agent should run on, writes or rewrites an agent system prompt, or wonders why an agent has the wrong tools, model, context or behavior — including casual asks like "make me an agent that reviews migrations" or "why is Explore so slow".
 ---
 
 # Authoring subagents
