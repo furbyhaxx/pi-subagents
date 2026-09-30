@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-30
+
 > **⚠️ Breaking: worktrees without a caller-selected branch now use `pi/<agentId>` instead of detached HEAD.** Orchestrators and scripts that expect detached HEAD or an empty `git branch --show-current` must adapt. Unchecked-out legacy `pi-agent-*` branches are untouched and listed in `/agents → Worktrees`.
 
 > **⚠️ Breaking: agent-file model selection is now canonical and explicit call models win.** Existing fuzzy `model:` pins must be changed to exact `provider/modelId` values; a caller-supplied `model` now replaces configured frontmatter rather than being ignored.
