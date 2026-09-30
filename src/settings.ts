@@ -662,9 +662,33 @@ function readLegacyJson(path: string): SubagentsSettings {
   }
 }
 
-/** Load merged settings: the user layer provides defaults, project overrides. */
+/**
+ * Settings merged key by key across the layers rather than overridden whole.
+ *
+ * `messaging` only. Its keys are independent — a project that sets `surface`
+ * has no opinion about `maxHops` — and the patch write can leave a layer
+ * holding just one of them, so a shallow spread would drop the rest.
+ *
+ * `worktreeDirectory` is deliberately absent: `mode` and `path` describe one
+ * placement, not two settings. A project `{ mode: project }` merged with a user
+ * `{ mode: custom, path: trees }` would read as a custom placement rooted at
+ * `trees` — a path that is never used because the mode says otherwise, and that
+ * the user never asked for.
+ */
+const MERGED_NESTED_KEYS = ["messaging"] as const;
+
+/**
+ * Load merged settings: the user layer provides defaults, project overrides.
+ */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsLayer("user", cwd), ...readSettingsLayer("project", cwd) };
+  const user = readSettingsLayer("user", cwd);
+  const project = readSettingsLayer("project", cwd);
+  const merged: SubagentsSettings = { ...user, ...project };
+  for (const key of MERGED_NESTED_KEYS) {
+    if (!isRecord(user[key]) || !isRecord(project[key])) continue;
+    merged[key] = { ...user[key], ...project[key] } as never;
+  }
+  return merged;
 }
 
 /** Read a single layer, without the other one merged over it. */

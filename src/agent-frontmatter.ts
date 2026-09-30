@@ -239,11 +239,19 @@ function nodeValue(field: AgentFieldSpec, value: AgentFieldValue): unknown {
     case "inherit": {
       // A bare CSV scalar, not a YAML sequence: these are documented as comma
       // separated, and the loader stringifies whatever it finds.
-      if (Array.isArray(value)) return value.length === 0 && field.kind === "tools" ? "none" : value.join(", ");
+      if (Array.isArray(value)) {
+        if (value.length > 0) return value.join(", ");
+        // `tools: none` is the one empty list that means something; for the
+        // rest, an empty list is indistinguishable from an absent key.
+        return field.kind === "tools" ? "none" : undefined;
+      }
       return value;
     }
     case "subagents":
-      return Array.isArray(value) ? value.join(", ") : value;
+      // An empty list and an absent key mean the same thing here, so an empty
+      // one deletes the key rather than writing `key: ""`.
+      if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : undefined;
+      return value;
     case "models":
       return Array.isArray(value) && value.length > 0 ? value : undefined;
     default:
@@ -276,7 +284,11 @@ export function applyAgentFields(content: string, values: AgentFieldValues, body
   const rendered = doc.toString({ lineWidth: 0 });
   const open = block ? block.lines[0] : `---${eol}`;
   const fence = `---${eol}`;
-  return `${open}${rendered}${fence}\n${body.trim()}\n`;
+  // `toString` always emits LF. A file the author kept on CRLF would come back
+  // with CRLF fences around an LF block — a mixed-ending file that trips every
+  // later diff — so the rendered block is put back on the file's own endings.
+  const eolEnding = eol === "\r\n" && rendered.includes("\n") ? rendered.replace(/\n/g, "\r\n") : rendered;
+  return `${open}${eolEnding}${fence}${eol}${body.trim()}${eol}`;
 }
 
 /**

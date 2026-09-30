@@ -203,7 +203,16 @@ function createEditorView(
 
   const rowChanged = (key: string) =>
     key === PROMPT_ROW ? state.body !== baseline.body : state.values[key] !== baseline.values[key];
-  const dirtyCount = () => rows.filter(rowChanged).length;
+  const touchedCount = () => rows.filter(rowChanged).length;
+  /**
+   * Whether a save would change the file — the same question `Esc` asks.
+   *
+   * Not the row count: a file that a save would rewrite without the user
+   * touching anything (a singular `model:`, a missing blank line) is dirty by
+   * this measure and clean by the row count, and the two answers have to
+   * agree or the footer promises a quiet exit that then asks to save.
+   */
+  const isDirty = () => applyAgentFields(options.original, state.values, state.body) !== options.original;
 
   /** Set a field. `undefined` is a real value here: it means "key absent". */
   const setValue = (key: string, value: AgentFieldValue) => {
@@ -438,7 +447,11 @@ function createEditorView(
 
   return {
     render(width: number): string[] {
-      const pending = dirtyCount();
+      const dirty = isDirty();
+      const pending = dirty ? touchedCount() : 0;
+      const status = pending === 0
+        ? dirty ? "unsaved changes" : "no changes"
+        : `${pending} unsaved change${pending === 1 ? "" : "s"}`;
       const selectedKey = rows[state.selected];
       const lines: string[] = [header, theme.value(`→ ${options.pathFor(state.scope)}`, false), ""];
       for (let index = 0; index < rows.length; index++) {
@@ -447,10 +460,7 @@ function createEditorView(
       lines.push(
         "",
         theme.description(hintFor(selectedKey)),
-        theme.hint(
-          `${pending === 0 ? "no changes" : `${pending} unsaved change${pending === 1 ? "" : "s"}`}`
-          + "   Ctrl+S save · Tab switch scope · Enter edit · Esc back",
-        ),
+        theme.hint(`${status}   Ctrl+S save · Tab switch scope · Enter edit · Esc back`),
       );
       if (control) lines.push("", ...control.render(width));
       return lines;

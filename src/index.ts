@@ -4092,7 +4092,15 @@ Terse command-style prompts produce shallow, generic work.
       original,
       originalPath: file?.path,
       initialScope,
-      pathFor: (scope: AgentScope) => join(scope === "user" ? personalAgentsDir() : projectAgentsDir(), `${name}.md`),
+      // The scope the file came from keeps its real path. Building it from the
+      // agent TYPE would write a second file for any agent whose `name:`
+      // differs from its filename (`reviewer.md` declaring `code-reviewer`),
+      // leaving the original in place and silently changing which one loads —
+      // the same trap `locateAgentFile` exists to avoid.
+      pathFor: (scope: AgentScope) =>
+        file && scope === initialScope
+          ? file.path
+          : join(scope === "user" ? personalAgentsDir() : projectAgentsDir(), `${name}.md`),
       models: registryModels(ctx),
     });
     if (result.action !== "save") return;
@@ -4701,6 +4709,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
     /** Rows whose value is typed or chosen in a dialog rather than cycled in place. */
     const TYPED_ROW_IDS = new Set([...NUMERIC_IDS, "sessionArtifactDirectory", "worktreeDirectory", "promptEditor"]);
 
+    /**
+     * Per-row label and accepted range.
+     *
+     * The range is not cosmetic: `applyValue` and `sanitize` both reject an
+     * out-of-range number, so staging one the row would refuse produces a save
+     * that silently drops the value and a toast reading "0 settings updated".
+     * Validating here means the prompt re-asks instead.
+     */
     const NUMERIC_LABELS: Record<string, string> = {
       maxConcurrent: "Max concurrency (1+)",
       maxConcurrentForeground: "Max foreground concurrency (0 = unlimited)",
@@ -4711,14 +4727,26 @@ Write the file using the write tool. Only write the file, nothing else.`;
       graceTurns: "Grace turns (1+)",
       maxSubagentDepth: "Nested depth (0/1 = nesting off)",
     };
+    const NUMERIC_RANGES: Record<string, { min: number; max: number }> = {
+      maxConcurrent: { min: 1, max: 1024 },
+      maxConcurrentForeground: { min: 0, max: 1024 },
+      stallThresholdMinutes: { min: 0, max: Number.MAX_SAFE_INTEGER },
+      defaultMaxTurns: { min: 0, max: 10_000 },
+      maxRetries: { min: 0, max: 100 },
+      maxModelWraparounds: { min: 0, max: 100 },
+      graceTurns: { min: 1, max: 1_000 },
+      maxSubagentDepth: { min: 0, max: 16 },
+    };
 
-    /** Prompt for a numeric row, re-asking until the value parses. Esc cancels. */
+    /** Prompt for a numeric row, re-asking until the value parses and is in range. Esc cancels. */
     async function promptNumeric(ctx: ExtensionCommandContext, id: string): Promise<string | undefined> {
       const label = NUMERIC_LABELS[id];
+      const range = NUMERIC_RANGES[id];
       let input = await ctx.ui.input(label, displayed(id, rawItems().find(item => item.id === id)?.currentValue ?? ""));
       while (input != null) {
         const trimmed = input.trim();
-        if (trimmed !== "" && Number.isInteger(Number(trimmed))) return trimmed;
+        const parsed = Number(trimmed);
+        if (trimmed !== "" && Number.isInteger(parsed) && parsed >= range.min && parsed <= range.max) return trimmed;
         // Invalid — re-prompt with the user's last entry so they can edit it.
         input = await ctx.ui.input(label, trimmed);
       }
