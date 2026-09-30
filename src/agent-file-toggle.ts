@@ -111,7 +111,7 @@ const FENCE = /^---[ \t]*$/;
  * endings instead of rewriting CRLF to LF. Returns undefined when there is no
  * usable block.
  */
-function splitFrontmatter(content: string):
+export function splitFrontmatter(content: string):
   | { lines: string[]; openIdx: number; closeIdx: number; eol: string }
   | undefined {
   const lines = content.split(/(?<=\n)/);

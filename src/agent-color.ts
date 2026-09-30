@@ -37,6 +37,9 @@ const NAMED_AGENT_COLORS: Readonly<Record<string, string>> = {
   navy: "#1E3A8A",
 };
 
+/** Accepted spellings for the `color:` frontmatter field, for the editor's chooser. */
+export const AGENT_COLOR_NAMES: readonly string[] = Object.keys(NAMED_AGENT_COLORS);
+
 const CUBE_VALUES = [0, 95, 135, 175, 215, 255];
 const GRAY_VALUES = Array.from({ length: 24 }, (_, i) => 8 + i * 10);
 const BLACK = { r: 0, g: 0, b: 0 };
