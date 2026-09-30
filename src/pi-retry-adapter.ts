@@ -63,6 +63,58 @@ function terminalFailureRemains(session: AgentSession, failure: AssistantFailure
   return messages[messages.length - 1] === failure;
 }
 
+/**
+ * A provider refuses a request for two reasons that look alike in the transcript
+ * but need opposite handling. A request-level failure (bad schema, malformed
+ * tool call) fails on every candidate, so the walk must stop. An account-level
+ * refusal (out of credits, quota or billing exhaustion, a 402/403 entitlement
+ * answer) is scoped to the provider and its account, so the next candidate may
+ * still serve the request — which is the entire reason an ordered candidate list
+ * exists.
+ *
+ * Pi classifies both as non-retryable, correctly: retrying the same candidate
+ * cannot help. So the adapter cannot lean on `_isRetryableError` alone and has to
+ * recognise the account-scoped case itself. Patterns name the account or its
+ * balance, never the request, so a malformed-request 400 still stops the walk.
+ */
+const PROVIDER_ACCOUNT_REFUSAL_PATTERN = new RegExp([
+  // Provider limit codes that are already known to be account-scoped.
+  "GoUsageLimitError",
+  "FreeUsageLimitError",
+  "insufficient_quota",
+  "out of budget",
+  "quota exceeded",
+  "billing",
+  "available balance",
+  "monthly usage limit",
+  // Payment and entitlement wording, including the status code some providers
+  // expose only in the message body (e.g. xAI's 403 credit refusal). The code is
+  // anchored to a status/error word or a payment phrase so an unrelated number
+  // ("exceeded by 403 tokens") cannot trigger a walk.
+  "(?:http|status|error|api)\\D{0,20}\\b40[23]\\b",
+  "\\b40[23]\\b\\s*(?:forbidden|payment required|unauthorized|permission)",
+  "payment required",
+  "spending limit",
+  "out of credits?",
+  "run out of credits?",
+  "no credits",
+  "insufficient (?:credits?|funds|balance)",
+  "credit (?:balance|limit)",
+  "subscription",
+].join("|"), "i");
+
+/**
+ * True when a failed assistant turn was refused for account-scoped reasons
+ * rather than because the request itself was bad. See the pattern above.
+ */
+export function isProviderAccountRefusal(
+  message: { stopReason?: string; errorMessage?: string } | undefined,
+): boolean {
+  return message?.stopReason === "error"
+    && typeof message.errorMessage === "string"
+    && PROVIDER_ACCOUNT_REFUSAL_PATTERN.test(message.errorMessage);
+}
+
 async function switchModel(
   session: AgentSession,
   privateSession: PrivateAgentSession,
@@ -148,9 +200,14 @@ function installAdapter(session: AgentSession): InstalledAdapter {
   privateSession._handlePostAgentRun = async () => {
     const failure = privateSession._lastAssistantMessage;
     const retryable = failure !== undefined && privateSession._isRetryableError(failure);
+    // A provider that refuses the account (no credits, quota, 402/403) is not
+    // retryable and never will be on this candidate, but the next candidate is
+    // exactly what the list is for. Treat it as a reason to advance instead of a
+    // reason to stop.
+    const advance = retryable || isProviderAccountRefusal(failure);
     const shouldContinue = await original();
     if (
-      !retryable
+      !advance
       || failure === undefined
       || !terminalFailureRemains(session, failure)
       || adapter.invocation?.signal?.aborted

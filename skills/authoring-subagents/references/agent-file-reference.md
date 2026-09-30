@@ -126,8 +126,9 @@ run time:
   3); only after those does the same session advance to the next candidate,
   without replaying the prompt or completed tools. `maxModelWraparounds`
   (default 0) allows additional full passes.
-- Tool/schema/worktree failures, cancellation and non-retryable provider errors
-  do not advance the list.
+- Tool/schema/worktree failures, cancellation and request-level non-retryable
+  errors do not advance the list. An account-scoped refusal (out of credits,
+  quota or billing exhaustion, a 402/403 entitlement answer) does.
 - A literal model ID that ends in a thinking-level word wins over suffix parsing
   when that exact ID exists.
 - With `scopeModels` on, a frontmatter model outside pi's `enabledModels`

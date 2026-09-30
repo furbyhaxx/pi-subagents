@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   beginModelFallbackInvocation,
   getSessionModelCandidates,
+  isProviderAccountRefusal,
   recordReopenedModelSelection,
   replaceSessionModelCandidates,
 } from "../src/pi-retry-adapter.js";
@@ -27,6 +28,12 @@ function model(provider: string, id: string) {
     maxTokens: 100,
   } as never;
 }
+
+// The exact body xAI returns for an exhausted account, which pi classifies as
+// non-retryable (403 is not in its retryable set).
+const CREDIT_403 =
+  'xai API error (403): 403 "You have run out of credits or need a Grok subscription.'
+  + ' Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."';
 
 function fakeSession(initialModel = model("one", "a")) {
   const failure = { role: "assistant" as const, stopReason: "error", errorMessage: "overloaded" };
@@ -226,5 +233,50 @@ describe("Pi retry adapter", () => {
     await expect(raw._handlePostAgentRun()).resolves.toBe(true);
     expect(raw.agent.state.model).toMatchObject({ provider: second.provider, id: second.id });
     expect(raw.agent.state.messages).toEqual([finalFailure]);
+  });
+
+  it("advances on a provider account refusal even though Pi will not retry it", async () => {
+    const { session, raw, appendModelChange, omitRecoveryAttempt, failure } = fakeSession();
+    failure.errorMessage = CREDIT_403;
+    raw._isRetryableError = vi.fn(() => false); // as Pi classifies a 403 credit refusal
+    beginModelFallbackInvocation(session, {
+      candidates: [
+        { input: "one/a", model: raw.agent.state.model },
+        { input: "two/b", model: model("two", "b") },
+      ],
+      maxWraparounds: 0,
+    });
+
+    await expect(raw._handlePostAgentRun()).resolves.toBe(true);
+    expect(raw.agent.state.model).toMatchObject({ provider: "two", id: "b" });
+    expect(appendModelChange).toHaveBeenCalledWith("two", "b");
+    expect(omitRecoveryAttempt).toHaveBeenCalledWith(failure);
+  });
+
+  it("does not advance on a non-retryable request error", async () => {
+    const { session, raw, omitRecoveryAttempt, failure } = fakeSession();
+    failure.errorMessage = '400 "invalid request: unknown tool parameter"';
+    raw._isRetryableError = vi.fn(() => false);
+    beginModelFallbackInvocation(session, {
+      candidates: [
+        { input: "one/a", model: raw.agent.state.model },
+        { input: "two/b", model: model("two", "b") },
+      ],
+      maxWraparounds: 0,
+    });
+
+    await expect(raw._handlePostAgentRun()).resolves.toBe(false);
+    expect(raw.agent.state.model.provider).toBe("one");
+    expect(omitRecoveryAttempt).not.toHaveBeenCalled();
+  });
+
+  it("recognises account refusals but not request errors", () => {
+    expect(isProviderAccountRefusal({ stopReason: "error", errorMessage: CREDIT_403 })).toBe(true);
+    expect(isProviderAccountRefusal({ stopReason: "error", errorMessage: "insufficient_quota" })).toBe(true);
+    expect(isProviderAccountRefusal({ stopReason: "error", errorMessage: "402 payment required" })).toBe(true);
+    expect(isProviderAccountRefusal({ stopReason: "error", errorMessage: '400 "invalid request"' })).toBe(false);
+    expect(isProviderAccountRefusal({ stopReason: "error", errorMessage: "context length exceeded by 403 tokens" })).toBe(false);
+    expect(isProviderAccountRefusal({ stopReason: "stop", errorMessage: "403 forbidden" })).toBe(false);
+    expect(isProviderAccountRefusal(undefined)).toBe(false);
   });
 });
