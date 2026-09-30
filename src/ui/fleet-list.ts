@@ -170,11 +170,6 @@ export class FleetList {
     this.inputUnsub = ui.onTerminalInput(data => this.handleKey(data));
   }
 
-  /** Ensure the re-render timer is running (called when an agent spawns). */
-  ensureTimer(): void {
-    if (!this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
-  }
-
   /**
    * Called when an agent finishes. The viewer (if open on it) stays open so the
    * final output remains readable, and the row lingers in the list — just refresh.
@@ -207,7 +202,8 @@ export class FleetList {
     // it is the thing the user opens to see what its children did. Read off the
     // roster for the same reason activation does: two counts of "is there
     // anything here" drifted apart once before.
-    const hasRows = this.enabled && this.roster().length > 1;
+    const roster = this.roster();
+    const hasRows = this.enabled && roster.length > 1;
 
     if (!hasRows) {
       if (this.widgetRegistered) {
@@ -222,7 +218,7 @@ export class FleetList {
     }
 
     this.clampSelection();
-    this.ensureTimer(); // keep stats ticking whenever the list is shown (e.g. after a re-enable)
+    this.syncTick(roster);
 
     if (!this.widgetRegistered) {
       this.ui.setWidget(FLEET_KEY, (tui, theme) => {
@@ -299,6 +295,39 @@ export class FleetList {
       ...this.workflows().map(workflow => ({ kind: "workflow" as const, workflow })),
       ...this.agentRecords().map(record => ({ kind: "agent" as const, record })),
     ];
+  }
+
+  /**
+   * Arm or disarm the tick, from the roster the caller already read.
+   *
+   * The tick exists for the two things no event reports: the elapsed clock on a
+   * live row, and the wall-clock expiry of a settled row's linger — nothing
+   * fires at t+FINISHED_LINGER_MS, so that row only leaves the list because
+   * something re-reads it. A queued row is deliberately not counted: its clock
+   * does not run, and the transition to running arrives as an update.
+   *
+   * Everything else in the list is static between events, and re-rendering the
+   * conversation to redraw an unchanged row is the cost this avoids.
+   */
+  private syncTick(roster: readonly FleetEntry[]): void {
+    const now = Date.now();
+    const animating = roster.some((entry) => {
+      if (entry.kind === "main") return false;
+      if (entry.kind === "workflow") {
+        const run = entry.workflow;
+        return run.status === "running" || run.status === "paused"
+          || (run.completedAt != null && now - run.completedAt < FINISHED_LINGER_MS);
+      }
+      const record = entry.record;
+      return record.status === "running"
+        || (record.completedAt != null && now - record.completedAt < FINISHED_LINGER_MS);
+    });
+    if (animating) {
+      if (!this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
+    } else if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
   }
 
   private clampSelection(): void {

@@ -879,9 +879,7 @@ export default function (pi: ExtensionAPI) {
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
-      widget.ensureTimer();
       widget.update();
-      fleet.ensureTimer();
       fleet.update();
     }
     // Emit started event when agent transitions to running (including from queue)
@@ -1522,6 +1520,14 @@ export default function (pi: ExtensionAPI) {
       manager.abortAll();
       for (const timer of pendingNudges.values()) clearTimeout(timer);
       pendingNudges.clear();
+      // A pending batch finalize would emit nudges into a session that is going
+      // away; dropping it here is the only place all shutdown paths converge.
+      clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = undefined;
+      // The widget arms an animation tick of its own accord, and is only
+      // reachable from here — without this it outlives the session and keeps
+      // forcing renders of a TUI that no longer has a subagent panel.
+      widget.dispose();
       fleet.dispose();
       // Awaited: it emits `session_shutdown` into every retained child session so
       // extensions bound there can release what they armed in `session_start` (#242).
@@ -1857,9 +1863,7 @@ export default function (pi: ExtensionAPI) {
     // for it that is past the linger limit — without clearing it, the
     // resumed run's ✓/✗ line never renders and the agent just vanishes.
     widget.markRunning(id);
-    widget.ensureTimer();
     widget.update();
-    fleet.ensureTimer();
     fleet.update();
 
     // Resume ignores subagent_type (the record keeps the type it was
@@ -2695,9 +2699,7 @@ Terse command-style prompts produce shallow, generic work.
         }
 
         agentActivity.set(id, bgState);
-        widget.ensureTimer();
         widget.update();
-        fleet.ensureTimer();
         fleet.update();
 
         // Emit created event
@@ -2783,8 +2785,7 @@ Terse command-style prompts produce shallow, generic work.
           if (a.session === session) {
             fgId = a.id;
             agentActivity.set(a.id, fgState);
-            widget.ensureTimer();
-            fleet.ensureTimer();
+            widget.update();
             fleet.update();
             break;
           }

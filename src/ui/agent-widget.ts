@@ -20,6 +20,14 @@ const MAX_WIDGET_LINES = 12;
 /** Braille spinner frames for animated running indicator. */
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/**
+ * Cadence of the animation tick. A running row's elapsed and idle clocks render
+ * in tenths of a second and the spinner has ten frames, so 100 ms is the finest
+ * change any of them can show; a faster tick re-renders an identical widget and
+ * costs a full conversation frame each time.
+ */
+const ANIMATION_TICK_MS = 100;
+
 /** Statuses that indicate an error/non-success outcome (used for linger behavior and icon rendering). */
 export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped"]);
 
@@ -255,6 +263,8 @@ export class AgentWidget {
   private uiCtx: UICtx | undefined;
   private widgetFrame = 0;
   private widgetInterval: ReturnType<typeof setInterval> | undefined;
+  /** Set by `dispose()`; blocks a late event from re-registering the widget. */
+  private disposed = false;
   /** Tracks how many turns each finished agent has survived. Key: agent ID, Value: turns since finished. */
   private finishedTurnAge = new Map<string, number>();
   /** How many extra turns errors/aborted agents linger (completed agents clear after 1 turn). */
@@ -340,10 +350,39 @@ export class AgentWidget {
     this.update();
   }
 
-  /** Ensure the widget update timer is running. */
-  ensureTimer() {
-    if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 80);
+  /**
+   * Arm or disarm the animation tick. The tick exists only for what no event
+   * can signal — the spinner frame and the elapsed/idle clocks — so it runs
+   * exactly while a row is spinning and not at all otherwise. Every render it
+   * triggers re-renders the whole conversation, so a widget that ticked
+   * regardless would cost a full frame many times a second to redraw a string
+   * that had not changed.
+   */
+  private syncAnimationTick(spinning: boolean): void {
+    if (spinning) {
+      if (!this.widgetInterval) {
+        this.widgetInterval = setInterval(() => this.update(), ANIMATION_TICK_MS);
+        // A tick that outlives the session must not be what keeps the process up.
+        this.widgetInterval.unref();
+      }
+    } else if (this.widgetInterval) {
+      clearInterval(this.widgetInterval);
+      this.widgetInterval = undefined;
+    }
+  }
+
+  /**
+   * Drop finished-ages for agents that are no longer on the roster. Runs on
+   * every update, not only when the widget empties: every completion appends
+   * one, and a session whose widget never empties (one long background agent)
+   * would otherwise grow it for the life of the session. The live set is taken
+   * once, because the alternative is one scan of the roster per aged id.
+   */
+  private evictStaleAges(allAgents: readonly { id: string }[]): void {
+    if (this.finishedTurnAge.size === 0) return;
+    const live = new Set(allAgents.map(a => a.id));
+    for (const id of this.finishedTurnAge.keys()) {
+      if (!live.has(id)) this.finishedTurnAge.delete(id);
     }
   }
 
@@ -580,7 +619,7 @@ export class AgentWidget {
 
   /** Force an immediate widget update. */
   update() {
-    if (!this.uiCtx) return;
+    if (this.disposed || !this.uiCtx) return;
     const allAgents = this.widgetAgents();
 
     // Lightweight existence checks — full categorization happens in renderWidget()
@@ -593,6 +632,8 @@ export class AgentWidget {
       else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+    this.evictStaleAges(allAgents);
+    this.syncAnimationTick(runningCount > 0);
 
     // Nothing to show — clear widget
     if (!hasActive && !hasFinished) {
@@ -604,11 +645,6 @@ export class AgentWidget {
       if (this.lastStatusText !== undefined) {
         this.uiCtx.setStatus("subagents", undefined);
         this.lastStatusText = undefined;
-      }
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
-      // Clean up stale entries
-      for (const [id] of this.finishedTurnAge) {
-        if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
       }
       return;
     }
@@ -651,11 +687,14 @@ export class AgentWidget {
   }
 
   dispose() {
+    // Flagged first: a completion that lands after dispose() must not re-register
+    // the widget and re-arm the tick it was just torn down for.
+    this.disposed = true;
     if (this.widgetInterval) {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
     }
-    if (this.uiCtx) {
+    if (this.uiCtx && this.widgetRegistered) {
       this.uiCtx.setWidget("agents", undefined);
       this.uiCtx.setStatus("subagents", undefined);
     }
