@@ -95,14 +95,12 @@ output varies; a single run difference is noise, especially on turn counts.
 
 ## Turning on the instrumentation
 
-```jsonc
-// .pi/subagents.json
-{
-  "showModel": true,      // widget names the model and thinking level actually used
-  "showCost": true,       // estimated cost beside token counts
-  "reportUsage": true,    // fold subagent spend into this session's /cost
-  "outputTranscript": true
-}
+```yaml
+# .pi/subagents.yaml
+showModel: true          # widget names the model and thinking level actually used
+showCost: true           # estimated cost beside token counts
+reportUsage: true        # fold subagent spend into this session's /cost
+outputTranscript: true
 ```
 
 `showModel` is the one that catches configuration bugs: it reports what the run

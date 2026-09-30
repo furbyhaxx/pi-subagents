@@ -275,7 +275,7 @@ initiating project — a named branch's own `.pi` extensions are not loaded.
 |---|---|
 | Per call | Omit `isolation` and `branch`, or pass `isolation: "off"` (without `branch`) |
 | Per agent | `isolation: off` in frontmatter — authoritative; an explicit caller `branch` then **errors**. `isolation: worktree` requires the caller to supply a branch |
-| Per project | `"worktreeIsolation": false` in `subagents.json` — the parameters disappear from the schema next session, and creation is refused on every path including RPC and schedules |
+| Per project | `"worktreeIsolation": false` in `subagents.yaml` — the parameters disappear from the schema next session, and creation is refused on every path including RPC and schedules |
 
 Project-level off is the right call on a repository large enough that a retained
 copy's setup time and disk cost are not justified.

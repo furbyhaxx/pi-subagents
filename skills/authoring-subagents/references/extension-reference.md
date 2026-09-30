@@ -62,7 +62,7 @@ Other locations:
 | Agent files | `.pi/agents/`, `.agents/agents/`, `<agent dir>/agents/` |
 | Saved workflows | `.pi/workflows/`, `.agents/workflows/`, `<agent dir>/workflows/` |
 | Agent memory | `.pi/agent-memory/`, `.pi/agent-memory-local/`, `<agent dir>/agent-memory/` |
-| Settings | `~/.pi/agent/subagents.json` (global), `<cwd>/.pi/subagents.json` (project) |
+| Settings | `~/.pi/agent/subagents.yaml` (global), `<cwd>/.pi/subagents.yaml` (project) |
 | Schedules | `<cwd>/.pi/subagent-schedules/<sessionId>.json` |
 | Messaging store | `<agent dir>/messaging/<project-hash>/messaging.sqlite3` |
 
@@ -71,8 +71,11 @@ cleaned up automatically.
 
 ## Settings
 
-Project `<cwd>/.pi/subagents.json` overrides global `~/.pi/agent/subagents.json`
-per field. `/agents → Settings` writes the project file.
+Project `<cwd>/.pi/subagents.yaml` overrides global `~/.pi/agent/subagents.yaml`
+per field. `/agents → Settings` writes the user file by default; `Tab` switches
+the target layer, and the screen names the file it is saving to. A save writes
+only the keys you changed, so the other layer and unrelated keys in the same
+file are untouched.
 
 | Key | Default | Effect |
 |---|---|---|

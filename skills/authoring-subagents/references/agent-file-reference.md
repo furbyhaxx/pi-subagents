@@ -291,5 +291,5 @@ max_turns: 25
 - `/agents → Agent types` flags a model that cannot be resolved
   (`(unavailable, fallback: inherit)`) or that resolves elsewhere
   (`(→ provider/id)`). Check there after editing `models:`.
-- Malformed `subagents.json` is ignored with a stderr warning; individual
+- Malformed `subagents.yaml` is ignored with a stderr warning; individual
   out-of-range fields are dropped per field.

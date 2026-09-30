@@ -36,10 +36,16 @@ shares one store, one roster and one bus. That is the case the feature is for: a
 main session in one terminal, another in a second, and the subagents of both
 able to reach each other.
 
-```jsonc
-// .pi/subagents.json
-{ "messaging": { "scope": "project" } }   // default
-{ "messaging": { "scope": "session" } }   // only this session's own agents
+```yaml
+# .pi/subagents.yaml
+messaging:
+  scope: project   # default
+```
+
+```yaml
+# only this session's own agents
+messaging:
+  scope: session
 ```
 
 The store lives under `<agent dir>/messaging/<project-hash>/messaging.sqlite3`,
@@ -275,11 +281,11 @@ it dropped. Traffic from another session carries that session's short id.
 
 ## Settings
 
-All under `messaging` in `subagents.json`. Two are in `/agents → Settings`:
+All under `messaging` in `subagents.yaml`. Two are in `/agents → Settings`:
 **Peer messaging**, which applies on the next pi session because the store and
 the bus are opened once at session start, and **Message surface**, which is read
 per delivery and so applies immediately. The rest are file-only. The whole block
-is written back together, so keys you set by hand survive a menu toggle.
+is written as a patch, so keys you set by hand survive a menu toggle.
 
 | Key | Default | Meaning |
 |---|---|---|
