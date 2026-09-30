@@ -83,6 +83,33 @@ describe("YAML settings file", () => {
     });
   });
 
+  it("merges the messaging block per key across layers, not wholesale", () => {
+    writeFileSync(
+      userFile(),
+      ["messaging:", "  enabled: true", "  maxHops: 5", "  surface: ui", ""].join("\n"),
+    );
+    writeFileSync(projectFile(), ["messaging:", "  surface: context", ""].join("\n"));
+
+    // A shallow spread would drop `enabled` and `maxHops` here, and the write
+    // path merges per key — so the read has to merge per key too, or a save
+    // would appear to lose settings it never touched.
+    expect(loadSettings(projectDir).messaging).toEqual({
+      enabled: true,
+      maxHops: 5,
+      surface: "context",
+    });
+  });
+
+  it("overrides the worktree directory wholesale, because it is one setting", () => {
+    writeFileSync(userFile(), "worktreeDirectory:\n  mode: custom\n  path: trees\n");
+    writeFileSync(projectFile(), "worktreeDirectory:\n  mode: project\n");
+
+    // `mode` and `path` describe one placement. Merging them per key would read
+    // as a custom placement rooted at `trees` — a path the user never asked for
+    // and that the mode would ignore anyway.
+    expect(loadSettings(projectDir).worktreeDirectory).toEqual({ mode: "project" });
+  });
+
   it("does not leak a patch from one layer into the other", () => {
     saveSettingsPatch({ maxConcurrent: 2 }, "project", projectDir);
     saveSettingsPatch({ showCost: true }, "user", projectDir);

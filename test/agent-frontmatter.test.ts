@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_FIELDS, applyAgentFields, readAgentFields } from "../src/agent-frontmatter.js";
+import { AGENT_FIELDS, type AgentFieldValue, applyAgentFields, readAgentFields } from "../src/agent-frontmatter.js";
 
 /**
  * The definition editor's field model. The contract that matters: a form save
@@ -116,6 +116,17 @@ describe("agent frontmatter field model", () => {
     expect(applyAgentFields(original, { skills: ["a", "b"] }, "body")).toContain("skills: a, b");
   });
 
+  it("drops an emptied list field rather than writing an empty scalar", () => {
+    const original = "---\ndescription: x\nexclude_extensions: a, b\n---\n\nbody\n";
+
+    const written = applyAgentFields(original, { exclude_extensions: [] }, "body");
+
+    // `key: ""` would parse back as absent anyway, so it is only noise in the
+    // user's file — and it survives a save as a line they never wrote.
+    expect(written).not.toContain("exclude_extensions");
+    expect(readAgentFields(written).values.exclude_extensions).toBeUndefined();
+  });
+
   it("creates a frontmatter block for a file that has none", () => {
     const written = applyAgentFields("just a body\n", { description: "new" }, "just a body");
 
@@ -125,12 +136,14 @@ describe("agent frontmatter field model", () => {
   });
 
   it("preserves CRLF line endings and a leading BOM", () => {
-    const original = "\uFEFF---\r\ndescription: before\r\n---\r\n\r\nbody\r\n";
+    const original = "\uFEFF---\r\ndescription: before\r\ncolor: red\r\n---\r\n\r\nbody\r\n";
 
     const written = applyAgentFields(original, { description: "after" }, "body");
 
     expect(written.startsWith("\uFEFF")).toBe(true);
-    expect(written).toContain("\r\n");
+    // The inner block too, not just the fences: a file that comes back with
+    // CRLF fences around LF lines is worse than one that normalized.
+    expect(written).toBe("\uFEFF---\r\ndescription: after\r\ncolor: red\r\n---\r\n\r\nbody\r\n");
     expect(readAgentFields(written).values.description).toBe("after");
   });
 
@@ -142,11 +155,31 @@ describe("agent frontmatter field model", () => {
     expect(readAgentFields(written).values.description).toBe("fixed");
   });
 
-  it("declares each key once, and only keys the loader reads", () => {
+  it("declares each key once, and every field round-trips through the form", () => {
     const keys = AGENT_FIELDS.map(field => field.key);
     expect(new Set(keys).size).toBe(keys.length);
     // The singular spelling is an alias, never a field of its own.
     expect(keys).not.toContain("model");
     expect(keys).not.toContain("inherit_extensions");
+
+    // Every declared field must be writable AND readable, or the form shows a
+    // control whose value silently disappears on save. One value per kind, so
+    // the loop covers all of them without a fixture per field.
+    const samples: Record<string, AgentFieldValue> = {
+      text: "reviewer",
+      color: "red",
+      boolean: true,
+      integer: 7,
+      choice: AGENT_FIELDS.find(f => f.kind === "choice" && f.key !== "prompt_mode")?.options?.[0] ?? "append",
+      tools: ["read", "bash"],
+      inherit: ["a", "b"],
+      list: ["x", "y"],
+      subagents: ["other"],
+      models: ["anthropic/claude-sonnet-4-6"],
+    };
+    for (const field of AGENT_FIELDS) {
+      const written = applyAgentFields("---\ndescription: d\n---\n\nbody\n", { [field.key]: samples[field.kind] }, "body");
+      expect(readAgentFields(written).values[field.key], `field ${field.key}`).toEqual(samples[field.kind]);
+    }
   });
 });

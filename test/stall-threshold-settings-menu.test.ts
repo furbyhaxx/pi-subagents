@@ -75,4 +75,66 @@ describe("/agents → Settings stall threshold", () => {
       "info",
     );
   });
+
+  it("re-asks rather than staging a number the settings file would drop", async () => {
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: false } });
+    initTheme(undefined, false);
+    const booted = makePi();
+    subagentsExtension(booted.pi);
+    const command = booted.commands.get("agents");
+    if (!command) throw new Error("the extension did not register /agents");
+
+    let openedSettings = false;
+    let settingsViews = 0;
+    const typed: string[] = [];
+    const context = ctx({ cwd: hermetic.dir });
+    context.ui = {
+      ...context.ui,
+      notify: vi.fn(),
+      select: vi.fn(async (title: string, options: string[]) => {
+        if (title !== "Agents" || openedSettings) return undefined;
+        openedSettings = true;
+        return options.find(option => option === "Settings");
+      }),
+      custom: vi.fn(async (factory: (...args: unknown[]) => unknown) => {
+        let result: unknown;
+        const component = factory(
+          { requestRender: () => {} },
+          {},
+          {},
+          (value: unknown) => { result = value; },
+        ) as { handleInput?(data: string): void };
+        component.handleInput?.("x");
+        const pass = settingsViews++;
+        if (pass === 0) {
+          component.handleInput?.("\x1b[B");
+          component.handleInput?.("\x1b[B");
+          component.handleInput?.("\r");
+        } else if (pass === 1) {
+          component.handleInput?.("\x13");
+        } else {
+          component.handleInput?.("\x1b");
+        }
+        return result;
+      }),
+      // First a value the row cannot hold, then a usable one. `-1` would be
+      // dropped by sanitize on the way back in, so accepting it would produce
+      // a save that reports success and persists nothing.
+      input: vi.fn(async (label: string) => {
+        expect(label).toContain("Stall threshold");
+        typed.push("pending");
+        return typed.length === 1 ? "-1" : "0";
+      }),
+    };
+
+    await command.handler("", context);
+
+    expect(typed).toHaveLength(2);
+    const saved = parse(readFileSync(`${hermetic.agentDir}/subagents.yaml`, "utf-8")) as Record<string, unknown>;
+    expect(saved.stallThresholdMinutes).toBe(0);
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Stall visibility disabled"),
+      "info",
+    );
+  });
 });

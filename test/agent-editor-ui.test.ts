@@ -172,6 +172,23 @@ describe("agent definition editor", () => {
     expect(readAgentFields(result.content).values.description).toBe("Reviews diffs!");
   });
 
+  it("agrees with itself about a file a save would rewrite untouched", async () => {
+    // A singular `model:` is rewritten to `models:` on save, so the form is
+    // dirty the moment it opens even though no row was touched. The footer and
+    // the back-prompt have to tell the same story.
+    const editor = harness({
+      original: "---\nname: reviewer\nmodel: anthropic/claude-sonnet-4-6\n---\n\nbody\n",
+      keys: [ESC],
+      repeat: [ESC],
+      answers: (_title, choices) => choices.find(choice => choice === "Save and close"),
+    });
+    const result = await editor.run();
+
+    expect(editor.frame()).toContain("unsaved changes");
+    expect(editor.frame()).not.toContain("no changes");
+    expect(result.action).toBe("save");
+  });
+
   it("treats a save with nothing changed as no work", async () => {
     const editor = harness({ keys: [CTRL_S], repeat: [ESC] });
     const result = await editor.run();
