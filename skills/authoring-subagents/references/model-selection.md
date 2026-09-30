@@ -209,8 +209,10 @@ models:
   what the agent is capable of, and you will read the output as if nothing
   happened.
 - `maxModelWraparounds` (default 0) allows extra full passes over the list.
-- Only tool/schema/worktree failures, cancellation and non-retryable provider
-  errors *stop* the walk; they do not advance it.
+- Tool/schema/worktree failures, cancellation and request-level non-retryable
+  errors *stop* the walk. An account-scoped refusal (out of credits, quota or
+  billing exhaustion, a 402/403 entitlement answer) advances it instead: the
+  provider will not serve this account, but the next candidate may.
 
 ## Cost control
 
