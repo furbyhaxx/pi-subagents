@@ -215,7 +215,7 @@ describe("gate on an isolated child", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
     const result = await host.spawnAgent(
-      spawnRequest({ isolation: "worktree", gate: "npm test" }),
+      spawnRequest({ isolation: "worktree", branch: "feat/gate", gate: "npm test" }),
     );
 
     const worktreePath = manager.listAgents()[0].worktree?.path;
@@ -242,7 +242,7 @@ describe("gate on an isolated child", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
     const result = await runWorkflow({
-      script: `${HEAD}return await agent("fix it", { gate: "npm test", isolation: "worktree" });`,
+      script: `${HEAD}return await agent("fix it", { gate: "npm test", isolation: "worktree", branch: "feat/gate" });`,
       host,
     });
 
@@ -267,7 +267,7 @@ describe("gate on an isolated child", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
     const result = await runWorkflow({
-      script: `${HEAD}return await agent("x", { gate: "npm run lint", isolation: "worktree" });`,
+      script: `${HEAD}return await agent("x", { gate: "npm run lint", isolation: "worktree", branch: "feat/gate" });`,
       host,
     });
 
@@ -278,33 +278,26 @@ describe("gate on an isolated child", () => {
     const { pi } = makePi(() => ({ stdout: "", stderr: "", code: 0, killed: true }));
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
-    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", gate: "sleep 999" }));
+    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", branch: "feat/gate", gate: "sleep 999" }));
 
     expect(result.gate?.ok).toBe(false);
     expect(result.gate?.output).toMatch(/timed out/);
   });
 
-  it("does not fall back to a gate after background-job quiescence fails", async () => {
+  it("leaves caller-selected worktree jobs alone before the gate", async () => {
     const { pi, gateRuns } = makePi();
     failQuiescence(pi, "cannot signal pid");
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
     const result = await runWorkflow({
-      script: `${HEAD}return await agent("x", { gate: "npm test", isolation: "worktree" });`,
+      script: `${HEAD}return await agent("x", { gate: "npm test", isolation: "worktree", branch: "feat/gate" });`,
       host,
     });
 
     expect(result.status).toBe("completed");
-    expect(result.value).toBeNull();
-    expect(gateRuns).toEqual([]);
-    const entry = agentEntries(result.progress).at(-1);
-    expect(entry?.state).toBe("error");
-    expect(entry?.error).toContain("Background-job termination could not be confirmed");
-    expect(entry?.error).toContain("cannot signal pid");
-    const record = manager.listAgents()[0];
-    expect(entry?.error).toContain(`Worktree retained at \`${record.worktree!.path}\``);
-    expect(record.worktreeQuiescenceError).toContain("cannot signal pid");
-    expect(existsSync(record.worktree!.path)).toBe(true);
+    expect(result.value).toContain("done");
+    expect(gateRuns).toMatchObject([{ command: "npm test", existed: true, sawChildWork: true }]);
+    expect(manager.listAgents()[0].worktreeQuiescenceError).toBeUndefined();
   });
 
   it("treats a gate that could not run at all as a failed gate, not an un-run one", async () => {
@@ -317,7 +310,7 @@ describe("gate on an isolated child", () => {
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
     const result = await runWorkflow({
-      script: `${HEAD}return await agent("x", { gate: "npm test", isolation: "worktree" });`,
+      script: `${HEAD}return await agent("x", { gate: "npm test", isolation: "worktree", branch: "feat/gate" });`,
       host,
     });
 
@@ -335,7 +328,7 @@ describe("gate on an isolated child", () => {
     const { pi, gateRuns } = makePi();
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
-    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", gate: "npm test" }));
+    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", branch: "feat/gate", gate: "npm test" }));
 
     expect(manager.listAgents()[0].status).toBe("steered");
     expect(result.ok).toBe(true);
@@ -355,7 +348,7 @@ describe("gate on an isolated child", () => {
     const { pi, gateRuns } = makePi();
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
-    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", gate: "npm test" }));
+    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", branch: "feat/gate", gate: "npm test" }));
 
     expect(result).toMatchObject({ ok: false, error: "provider exploded" });
     expect(result.gate).toBeUndefined();
@@ -415,11 +408,11 @@ describe("an isolated child with no gate", () => {
     vi.mocked(runAgent).mockReset();
   });
 
-  it("is untouched: nothing runs, and the agent branch worktree remains in place", async () => {
+  it("is untouched: nothing runs, and the caller branch worktree remains in place", async () => {
     const { pi, gateRuns } = makePi();
     const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
 
-    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree" }));
+    const result = await host.spawnAgent(spawnRequest({ isolation: "worktree", branch: "feat/gate" }));
 
     expect(gateRuns).toEqual([]);
     expect(result.ok).toBe(true);
@@ -428,7 +421,7 @@ describe("an isolated child with no gate", () => {
     expect(record.worktreeResult).toMatchObject({
       path: record.worktree!.path, branch: record.worktree!.branch, retained: true,
     });
-    expect(record.worktree!.branch).toMatch(/^pi\//);
+    expect(record.worktree!.branch).toBe("feat/gate");
     expect(existsSync(join(record.worktree!.path, CHILD_FILE))).toBe(true);
     expect(existsSync(record.worktree!.path)).toBe(true);
   });

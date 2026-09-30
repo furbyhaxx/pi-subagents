@@ -36,6 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
+import { WORKTREE_BRANCH_REQUIRED_ERROR } from "../invocation-config.js";
 import { type ResolvedModelCandidate, resolveModelCandidates } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import type { RetryModelCandidate } from "../pi-retry-adapter.js";
@@ -199,8 +200,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
-      let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
+      if ((config?.isolation ?? request.isolation) === "worktree" && request.branch === undefined) {
+        return { ok: false, error: WORKTREE_BRANCH_REQUIRED_ERROR };
+      }
+
+      let model = ctx.model;
       const modelInputs = request.model !== undefined ? [request.model] : config?.models;
       let resolvedCandidates: ResolvedModelCandidate[] = [];
       if (modelInputs?.length) {

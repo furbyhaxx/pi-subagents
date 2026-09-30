@@ -123,6 +123,16 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(options.description).toBe("review:bugs");
   });
 
+  it("rejects worktree isolation without a branch before spawning", async () => {
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ isolation: "worktree" }));
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('pass branch: "feat/<slug>"') });
+    expect(stub.spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("passes isolation and the run's abort signal down to the spawn", async () => {
     const stub = stubManager();
     const controller = new AbortController();
@@ -134,7 +144,7 @@ describe("createWorkflowHost — spawn mapping", () => {
       rootSessionId: "root-1",
     });
 
-    await host.spawnAgent(request({ isolation: "worktree" }));
+    await host.spawnAgent(request({ isolation: "worktree", branch: "feat/workflow" }));
 
     const options = stub.spawnAndWait.mock.calls[0][4];
     expect(options.isolation).toBe("worktree");
@@ -282,7 +292,7 @@ describe("createWorkflowHost — spawn mapping", () => {
 
     // `await` rather than `rejects`: a startup failure must land in the script
     // as a null, so the rest of a fan-out keeps going.
-    const result = await host.spawnAgent(request({ isolation: "worktree" }));
+    const result = await host.spawnAgent(request({ isolation: "worktree", branch: "feat/workflow" }));
 
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/isolation: "worktree"/);
@@ -481,7 +491,7 @@ describe("createWorkflowHost — worktree cwd propagation", () => {
     );
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
-    const result = await host.spawnAgent(request({ isolation: "worktree" }));
+    const result = await host.spawnAgent(request({ isolation: "worktree", branch: "feat/worktree-cwd" }));
 
     expect(result.cwd).toBe(worktree);
   });
@@ -497,7 +507,7 @@ describe("createWorkflowHost — worktree cwd propagation", () => {
     );
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
-    const result = await host.spawnAgent(request({ isolation: "worktree" }));
+    const result = await host.spawnAgent(request({ isolation: "worktree", branch: "feat/worktree-gone" }));
 
     expect(result.cwd).toBeUndefined();
   });
@@ -563,10 +573,10 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     const stub = stubManager();
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
-    await host.spawnAgent(request({ isolation: "worktree" }));
+    await host.spawnAgent(request({ isolation: "worktree", branch: "feat/workflow", agentId: "wf-agent-1" }));
     expect(stub.spawnAndWait.mock.calls[0][4].onBeforeWorktreeCleanup).toBeUndefined();
 
-    await host.spawnAgent(request({ isolation: "worktree", gate: "npm test" }));
+    await host.spawnAgent(request({ isolation: "worktree", branch: "feat/workflow-gated", gate: "npm test" }));
     expect(stub.spawnAndWait.mock.calls[1][4].onBeforeWorktreeCleanup).toBeInstanceOf(Function);
   });
 

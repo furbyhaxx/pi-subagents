@@ -270,10 +270,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const config = getAgentConfigIn(registry, resolvedType);
       // Foreground regardless of `backgroundByDefault` — see the reasoning on
       // ResolveOptions. An explicit `true` here still opts in.
-      const invocation = resolveAgentInvocationConfig(config, params, {
-        worktreeAllowed: isWorktreeIsolationEnabled(),
-        defaultRunInBackground: false,
-      });
+      let invocation: ReturnType<typeof resolveAgentInvocationConfig>;
+      try {
+        invocation = resolveAgentInvocationConfig(config, params, {
+          worktreeAllowed: isWorktreeIsolationEnabled(),
+          defaultRunInBackground: false,
+        });
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error), true);
+      }
       let model = ctx.model;
       let resolvedCandidates: ResolvedModelCandidate[] = [];
       if (invocation.modelInputs?.length) {

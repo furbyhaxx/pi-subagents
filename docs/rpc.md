@@ -24,7 +24,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
-| `isolation` | `"off"` \| `"worktree"` | Without `branch`, creates a retained linked worktree on `pi/<agentId>`. Completion reports the branch, path and change state |
+| `isolation` | `"off"` \| `"worktree"` | `"worktree"` requires `branch`; without it the request fails before the child starts |
 | `branch` | string | Exact local branch. Implies worktree isolation; create or reuse a retained linked worktree |
 | `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
@@ -55,9 +55,9 @@ Four things that are not obvious from the tables:
 
 ### Workspaces and storage
 
-Every extension-created worktree is retained after success, turn limit, abort, stop, failure, cancellation and shutdown. Without `branch`, `options.isolation: 'worktree'` creates a real local branch named `pi/<agentId>`. With `options.branch: 'feat/x'`, the [Agent tool's caller-selected branch contract](../README.md#retained-branch-workspaces) applies: a missing local branch starts at the calling checkout's resolved HEAD; an existing branch starts at its tip. Git-registered linked worktrees are reused at their actual path, even outside the configured container, preserving staged, unstaged and untracked changes. There is no fetch or remote-branch guessing. The injected scope asks agents to commit logical conventional commits unless their task says not to; `worktreeAutoCommit` optionally stages and commits dirty worktrees at settlement. The extension never pushes, merges or removes worktree directories. Main/orchestrating-checkout reuse is refused.
+Every extension-created worktree is retained after success, turn limit, abort, stop, failure, cancellation and shutdown. `options.isolation: 'worktree'` requires an explicit `options.branch`, such as `feat/<slug>`; no automatic branch is created. The [Agent tool's caller-selected branch contract](../README.md#retained-branch-workspaces) applies: a missing local branch starts at the calling checkout's resolved HEAD; an existing branch starts at its tip. Git-registered linked worktrees are reused at their actual path, even outside the configured container, preserving staged, unstaged and untracked changes. There is no fetch or remote-branch guessing. The injected scope asks agents to commit logical conventional commits unless their task says not to; `worktreeAutoCommit` optionally stages and commits dirty worktrees at settlement. The extension never pushes, merges or removes worktree directories. Main/orchestrating-checkout reuse is refused.
 
-Explicit `isolation: 'off'`, agent-file `isolation: off`, or project-wide worktree disablement fails a branch request rather than silently downgrading it. Invalid exact local names, stale or inaccessible registrations and a busy repository/branch lease also fail. The cross-process lease is held through execution and `onBeforeWorktreeCleanup`; workflow gates and agent-created-worktree background-job quiescence run before lease release. The callback receives the **effective working cwd**, including monorepo scope. Its legacy name now means the settlement boundary for retained trees, not deletion. Every settlement path releases the lease without deleting retained files. At session start, the extension silently runs `git worktree prune` in the origin repository to drop stale registrations for missing directories; it does not remove worktree directories or branches. `/agents → Worktrees` is a read-only view, including unchecked-out legacy `pi-agent-*` branches. Other human processes are not covered by the lease.
+Explicit `isolation: 'off'`, agent-file `isolation: off`, or project-wide worktree disablement fails a branch request rather than silently downgrading it. Invalid exact local names, stale or inaccessible registrations and a busy repository/branch lease also fail. The cross-process lease is held through execution and `onBeforeWorktreeCleanup`; workflow gates and legacy non-named-worktree background-job quiescence run before lease release. The callback receives the **effective working cwd**, including monorepo scope. Its legacy name now means the settlement boundary for retained trees, not deletion. Every settlement path releases the lease without deleting retained files. At session start, the extension silently runs `git worktree prune` in the origin repository to drop stale registrations for missing directories; it does not remove worktree directories or branches. `/agents → Worktrees` is a read-only view, including unchecked-out legacy `pi-agent-*` branches. Other human processes are not covered by the lease.
 
 A fresh spawn reuses files, not conversation. Resume keeps recorded scope, reacquires its lease and validates the repository/path/checked-out branch. It cannot retarget to a new `branch` or fall back to the parent checkout. Named execution keeps configuration at the initiating project; the reused branch's `.pi` extensions do not become authoritative. With `cwd`, the equivalent subdirectory must exist in the target tree. A retained worktree agent can resume after a Pi restart; restored records resolve by their original agent ID.
 
@@ -98,7 +98,8 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `SpawnOptions.cwd must be an absolute path: "<value>"` | `src/agent-manager.ts:85` |
 | `SpawnOptions.cwd does not exist: "<cwd>"` | `src/agent-manager.ts:91` |
 | `SpawnOptions.cwd is not a directory: "<cwd>"` | `src/agent-manager.ts:94` |
-| `Cannot run with isolation: "worktree" — not a git repo, no commits yet, or 'git worktree add' failed.` | `src/agent-manager.ts:716-719`, surfaced through `awaitStartup` |
+| `Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).` | Spawn validation before starting the child |
+| `Cannot run with isolation: "worktree" — not a git repo, no commits yet, or 'git worktree add' failed.` | `src/agent-manager.ts`, surfaced through `awaitStartup` |
 | git plumbing failures | `src/worktree.ts:76` |
 | `Agent not found` | stop — `src/cross-extension-rpc.ts:170` |
 | `Agent is owned by another agent or workflow` | stop — `:178` |
@@ -107,7 +108,7 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 
 Three things the table cannot show:
 
-- **A worktree request without `branch` may downgrade silently.** With `worktreeIsolation` off project-wide, `isolation: "worktree"` requests retain their silent downgrade to the caller's tree. Explicit `branch` requests instead fail; they never silently lose their caller-selected workspace.
+- **A worktree request without `branch` fails.** Pass an explicit local branch such as `feat/<slug>`. With `worktreeIsolation` off project-wide, explicit `branch` requests also fail; they never silently lose their caller-selected workspace.
 - **`data` is omitted** when a handler returns nothing, so a successful stop or consume reply is a bare `{ success: true }` and `reply.data.anything` throws.
 - **`requestId` is not validated.** It is interpolated straight into the reply channel, so a caller that omits it gets its reply on the literal channel `subagents:rpc:spawn:reply:undefined` — where every other caller that omitted it is also listening. Send one, and send a unique one.
 
@@ -179,7 +180,7 @@ One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`
 
 ## Stopping background jobs before lease release
 
-The one place this extension is an RPC **client** rather than a server: while settling an agent-created worktree, it asks `pi-background-jobs` — when one is loaded — to stop that worktree's jobs before releasing the lease. This leaves the retained tree quiescent for review; it never authorizes removal. The caller side is `src/background-jobs-rpc.ts`; `path` is the worktree's path.
+The one place this extension is an RPC **client** rather than a server: while settling a legacy non-named worktree, it asks `pi-background-jobs` — when one is loaded — to stop that worktree's jobs before releasing the lease. This leaves the retained tree quiescent for review; it never authorizes removal. The caller side is `src/background-jobs-rpc.ts`; `path` is the worktree's path.
 
 ```text
 request  background-jobs:rpc:ping          { requestId }

@@ -823,11 +823,28 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
 // Regression: `isolation: "worktree"` MUST fail loud when the cwd can't host
 // a worktree. The previous behavior silently fell back to the main tree and
 // injected a warning into the LLM's prompt — invisible to the caller.
-describe("AgentManager — isolation: worktree fails loud, no silent fallback", () => {
+describe("AgentManager — worktree isolation requires a caller branch", () => {
   let manager: AgentManager;
 
   afterEach(() => {
     manager?.dispose();
+  });
+
+  it("rejects a missing branch before attempting acquisition or running the agent", async () => {
+    const { createWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockClear();
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+    await expect(manager.awaitStartup(id)).rejects.toThrow('pass branch: "feat/<slug>"');
+
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(manager.listAgents()).toEqual([]);
+    expect(runAgent).not.toHaveBeenCalled();
   });
 
   it("awaitStartup rejects when createWorktree returns undefined; no orphan record left behind", async () => {
@@ -841,7 +858,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await expect(manager.awaitStartup(id)).rejects.toThrow(/isolation: "worktree"/);
 
@@ -861,7 +878,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     manager = new AgentManager();
     await expect(manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     })).rejects.toThrow(/isolation: "worktree"/);
 
     expect(manager.listAgents()).toEqual([]);
@@ -882,7 +899,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager(undefined, 1);
     const slowId = manager.spawn(mockPi, mockCtx, "X", "slow", {
-      description: "slow", isBackground: true, isolation: "worktree",
+      description: "slow", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
     const queuedId = manager.spawn(mockPi, mockCtx, "X", "queued", {
       description: "queued", isBackground: true,
@@ -919,7 +936,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "go", {
-      description: "go", isBackground: true, isolation: "worktree",
+      description: "go", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
@@ -943,7 +960,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "go", {
-      description: "go", isBackground: true, isolation: "worktree",
+      description: "go", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
@@ -969,7 +986,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "test", {
-      description: "test", isBackground: true, isolation: "worktree",
+      description: "test", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
     const record = manager.getRecord(id)!;
 
@@ -996,7 +1013,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "stopped", {
-      description: "stopped", isBackground: true, isolation: "worktree",
+      description: "stopped", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
     expect(manager.abort(id)).toBe(true);
 
@@ -1011,7 +1028,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(manager.getRecord(id)!.status).toBe("stopped");
   });
 
-  it("retains an anonymous worktree when a max-turn steering run settles", async () => {
+  it("retains a legacy non-named worktree when a max-turn steering run settles", async () => {
     const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
     const wt = { path: "/wt/limit", branch: "pi/limit", baseSha: "abc", workPath: "/wt/limit", named: false, baseRef: "main", lifecycle: "retained" };
     vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
@@ -1027,7 +1044,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
-      description: "test", isolation: "worktree", maxTurns: 1,
+      description: "test", isolation: "worktree", branch: "feat/manager-test", maxTurns: 1,
     });
 
     expect(record.status).toBe("steered");
@@ -1054,7 +1071,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onSpawned: () => { throw new Error("transcript failed"); },
     });
 
@@ -1071,7 +1088,7 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
 
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "X", "test", {
-      description: "test", isolation: "worktree", signal: parent.signal,
+      description: "test", isolation: "worktree", branch: "feat/manager-test", signal: parent.signal,
     });
     await manager.awaitStartup(id);
 
@@ -1120,7 +1137,7 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     manager = new AgentManager();
     await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: async (path) => {
         order.push("hook");
         seen.push(path);
@@ -1139,7 +1156,7 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: async () => {
         order.push("hook");
         throw new Error("gate blew up");
@@ -1158,7 +1175,7 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: async () => {
         order.push("hook");
       },
@@ -1183,7 +1200,7 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     const id = manager.spawn(mockPi, mockCtx, "X", "stopped", {
       description: "stopped",
       isBackground: true,
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: async () => {
         order.push("hook");
       },
@@ -1287,7 +1304,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: async () => { order.push("gate"); },
     });
 
@@ -1318,7 +1335,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "X", "wedged", {
       description: "wedged worktree run",
       isBackground: true,
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await manager.awaitStartup(id);
 
@@ -1349,7 +1366,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "X", "wedged gate", {
       description: "wedged gate",
       isBackground: true,
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: () => {
         enterGate();
         return new Promise<void>(() => {});
@@ -1380,7 +1397,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
       onBeforeWorktreeCleanup: gate,
     });
 
@@ -1406,7 +1423,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait({ events: bus } as never, mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
 
     expect(record.jobsPossible).toBe(false);
@@ -1426,7 +1443,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const pending = manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await vi.advanceTimersByTimeAsync(PING_TIMEOUT_MS);
     const { record } = await pending;
@@ -1449,7 +1466,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
 
     expect(stops).toEqual([]);
@@ -1467,7 +1484,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
 
     expect(stops.map((entry) => entry.path)).toEqual(["/wt/jobs"]);
@@ -1488,7 +1505,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
 
     expect(record.status).toBe("error");
@@ -1509,7 +1526,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(piWithBackgroundJobs(bus), mockCtx, "X", "go", {
       description: "go",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
 
     expect(cleanupWorktree).not.toHaveBeenCalled();
@@ -1534,7 +1551,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "general-purpose", "task", {
       description: "task",
       isBackground: true,
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
@@ -1564,7 +1581,7 @@ describe("AgentManager — background jobs before agent-branch lease release", (
     const id = manager.spawn(piWithBackgroundJobs(bus), mockCtx, "general-purpose", "task", {
       description: "task",
       isBackground: true,
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
@@ -1594,7 +1611,7 @@ describe("AgentManager — worktreeIsolation: false refuses worktrees", () => {
     vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
   });
 
-  it("creates no worktree for an RPC-shaped spawn when the project disabled it", async () => {
+  it("rejects an RPC-shaped worktree request without a branch when disabled", async () => {
     const { createWorktree } = await import("../src/worktree.js");
     vi.mocked(createWorktree).mockClear();
     vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(false);
@@ -1605,9 +1622,9 @@ describe("AgentManager — worktreeIsolation: false refuses worktrees", () => {
       isolation: "worktree",
     });
 
-    // Downgraded, not rejected — the user opted out, so the call still runs.
+    await expect(manager.awaitStartup(id)).rejects.toThrow('pass branch: "feat/<slug>"');
     expect(createWorktree).not.toHaveBeenCalled();
-    expect(manager.getRecord(id)!.worktree).toBeUndefined();
+    expect(manager.listAgents()).toEqual([]);
   });
 
   it("does not mask a genuine worktree failure while enabled", async () => {
@@ -1616,12 +1633,11 @@ describe("AgentManager — worktreeIsolation: false refuses worktrees", () => {
     vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
 
     manager = new AgentManager();
-    // The refusal above is silent, but a real failure still surfaces — through
-    // awaitStartup rather than a throw out of spawn(), since the repo copy is
-    // an awaited git call.
+    // The missing-branch error above is separate from acquisition failure,
+    // which still surfaces through awaitStartup.
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await expect(manager.awaitStartup(id)).rejects.toThrow(/isolation: "worktree"/);
   });
@@ -1688,7 +1704,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
       cwd: "/",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     // The run only exists once the copy does — the agent is not running when
     // spawn() returns under worktree isolation.
@@ -1719,7 +1735,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     manager = new AgentManager();
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
-      isolation: "worktree",
+      isolation: "worktree", branch: "feat/manager-test",
     });
     await manager.awaitStartup(id);
     await manager.getRecord(id)!.promise;
@@ -2302,7 +2318,7 @@ describe("AgentManager — drainQueue failure handling", () => {
 
     const firstId = manager.spawn(mockPi, mockCtx, "X", "first", { description: "first", isBackground: true });
     const boomId = manager.spawn(mockPi, mockCtx, "X", "boom", {
-      description: "boom", isBackground: true, isolation: "worktree",
+      description: "boom", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
     const lastId = manager.spawn(mockPi, mockCtx, "X", "last", { description: "last", isBackground: true });
     expect(manager.getRecord(boomId)?.status).toBe("queued");
@@ -2504,7 +2520,7 @@ describe("AgentManager — waitForAll", () => {
 
     manager = new AgentManager();
     manager.spawn(mockPi, mockCtx, "X", "copying", {
-      description: "copying", isBackground: true, isolation: "worktree",
+      description: "copying", isBackground: true, isolation: "worktree", branch: "feat/manager-test",
     });
 
     let settled = false;

@@ -91,7 +91,7 @@ describe("Agent startup failures fail the tool call (#179)", () => {
           },
           undefined, undefined, ctx(),
         ),
-      ).rejects.toThrow('Cannot run with isolation: "worktree"');
+      ).rejects.toThrow('pass branch: "feat/<slug>"');
     });
   }
 });

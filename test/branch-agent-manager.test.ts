@@ -103,13 +103,13 @@ describe("branch-scoped manager execution", () => {
     expect(manager.resolveMention("general-purpose")).toEqual({ kind: "tombstone", entry: expect.objectContaining({ worktree: scope, effectiveCwd: scope.workPath, configCwd: ctx.cwd, artifactRoot: "/artifacts/session" }) });
   });
 
-  it("honors anonymous worktree defaults and vetoes on programmatic spawns", async () => {
+  it("honors worktree frontmatter and vetoes on programmatic spawns", async () => {
     const config = getAgentConfig("general-purpose")!;
     registerAgents(new Map([[config.name, { ...config, isolation: "off" }]]));
     await manager.spawnAndWait(pi, ctx, config.name, "run", { description: "run", isolation: "worktree" });
     expect(createWorktree).not.toHaveBeenCalled();
     registerAgents(new Map([[config.name, { ...config, isolation: "worktree" }]]));
-    await manager.spawnAndWait(pi, ctx, config.name, "run", { description: "run", artifactRoot: "/artifacts/session" });
+    await manager.spawnAndWait(pi, ctx, config.name, "run", { description: "run", artifactRoot: "/artifacts/session", branch: "feat/manager-test" });
     expect(createWorktree).toHaveBeenCalledOnce();
   });
 

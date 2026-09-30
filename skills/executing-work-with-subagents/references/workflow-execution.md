@@ -101,7 +101,7 @@ so `.filter(Boolean)` before using results.
 | `agentType` | Which agent definition; defaults to `general-purpose`. **An unknown name falls back silently** — option keys are validated, values are not |
 | `model` | `provider/modelId[:thinking]` or fuzzy. Replaces the definition's fallback list; omit normally |
 | `effort` | `minimal`…`max`; omitted, the definition's `thinking` decides, then the parent's. Use `low` for mechanical stages, high tiers for verify/judge |
-| `isolation: "worktree"` | Retained worktree on `pi/<agentId>` — expensive; use when parallel edits would collide |
+| `isolation: "worktree"` | Requires `branch: "feat/<slug>"`; retained worktree on that exact branch |
 | `branch` | Retained workspace on an exact caller-selected local branch |
 | `gate` | Shell command run after the agent finishes, in its effective cwd |
 | `resume` | Continue the child that ran under that label |
@@ -121,7 +121,7 @@ const fixed = await agent('Fix the failing test in src/parser.ts.', { label: 'fi
 ```
 
 The gate runs in the child's effective working directory after it finishes and
-**before** worktree settlement and lease release. For agent-created worktrees,
+**before** worktree settlement and lease release. For legacy non-named worktrees,
 background jobs are quiesced before the gate; if quiescence cannot be
 confirmed, the gate does not run. Named worktrees skip implicit job control.
 A non-zero exit marks the agent failed and the command output becomes the
@@ -265,6 +265,7 @@ for the current session.
 | An agent ran as the wrong type, silently | `agentType` value is not validated — check spelling in `/agents` |
 | `agent()` returned `null` | Terminal failure, an inspector skip, or a schema never satisfied |
 | Un-awaited `agent()` error | A dropped `await`, usually inside a stage |
+| Worktree isolation requires an explicit branch | `isolation: "worktree"` had no `branch` | Pass `branch: "feat/<slug>"` |
 | `Cannot run with isolation: "worktree"` | Not a git repo, no commits, or `git worktree add` failed — no workspace |
 | Call fails naming a retained path | Verification failed after add; path retained conservatively |
 | `No saved workflow named "x"` | Not in the three directories, or missing `export const meta` |

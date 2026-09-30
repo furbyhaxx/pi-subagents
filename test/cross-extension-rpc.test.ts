@@ -143,7 +143,7 @@ describe("cross-extension RPC", () => {
       // back an id — the repo copy is an awaited git call. A failure there has
       // to be an error envelope, not an id for an agent that never ran.
       (manager.awaitStartup as ReturnType<typeof vi.fn>).mockRejectedValue(
-        new Error('Cannot run with isolation: "worktree"'),
+        new Error('Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).'),
       );
       registerRpcHandlers(deps);
       const reply = vi.fn();
@@ -155,7 +155,7 @@ describe("cross-extension RPC", () => {
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({
-        success: false, error: 'Cannot run with isolation: "worktree"',
+        success: false, error: 'Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).',
       });
       expect(manager.awaitStartup).toHaveBeenCalledWith("agent-42");
     });

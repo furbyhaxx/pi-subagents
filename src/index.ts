@@ -1996,17 +1996,14 @@ export default function (pi: ExtensionAPI) {
 
   // Same trade as scheduleParam/scheduleGuideline above: `isolationParam` drops
   // the field from the schema when the project set `worktreeIsolation: false`,
-  // so the prose has to go with it. Left in, it would teach the model to pass a
-  // parameter that isn't declared — accepted (TypeBox sets no
-  // `additionalProperties: false`) and then silently dropped by the resolver.
-  // With no per-result note by design, the model would have every reason to go
-  // on reporting an isolated workspace that was never created.
+  // so the prose has to go with it. The runtime rejects stale requests rather
+  // than reporting a workspace that was never created.
   const isolationGuideline = isWorktreeIsolationEnabled()
-    ? `\n- Use isolation: "worktree" without branch for a fresh linked worktree on its own branch pi/<agentId>, retained after every outcome; completion reports its path and branch. The agent is told to commit its work on that branch unless your task says not to. The extension never pushes, merges, resets, stashes, cleans or removes, and commits on its own only when worktreeAutoCommit is enabled. Review the branch explicitly: either integrate it (merge, rebase or cherry-pick) and then remove the worktree, or discard and remove it. With branch: "feat/x", Agent creates or reuses a reusable named workspace checked out on that exact local branch. A missing branch starts at caller HEAD. Named workspaces follow the same rules. Creation never copies caller uncommitted changes; reuse exposes the existing workspace changes. Pass branch as a tool argument, not a request to create/switch worktrees. Use repository-relative task paths; state objective, permitted edits, validation and commit policy. Do not ask parallel agents to write the same branch. A fresh call reuses files, not conversation; use resume for conversation continuity. Branch cannot combine with resume or isolation: "off", and fails when worktrees are disabled or the branch is busy.`
+    ? `\n- Use isolation: "worktree" only with an explicit branch: branch: "feat/<slug>" (conventional-commit style). It creates or reuses a retained named workspace on that exact local branch; completion reports its path and change state. The agent commits logical changes unless the task says otherwise. The extension never pushes, merges or removes worktrees; review the branch and explicitly integrate or discard it. New worktrees do not copy caller uncommitted changes; reused worktrees keep their existing files. Pass branch as a tool argument, not a request to create or switch worktrees. Use repository-relative paths; state the objective, permitted edits, validation and commit policy. Do not ask parallel agents to write the same branch. A fresh call reuses files, not conversation; use resume for conversation continuity. Branch cannot combine with resume or isolation: "off", and fails when worktrees are disabled or the branch is busy.`
     : "";
 
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
-    ? `\n- isolation: "worktree" creates a fresh linked worktree on its own branch pi/<agentId>, retained after every outcome; the result reports its path and branch. The agent commits there; nothing is pushed, merged or removed for you: review, integrate the branch, then remove the worktree, or discard it. branch: "feat/x" creates/reuses a reusable named workspace. New worktrees see committed files only; reuse keeps changes.`
+    ? `\n- isolation: "worktree" requires branch: "feat/<slug>" (conventional-commit style) and creates or reuses a retained named workspace on that exact branch. No automatic branch is created. The result reports its path and change state; review the branch and explicitly integrate or discard it. New worktrees see committed files only; reused worktrees keep changes.`
     : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —

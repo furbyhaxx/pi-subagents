@@ -206,24 +206,15 @@ export interface SubagentsSettings {
   /**
    * Whether `isolation: "worktree"` may create a worktree at all. Defaults to
    * `true`. Set `false` on a repo where worktrees are too slow or too large to
-   * be worth it (#184): a requested worktree is then dropped and the agent runs
-   * in the main checkout.
+   * be worth it (#184): the Agent schema and descriptions omit worktree options,
+   * and stale or programmatic requests fail rather than running in the shared
+   * checkout.
    *
-   * The drop is deliberately silent — there is no per-result note, because the
-   * setting exists for projects whose model asks for a worktree on every call,
-   * where a note would be noise on every result. What keeps the orchestrator
-   * from claiming a `pi/<agentId>` branch anyway is that it is never told the
-   * capability exists: `isolationParam` (invocation-config.ts) drops the field
-   * from both tool schemas, and `isolationGuideline` (index.ts) drops the
-   * matching prose from the full and compact descriptions — a custom one opts
-   * in via the `{{isolationGuideline}}` placeholder. Anything that
-   * reintroduces the prose has to reintroduce a note with it.
-   *
-   * Deliberately a downgrade rather than an error. The fail-loud rule covers
-   * worktrees that *cannot* be created; this is the user declining one, and
-   * throwing would reject exactly the calls that the `isolation: "off"` value
-   * exists to tolerate. Enforced below the tool boundary, so it also covers the
-   * scheduler and the unvalidated cross-extension RPC path.
+   * `isolationParam` (invocation-config.ts) drops the field from both tool
+   * schemas, and `isolationGuideline` (index.ts) drops the matching prose from
+   * the full and compact descriptions — a custom description opts in through
+   * the `{{isolationGuideline}}` placeholder. Runtime enforcement also covers
+   * agent frontmatter, schedules and unvalidated cross-extension RPC calls.
    */
   worktreeIsolation?: boolean;
   /** Automatically stage and commit dirty worktrees when agents settle. Defaults to false. */

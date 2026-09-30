@@ -121,6 +121,37 @@ afterEach(() => {
 });
 
 describe("Agent tool result — effective model", () => {
+  it("rejects worktree isolation without a branch before spawning", async () => {
+    vi.mocked(runAgent).mockClear();
+    const tool = agentTool();
+
+    await expect(tool.execute(
+      "tc-worktree",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", isolation: "worktree" },
+      undefined,
+      vi.fn(),
+      ctx(),
+    )).rejects.toThrow('pass branch: "feat/<slug>"');
+
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent frontmatter worktree isolation without a caller branch", async () => {
+    pinnedAgent("isolation: worktree\n");
+    vi.mocked(runAgent).mockClear();
+    const tool = agentTool();
+
+    await expect(tool.execute(
+      "tc-worktree-frontmatter",
+      { prompt: "go", description: "d", subagent_type: "pinned" },
+      undefined,
+      vi.fn(),
+      ctx(),
+    )).rejects.toThrow('pass branch: "feat/<slug>"');
+
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
   it("names the model even when the child inherited the parent's", async () => {
     // The old rule was "show it only when it differs from the parent", which
     // left `thinking: high` attached to nothing on the common path.

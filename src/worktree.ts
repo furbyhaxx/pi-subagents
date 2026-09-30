@@ -2,8 +2,7 @@
  * worktree.ts — Git worktree isolation for agents.
  *
  * Every worktree checks out a real local branch and remains after settlement.
- * Explicit branches acquire reusable named workspaces; anonymous agents get
- * their own `pi/<agentId>` branch.
+ * Explicit branches acquire reusable named workspaces.
  * Leases serialize extension-owned writers across processes through settlement.
  *
  * Every git call goes through `pi.exec` (async) rather than `execFileSync`: a
@@ -394,22 +393,15 @@ export async function createWorktree(
   agentId: string,
   options: WorktreeOptions = {},
 ): Promise<WorktreeInfo | undefined> {
-  const named = options.branch !== undefined;
-  if (named && !worktreeIsolationEnabled) throw new Error("Branch requires worktree isolation, which is disabled");
-  let baseSha: string;
-  let baseRef: string;
-  let callerRoot: string;
-  let commonDir: string;
-  try {
-    baseSha = await git(pi, cwd, ["rev-parse", "HEAD"], 5000);
-    const callerBranch = await git(pi, cwd, ["branch", "--show-current"], 5000);
-    baseRef = callerBranch || baseSha;
-    callerRoot = realpathSync(await git(pi, cwd, ["rev-parse", "--show-toplevel"], 5000));
-    commonDir = await commonDirectory(pi, cwd);
-  } catch (error) {
-    if (named) throw error;
-    return undefined;
+  if (options.branch === undefined) {
+    throw new Error('Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).');
   }
+  if (!worktreeIsolationEnabled) throw new Error("Branch requires worktree isolation, which is disabled");
+  const baseSha = await git(pi, cwd, ["rev-parse", "HEAD"], 5000);
+  const callerBranch = await git(pi, cwd, ["branch", "--show-current"], 5000);
+  const baseRef = callerBranch || baseSha;
+  const callerRoot = realpathSync(await git(pi, cwd, ["rev-parse", "--show-toplevel"], 5000));
+  const commonDir = await commonDirectory(pi, cwd);
   const entries = await registrations(pi, cwd);
   const mainRoot = entries[0]?.path;
   let sourceRoot = mainRoot && existsSync(mainRoot) ? realpathSync(mainRoot) : callerRoot;
@@ -425,32 +417,30 @@ export async function createWorktree(
     } catch { /* Keep the target repository anchor. */ }
   }
   const subdir = relative(callerRoot, realpathSync(cwd));
-  const branch = options.branch ?? `pi/${agentId}`;
+  const branch = options.branch;
   const validated = await git(pi, cwd, ["check-ref-format", "--branch", branch], 5000);
   if (validated !== branch) throw new Error("Branch must be an exact local branch name, not a revision shortcut");
   await git(pi, cwd, ["check-ref-format", `refs/heads/${branch}`], 5000);
   const scope: WorktreeInfo = {
-    path: "", workPath: "", branch, baseSha, baseRef, named, sourceRoot, commonDir,
+    path: "", workPath: "", branch, baseSha, baseRef, named: true, sourceRoot, commonDir,
     lifecycle: "retained", reused: false, initialDirty: false,
   };
-  if (named) await acquireWorktreeLease(scope, agentId);
+  await acquireWorktreeLease(scope, agentId);
   try {
-    if (named) {
-      const matches = (await registrations(pi, cwd)).filter(entry => entry.branch === `refs/heads/${branch}`);
-      if (matches.length > 1) throw new Error(`Ambiguous worktree registrations for branch ${branch}`);
-      if (matches.length === 1) {
-        const target = matches[0];
-        if (target.prunable || !existsSync(target.path)) throw new Error(`Stale worktree for ${branch}: ${target.path}; inspect git worktree list and repair the registration`);
-        scope.path = realpathSync(target.path);
-        if (scope.path === sourceRoot || scope.path === callerRoot || scope.path === originRoot) {
-          throw new Error(`Branch ${branch} belongs to the main/orchestrating checkout; use another branch`);
-        }
-        scope.workPath = join(scope.path, subdir);
-        scope.reused = true;
-        scope.initialDirty = await verifyWorktree(pi, scope);
-        scope.baseSha = await git(pi, scope.path, ["rev-parse", "HEAD"], 5000);
-        return scope;
+    const matches = (await registrations(pi, cwd)).filter(entry => entry.branch === `refs/heads/${branch}`);
+    if (matches.length > 1) throw new Error(`Ambiguous worktree registrations for branch ${branch}`);
+    if (matches.length === 1) {
+      const target = matches[0];
+      if (target.prunable || !existsSync(target.path)) throw new Error(`Stale worktree for ${branch}: ${target.path}; inspect git worktree list and repair the registration`);
+      scope.path = realpathSync(target.path);
+      if (scope.path === sourceRoot || scope.path === callerRoot || scope.path === originRoot) {
+        throw new Error(`Branch ${branch} belongs to the main/orchestrating checkout; use another branch`);
       }
+      scope.workPath = join(scope.path, subdir);
+      scope.reused = true;
+      scope.initialDirty = await verifyWorktree(pi, scope);
+      scope.baseSha = await git(pi, scope.path, ["rev-parse", "HEAD"], 5000);
+      return scope;
     }
     const placement = options.directory ?? { mode: "session" };
     let container = placement.mode === "project" ? join(sourceRoot, ".worktrees")
@@ -471,46 +461,13 @@ export async function createWorktree(
     }
     mkdirSync(container, { recursive: true, mode: 0o700 });
     const slug = branch.replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 64) || "branch";
-    scope.path = join(container, named ? `${slug}-${hash(`${commonDir}\0${branch}`)}` : `${slug}-${randomUUID().slice(0, 8)}`);
+    scope.path = join(container, `${slug}-${hash(`${commonDir}\0${branch}`)}`);
     scope.workPath = join(scope.path, subdir);
-    if (!named) await acquireWorktreeLease(scope, agentId);
-    let args: string[];
-    if (named) {
-      const exists = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
-      if (exists.killed || (exists.code !== 0 && exists.code !== 1)) throw new Error(exists.stderr || "Cannot resolve local branch");
-      args = exists.code === 0 ? ["worktree", "add", scope.path, branch]
-        : ["worktree", "add", "-b", branch, scope.path, baseSha];
-    } else {
-      const parentBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", "refs/heads/pi"], { cwd, timeout: 5000 });
-      if (parentBranch.killed || (parentBranch.code !== 0 && parentBranch.code !== 1)) {
-        throw new Error(parentBranch.stderr || "Cannot check whether local branch `pi` exists");
-      }
-      if (parentBranch.code === 0) {
-        throw new Error(`Cannot create generated branch ${branch}: local branch 'pi' prevents refs under 'pi/'; rename it or request an explicit branch`);
-      }
-      const generatedBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
-      if (generatedBranch.killed || (generatedBranch.code !== 0 && generatedBranch.code !== 1)) {
-        throw new Error(generatedBranch.stderr || `Cannot check whether generated branch ${branch} exists`);
-      }
-      if (generatedBranch.code === 0) {
-        throw new Error(`Generated branch ${branch} already exists; use a different agent id or request an explicit branch`);
-      }
-      args = ["worktree", "add", "-b", branch, scope.path, baseSha];
-    }
-    try { await git(pi, cwd, args, 30000); }
-    catch (error) {
-      if (named) throw error;
-      const parentBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", "refs/heads/pi"], { cwd, timeout: 5000 });
-      if (parentBranch.code === 0) {
-        throw new Error(`Cannot create generated branch ${branch}: local branch 'pi' prevents refs under 'pi/'; rename it or request an explicit branch`, { cause: error });
-      }
-      const generatedBranch = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
-      if (generatedBranch.code === 0) {
-        throw new Error(`Generated branch ${branch} already exists; use a different agent id or request an explicit branch`, { cause: error });
-      }
-      releaseWorktreeLease(scope);
-      return undefined;
-    }
+    const exists = await pi.exec("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd, timeout: 5000 });
+    if (exists.killed || (exists.code !== 0 && exists.code !== 1)) throw new Error(exists.stderr || "Cannot resolve local branch");
+    const args = exists.code === 0 ? ["worktree", "add", scope.path, branch]
+      : ["worktree", "add", "-b", branch, scope.path, baseSha];
+    await git(pi, cwd, args, 30000);
     try {
       scope.initialDirty = await verifyWorktree(pi, scope);
       scope.baseSha = await git(pi, scope.path, ["rev-parse", "HEAD"], 5000);

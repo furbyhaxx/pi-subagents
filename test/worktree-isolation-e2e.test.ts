@@ -79,7 +79,7 @@ function agentResultText(session: Context): string {
  * tools resolve against, and writing the file from the test would answer it by
  * assumption.
  */
-function respondSpawning(isolation: "worktree" | undefined): (context: Context) => FauxReply {
+function respondSpawning(isolation: "worktree" | undefined, branch?: string): (context: Context) => FauxReply {
   return (context: Context): FauxReply => {
     if (firstUserText(context).includes(CHILD_PROMPT)) {
       if (!toolResultNames(context).includes("bash")) {
@@ -99,6 +99,7 @@ function respondSpawning(isolation: "worktree" | undefined): (context: Context) 
       description: "worktree work",
       prompt: CHILD_PROMPT,
       ...(isolation ? { isolation } : {}),
+      ...(branch ? { branch } : {}),
     });
   };
 }
@@ -126,14 +127,14 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     }
   });
 
-  it("runs the child in a retained agent branch, not the main checkout", async () => {
+  it("runs the child on the caller-selected branch, not the main checkout", async () => {
     const repo = initGitRepo();
     repos.push(repo);
 
     run = await runPrintMode({
       prompt: "Delegate the work.",
       cwd: repo,
-      respond: respondSpawning("worktree"),
+      respond: respondSpawning("worktree", "feat/e2e"),
       live: false,
     });
 
@@ -143,12 +144,12 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
 
     const result = agentResultText(run.parentSession);
     expect(result).toContain(CHILD_MARKER);
-    expect(result).toContain("Workspace type: agent-created branch");
+    expect(result).toContain("Workspace type: caller-selected branch");
 
     const workspace = /Workspace retained on branch `([^`]+)` at `([^`]+)`/.exec(result);
     const branch = workspace?.[1];
     const worktree = workspace?.[2];
-    expect(branch).toMatch(/^pi\//);
+    expect(branch).toBe("feat/e2e");
     expect(worktree).toBeTruthy();
 
     expect(existsSync(join(worktree!, MARKER_FILE))).toBe(true);
@@ -158,22 +159,12 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     expect(git(repo, "worktree", "list").split("\n")).toHaveLength(2);
   });
 
-  it("downgrades to the main checkout when the project set worktreeIsolation: false", async () => {
+  it("rejects cached worktree requests without a branch when disabled", async () => {
     const repo = initGitRepo();
     repos.push(repo);
     mkdirSync(join(repo, ".pi"), { recursive: true });
     writeFileSync(join(repo, ".pi", "subagents.json"), JSON.stringify({ worktreeIsolation: false }));
 
-    // The caller passes `isolation: "worktree"` even though the setting drops
-    // the parameter from the schema — exactly what a model holding a cached tool
-    // spec does, and the case the downgrade (rather than a throw) exists for.
-    //
-    // Mutation note: the resolver gate (invocation-config) and the manager gate
-    // (agent-manager) are redundant on THIS path, so removing either one alone
-    // leaves this test green — verified, not assumed. That is the point of the
-    // second gate, which exists for cross-extension RPC, where options skip the
-    // resolver entirely. This test pins the behaviour and goes red when both are
-    // gone; each gate is pinned individually by its own unit test.
     run = await runPrintMode({
       prompt: "Delegate the work.",
       cwd: repo,
@@ -182,15 +173,10 @@ describe("worktree isolation e2e (real git, real pi-mono, faux model)", () => {
     });
 
     const result = agentResultText(run.parentSession);
-    expect(result).toContain(CHILD_MARKER);
-
-    // Ran in the main checkout: the file is right there, and no branch was made.
-    expect(existsSync(join(repo, MARKER_FILE))).toBe(true);
+    expect(result).toContain('pass branch: "feat/<slug>"');
+    expect(result).not.toContain(CHILD_MARKER);
+    expect(existsSync(join(repo, MARKER_FILE))).toBe(false);
     expect(git(repo, "branch", "--list", "pi-agent-*")).toBe("");
     expect(git(repo, "worktree", "list").split("\n")).toHaveLength(1);
-
-    // Silent by design — no per-result note, which is why the tool description
-    // drops the isolation bullet alongside the parameter (see index.ts).
-    expect(result).not.toContain("Changes saved to branch");
   });
 });

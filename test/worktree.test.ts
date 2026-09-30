@@ -44,6 +44,15 @@ function mockPi(): ExtensionAPI {
  * A pi whose exec answers one git subcommand with a canned failure result and
  * runs everything else for real. `match` sees the argv git is called with.
  */
+async function createNamedTestWorktree(
+  pi: ExtensionAPI,
+  cwd: string,
+  agentId: string,
+  options: Parameters<typeof createWorktree>[3] = {},
+) {
+  return createWorktree(pi, cwd, agentId, { ...options, branch: options.branch ?? `feat/${agentId}` });
+}
+
 function failingPi(match: (args: string[]) => boolean, failure: { code: number; killed: boolean }): ExtensionAPI {
   const real = mockPi();
   return {
@@ -98,13 +107,13 @@ describe("worktree", () => {
 
   describe("createWorktree", () => {
     it("creates a worktree under persistent session artifacts", async () => {
-      const wt = await createWorktree(pi, repoDir, "test-id-1");
+      const wt = await createNamedTestWorktree(pi, repoDir, "test-id-1");
       expect(wt).toBeDefined();
       expect(existsSync(wt!.path)).toBe(true);
-      expect(wt!.branch).toBe("pi/test-id-1");
+      expect(wt!.branch).toBe("feat/test-id-1");
       expect(wt!.path.startsWith(artifactDir)).toBe(true);
       expect(wt!.lifecycle).toBe("retained");
-      expect(wt!.named).toBe(false);
+      expect(wt!.named).toBe(true);
       expect(wt!.baseRef).toBe(execFileSync("git", ["branch", "--show-current"], {
         cwd: repoDir, stdio: "pipe",
       }).toString().trim());
@@ -113,10 +122,10 @@ describe("worktree", () => {
       }).toString().trim());
       expect(execFileSync("git", ["rev-parse", "--symbolic-full-name", "HEAD"], {
         cwd: wt!.path, stdio: "pipe",
-      }).toString().trim()).toBe("refs/heads/pi/test-id-1");
-      expect(execFileSync("git", ["for-each-ref", "--format=%(refname)", "refs/heads/pi/test-id-1"], {
+      }).toString().trim()).toBe("refs/heads/feat/test-id-1");
+      expect(execFileSync("git", ["for-each-ref", "--format=%(refname)", "refs/heads/feat/test-id-1"], {
         cwd: repoDir, encoding: "utf8",
-      }).trim()).toBe("refs/heads/pi/test-id-1");
+      }).trim()).toBe("refs/heads/feat/test-id-1");
 
       // Verify it's a valid worktree with the repo's files
       expect(existsSync(join(wt!.path, "README.md"))).toBe(true);
@@ -125,47 +134,43 @@ describe("worktree", () => {
       try { execFileSync("git", ["worktree", "remove", "--force", wt!.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
-    it("returns undefined for non-git directory", async () => {
+    it("fails when the requested branch cannot be created outside a git repo", async () => {
       const nonGit = mkdtempSync(join(tmpdir(), "pi-wt-nongit-"));
       try {
-        const wt = await createWorktree(pi, nonGit, "test-id-2");
-        expect(wt).toBeUndefined();
+        await expect(createNamedTestWorktree(pi, nonGit, "test-id-2")).rejects.toThrow();
       } finally {
         rmSync(nonGit, { recursive: true, force: true });
       }
     });
 
-    it("returns undefined for git repo with no commits", async () => {
+    it("fails when the requested branch cannot be created before the first commit", async () => {
       const emptyRepo = mkdtempSync(join(tmpdir(), "pi-wt-empty-"));
       try {
         execFileSync("git", ["init"], { cwd: emptyRepo, stdio: "pipe" });
-        const wt = await createWorktree(pi, emptyRepo, "no-commits");
-        expect(wt).toBeUndefined();
+        await expect(createNamedTestWorktree(pi, emptyRepo, "no-commits")).rejects.toThrow();
       } finally {
         rmSync(emptyRepo, { recursive: true, force: true });
       }
     });
 
-    it("returns undefined when `git worktree add` reports a non-zero exit", async () => {
+    it("fails when `git worktree add` reports a non-zero exit", async () => {
       // pi.exec resolves with a failure code instead of throwing, so a port that
       // only caught exceptions would hand back a worktree path that isn't there.
-      const wt = await createWorktree(
+      await expect(createNamedTestWorktree(
         failingPi(args => args[0] === "worktree" && args[1] === "add", { code: 128, killed: false }),
         repoDir,
         "add-fails",
-      );
-      expect(wt).toBeUndefined();
+      )).rejects.toThrow("boom");
     });
 
-    it("returns undefined when a git call is killed by its timeout", async () => {
+    it("fails when a git call is killed by its timeout", async () => {
       // A killed process reports code 0 with killed: true — the one failure
       // shape that looks like success if only the exit code is checked.
-      const wt = await createWorktree(
+      await expect(createNamedTestWorktree(
         failingPi(args => args[0] === "rev-parse" && args[1] === "HEAD", { code: 0, killed: true }),
         repoDir,
         "timed-out",
-      );
-      expect(wt).toBeUndefined();
+      )).rejects.toThrow("boom");
     });
 
     it("surfaces the acquired path when post-add verification fails", async () => {
@@ -184,15 +189,15 @@ describe("worktree", () => {
 
       let failure: unknown;
       try {
-        await createWorktree(postAddFailure, repoDir, "verify-fails");
+        await createNamedTestWorktree(postAddFailure, repoDir, "verify-fails");
       } catch (error) {
         failure = error;
       }
 
       expect(failure).toBeInstanceOf(WorktreeAcquisitionError);
       const acquired = (failure as WorktreeAcquisitionError).worktree;
-      expect(acquired.branch).toBe("pi/verify-fails");
-      expect(acquired.path).toContain("pi-verify-fails");
+      expect(acquired.branch).toBe("feat/verify-fails");
+      expect(acquired.path).toContain("feat-verify-fails");
       expect(existsSync(acquired.path)).toBe(true);
       expect((failure as Error).message).toContain(acquired.path);
       execFileSync("git", ["worktree", "remove", "--force", acquired.path], { cwd: repoDir, stdio: "pipe" });
@@ -201,14 +206,14 @@ describe("worktree", () => {
     it("uses the caller HEAD SHA as baseRef when the caller is detached", async () => {
       execFileSync("git", ["checkout", "--detach", "HEAD"], { cwd: repoDir, stdio: "pipe" });
       const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-      const wt = (await createWorktree(pi, repoDir, "detached-base"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "detached-base"))!;
       expect(wt.baseRef).toBe(head);
       expect(wt.baseSha).toBe(head);
       execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" });
     });
 
     it("workPath equals path when created from the repo root", async () => {
-      const wt = (await createWorktree(pi, repoDir, "root-wp"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "root-wp"))!;
       expect(wt.workPath).toBe(wt.path);
       try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
@@ -219,26 +224,24 @@ describe("worktree", () => {
       execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
       execFileSync("git", ["commit", "-m", "add package"], { cwd: repoDir, stdio: "pipe" });
 
-      const wt = (await createWorktree(pi, join(repoDir, "packages", "api"), "subdir-wp"))!;
+      const wt = (await createNamedTestWorktree(pi, join(repoDir, "packages", "api"), "subdir-wp"))!;
       expect(wt).toBeDefined();
       expect(wt.workPath).toBe(join(wt.path, "packages", "api"));
       expect(existsSync(wt.workPath)).toBe(true);
       try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
-    it("fails with actionable errors when generated branch refs conflict", async () => {
-      execFileSync("git", ["branch", "pi/duplicate"], { cwd: repoDir, stdio: "pipe" });
-      await expect(createWorktree(pi, repoDir, "duplicate")).rejects.toThrow(/Generated branch pi\/duplicate already exists/);
-      execFileSync("git", ["branch", "-d", "pi/duplicate"], { cwd: repoDir, stdio: "pipe" });
-
-      execFileSync("git", ["branch", "pi"], { cwd: repoDir, stdio: "pipe" });
-      await expect(createWorktree(pi, repoDir, "nested")).rejects.toThrow("local branch 'pi' prevents refs under 'pi/'");
-      expect(execFileSync("git", ["branch", "--list", "pi"], { cwd: repoDir, encoding: "utf8" }).trim()).toBe("pi");
+    it("requires an explicit branch instead of generating one from the agent id", async () => {
+      await expect(createWorktree(pi, repoDir, "anonymous")).rejects.toThrow(
+        'Worktree isolation requires an explicit branch; pass branch: "feat/<slug>"',
+      );
+      expect(execFileSync("git", ["for-each-ref", "--format=%(refname)", "refs/heads/feat"], { cwd: repoDir, encoding: "utf8" }).trim()).toBe("");
+      expect(execFileSync("git", ["worktree", "list"], { cwd: repoDir, encoding: "utf8" }).trim().split("\n")).toHaveLength(1);
     });
 
     it("uses unique paths for multiple worktrees", async () => {
-      const wt1 = await createWorktree(pi, repoDir, "multi-1");
-      const wt2 = await createWorktree(pi, repoDir, "multi-2");
+      const wt1 = await createNamedTestWorktree(pi, repoDir, "multi-1");
+      const wt2 = await createNamedTestWorktree(pi, repoDir, "multi-2");
       expect(wt1).toBeDefined();
       expect(wt2).toBeDefined();
       expect(wt1!.path).not.toBe(wt2!.path);
@@ -262,8 +265,8 @@ describe("worktree", () => {
       } as unknown as ExtensionAPI;
 
       const [a, b] = await Promise.all([
-        createWorktree(tracking, repoDir, "par-1"),
-        createWorktree(tracking, repoDir, "par-2"),
+        createNamedTestWorktree(tracking, repoDir, "par-1"),
+        createNamedTestWorktree(tracking, repoDir, "par-2"),
       ]);
       expect(a).toBeDefined();
       expect(b).toBeDefined();
@@ -281,7 +284,7 @@ describe("worktree", () => {
 
   describe("cleanupWorktree", () => {
     it("retains a clean agent branch in place", async () => {
-      const wt = (await createWorktree(pi, repoDir, "clean-1"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "clean-1"))!;
 
       const result = await cleanupWorktree(pi, repoDir, wt, "test settlement", "clean-1");
 
@@ -296,7 +299,7 @@ describe("worktree", () => {
     });
 
     it("retains uncommitted changes without staging or committing", async () => {
-      const wt = (await createWorktree(pi, repoDir, "dirty-1"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "dirty-1"))!;
       writeFileSync(join(wt.path, "new-file.txt"), "agent wrote this");
       const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: wt.path, stdio: "pipe" }).toString().trim();
 
@@ -310,7 +313,7 @@ describe("worktree", () => {
     });
 
     it("does not create an empty commit when auto-commit is enabled for a clean worktree", async () => {
-      const wt = (await createWorktree(pi, repoDir, "auto-commit-clean"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "auto-commit-clean"))!;
       setWorktreeAutoCommitEnabled(true);
 
       const result = await cleanupWorktree(pi, repoDir, wt, "nothing changed", "agent-clean");
@@ -320,7 +323,7 @@ describe("worktree", () => {
     });
 
     it("auto-commits dirty work with the configured description and agent id", async () => {
-      const wt = (await createWorktree(pi, repoDir, "auto-commit-1"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "auto-commit-1"))!;
       writeFileSync(join(wt.path, "auto-committed.txt"), "settled work");
       setWorktreeAutoCommitEnabled(true);
 
@@ -333,7 +336,7 @@ describe("worktree", () => {
     });
 
     it("reports automatic commit failures without throwing or discarding staged work", async () => {
-      const wt = (await createWorktree(pi, repoDir, "auto-commit-fails"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "auto-commit-fails"))!;
       writeFileSync(join(wt.path, "uncommitted.txt"), "keep this");
       setWorktreeAutoCommitEnabled(true);
 
@@ -350,7 +353,7 @@ describe("worktree", () => {
     });
 
     it("retains agent commits on their branch", async () => {
-      const wt = (await createWorktree(pi, repoDir, "committed-1"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "committed-1"))!;
       writeFileSync(join(wt.path, "committed-file.txt"), "agent committed this");
       execFileSync("git", ["add", "committed-file.txt"], { cwd: wt.path, stdio: "pipe" });
       execFileSync("git", ["commit", "-m", "agent commit"], { cwd: wt.path, stdio: "pipe" });
@@ -365,7 +368,8 @@ describe("worktree", () => {
     });
 
     it("uses conservative change metadata when an agent branch cannot be verified", async () => {
-      const wt = (await createWorktree(pi, repoDir, "corrupt"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "corrupt", { branch: "pi/corrupt" }))!;
+      wt.named = false;
       writeFileSync(join(wt.path, "work.txt"), "agent output");
       writeFileSync(join(wt.path, ".git"), "gitdir: /nonexistent/path/that/is/not/a/repo");
 
@@ -376,7 +380,7 @@ describe("worktree", () => {
     });
 
     it("never invokes a mutating settlement command", async () => {
-      const wt = (await createWorktree(pi, repoDir, "observed"))!;
+      const wt = (await createNamedTestWorktree(pi, repoDir, "observed"))!;
       writeFileSync(join(wt.path, "work.txt"), "agent output");
       const observed = { ...pi, exec: vi.fn(pi.exec.bind(pi)) } as ExtensionAPI;
 
@@ -437,17 +441,12 @@ describe("worktree isolation switch", () => {
     expect(isWorktreeIsolationEnabled()).toBe(true);
   });
 
-  // The switch gates callers; it deliberately does not disarm createWorktree
-  // itself, so a caller that has already decided (agent-manager checks first)
-  // still gets a real worktree rather than a silent no-op.
-  it("does not disable anonymous createWorktree directly", async () => {
+  it("refuses explicit worktree creation when disabled", async () => {
     const repoDir = initGitRepo();
     const pi = mockPi();
     try {
       setWorktreeIsolationEnabled(false);
-      const wt = await createWorktree(pi, repoDir, "switch-test");
-      expect(wt).toBeDefined();
-      await cleanupWorktree(pi, repoDir, wt!, "switch test", "switch-test");
+      await expect(createNamedTestWorktree(pi, repoDir, "switch-test")).rejects.toThrow(/disabled/);
     } finally {
       await pruneWorktrees(pi, repoDir);
       rmSync(repoDir, { recursive: true, force: true });

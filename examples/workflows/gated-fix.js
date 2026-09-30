@@ -10,14 +10,11 @@
  *   1. `gate` cannot be combined with `resume`. A resumed child keeps the agent
  *      type, model, tree and tools it was started with, so the corrective pass
  *      is NOT itself gated — re-verification needs its own gated call.
- *   2. `isolation: "worktree"` is deliberately not used here. An isolated child's
- *      worktree (on its own pi/<agentId> branch) is retained when it settles, but a later fresh agent
- *      would still verify the main tree and could pass while the fix it was
- *      checking lives somewhere else. Nothing automatically merges, pushes,
- *      resets, stashes, cleans or removes that worktree; its reported path
- *      must be explicitly reviewed and integrated or discarded before removal.
- *      Isolation is for parallel writers that would collide; a serial
- *      fix-then-verify chain wants one shared tree.
+ *   2. Worktree isolation is deliberately not used here. It requires an
+ *      explicit branch and gives the child a separate retained workspace, so a
+ *      verifier in the shared checkout would inspect the wrong tree. Isolation
+ *      is for parallel writers that would collide; a serial fix-then-verify
+ *      chain wants one shared tree, or both calls on the same explicit branch.
  *
  * args: { task?: string, test?: string }
  *

@@ -97,7 +97,8 @@ beforeEach(async () => {
     const leaseDir = join(scope.commonDir, "pi-subagents-leases");
     leaseObserved ||= readdirSync(leaseDir).some(name => name.endsWith(".lock"));
   });
-  scope = (await createWorktree(api, repo, "restored-agent", { sessionRoot: sessions }))!;
+  scope = (await createWorktree(api, repo, "restored-agent", { branch: "pi/restored-agent", sessionRoot: sessions }))!;
+  scope.named = false;
   await cleanupWorktree(api, repo, scope, "initial run", "restored-agent");
   manager = new AgentManager();
   manager.setDefaultApi(api);

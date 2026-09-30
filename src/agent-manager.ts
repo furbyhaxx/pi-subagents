@@ -24,7 +24,7 @@ import { buildAgentRegistry, getAgentConfig, getAgentConfigIn } from "./agent-ty
 import { type StopWorktreeResult, stopWorktreeJobs } from "./background-jobs-rpc.js";
 import { resolveBashFamily } from "./bash-family.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { resolveBranch } from "./invocation-config.js";
+import { resolveBranch, WORKTREE_BRANCH_REQUIRED_ERROR } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { getWorktreeDirectory, sessionArtifactRoot } from "./output-file.js";
@@ -37,7 +37,7 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, releaseWor
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 
-/** Result note after background jobs in an agent-created worktree were confirmed stopped. */
+/** Result note after background jobs in a legacy non-named worktree were confirmed stopped. */
 function stoppedJobsNote(ids: string[]): string {
   return `\n\nStopped ${ids.length} background job(s) still running in the worktree: ${ids.join(", ")}.`;
 }
@@ -862,6 +862,9 @@ export class AgentManager {
       if (options.branch !== undefined) {
         branch = resolveBranch(options.branch, options.isolation, configured, isWorktreeIsolationEnabled());
       }
+      if (isolation === "worktree" && branch === undefined) {
+        throw new Error(WORKTREE_BRANCH_REQUIRED_ERROR);
+      }
     } catch (error) {
       releaseSlot();
       throw error;
@@ -1168,8 +1171,8 @@ export class AgentManager {
             if (jobs?.outcome === "stopped" && jobs.stopped.length > 0) {
               record.result = (record.result ?? "") + stoppedJobsNote(jobs.stopped);
             }
-            // Agent-created branches have their jobs stopped; named worktrees
-            // deliberately skip implicit job control. The lease remains held here.
+            // Legacy non-named branches have their jobs stopped; caller-named
+            // worktrees deliberately skip implicit job control. The lease remains held here.
             if (options.onBeforeWorktreeCleanup) {
               try {
                 await options.onBeforeWorktreeCleanup(record.effectiveCwd ?? record.worktree.workPath);
@@ -1672,9 +1675,9 @@ export class AgentManager {
   }
 
   /**
-   * Stop the background jobs of an agent-created branch before lease release.
+   * Stop background jobs in a legacy non-named branch before lease release.
    *
-   * Undefined when there is nothing to gate: no worktree, a named tree
+   * Undefined when there is nothing to gate: no worktree, a caller-named tree
    * (never implicitly stopped), or a record whose parent never exposed the
    * recognized family. A `failed` result means the caller must retain conservatively;
    * `unavailable` is a no-op only for a never-possible record. Once jobs were

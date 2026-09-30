@@ -116,6 +116,15 @@ describe("script globals", () => {
     expect(calls[0].effort).toBeUndefined();
   });
 
+  it("rejects worktree isolation without a branch before calling the host", async () => {
+    const { host, calls } = stubHost();
+    const result = await run('await agent("isolated", { isolation: "worktree" });\nreturn null;', { host });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain('pass branch: "feat/<slug>"');
+    expect(calls).toHaveLength(0);
+  });
+
   it("rejects an effort level pi does not have", async () => {
     const { host, calls } = stubHost();
     const result = await run('await agent("a", { effort: "ultra" });\nreturn null;', { host });
@@ -940,7 +949,7 @@ describe("Claude Code option compatibility", () => {
   it("accepts every option a Claude Code script actually uses", async () => {
     const stub = stubHost();
     const result = await run(
-      "return await agent('go', { label: 'L', phase: 'P', agentType: 'general-purpose', model: 'haiku', effort: 'high', isolation: 'worktree' });",
+      "return await agent('go', { label: 'L', phase: 'P', agentType: 'general-purpose', model: 'haiku', effort: 'high', isolation: 'worktree', branch: 'feat/compat' });",
       { host: stub.host },
     );
 

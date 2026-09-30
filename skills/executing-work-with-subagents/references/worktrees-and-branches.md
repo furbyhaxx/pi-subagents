@@ -1,13 +1,12 @@
 # Worktrees and branches
 
-Three places delegated work can happen: the shared checkout, an agent-created
-worktree on `pi/<agentId>`, or a retained caller-selected branch workspace.
-Picking wrong costs either safety or time.
+Delegated work can use the shared checkout or a retained worktree on an
+explicit caller-selected branch. Picking wrong costs either safety or time.
 
 ## Contents
 
 - [Choosing](#choosing)
-- [Agent-created branch worktrees](#agent-created-branch-worktrees)
+- [Legacy automatic branches](#legacy-automatic-branches)
 - [Named branch workspaces](#named-branch-workspaces)
 - [The lease: one writer per branch](#the-lease-one-writer-per-branch)
 - [What a worktree does not contain](#what-a-worktree-does-not-contain)
@@ -22,37 +21,19 @@ Picking wrong costs either safety or time.
 | Mode | Call | Use when | Aftermath |
 |---|---|---|---|
 | Shared checkout | omit both | Read-only work, or exactly one writer | Nothing isolated; your tree is edited directly |
-| Agent-created branch | `isolation: "worktree"` | Speculative writes, risky refactors, parallel writers you may discard | Retained on `pi/<agentId>`; agent commits logical changes unless told not to |
-| Caller-selected branch | `branch: "feat/x"` | Multi-step work on one line, reused across several agents | Workspace, branch, index and files remain; agent commits logical changes unless told not to |
+| Caller-selected branch | `branch: "feat/x"` or `isolation: "worktree", branch: "feat/x"` | Speculative writes, risky refactors, parallel writers you may discard | Retained on the exact branch; agent commits logical changes unless told not to |
 
 Isolation is not free: a copy costs setup time and disk per agent. Reach for it
 when parallel edits would actually collide, when you might want to throw the work
 away, or when the main checkout must stay usable while an agent works.
 
-## Agent-created branch worktrees
+## Legacy automatic branches
 
-`isolation: "worktree"` gives the agent a full isolated copy of the repository
-on a fresh local `pi/<agentId>` branch. Every extension-created worktree is
-retained after success, turn-limit wrap-up, abort, stop, failure, cancellation
-and shutdown.
-
-The injected `<worktree_scope>` asks the agent to commit logical conventional
-commits unless its task says not to, permits `git rebase <baseRef>` if the base
-moved, and requires a final report with branch, HEAD SHA, commit list and dirty
-state. `worktreeAutoCommit` can also stage and commit dirty trees at settlement;
-it is off by default. The extension never pushes, merges or removes worktrees.
-Completion reports the retained branch and path and whether changes remain. The
-orchestrator reviews and explicitly chooses integration or discard.
-
-If the worktree cannot be created (not a git repo, no commits, or `git worktree
-add` failed), the `Agent` call **fails**. Isolation is a strict guarantee, not a
-hint, and the failure is reported as a failed tool call rather than as an agent
-that ran and complained. Failures before `git worktree add` create no workspace.
-Failures after add during verification still fail the call, but retain and
-report the acquired path conservatively.
-
-Isolation is a directive, not a sandbox: the agent's system prompt tells it to
-work only in the copy, but an agent with `bash` can `cd` out.
+Earlier releases created a `pi/<agentId>` branch when worktree isolation was
+requested without `branch`. New requests never create these automatically;
+`isolation: "worktree"` now requires a caller-selected branch. Existing retained
+`pi/*` worktrees are not migrated or removed and remain available through
+listing, resume/restore and `git worktree prune`.
 
 ## Named branch workspaces
 
@@ -98,12 +79,12 @@ to the parent directory.
 ## The lease: one writer per branch
 
 One extension-managed writer holds a cross-process repository/branch lease
-through execution, workflow gates and agent-created-worktree background-job
-quiescence. Contention **fails fast** rather than queueing: steer or resume the
-owning agent, or use another branch. For agent-created worktrees, background
+through execution, workflow gates and background-job quiescence for legacy
+non-named worktrees. Contention **fails fast** rather than queueing: steer or resume the
+owning agent, or use another branch. For legacy non-named worktrees, background
 jobs are quiesced before a workflow gate runs, and the gate runs before
 settlement and lease release; if quiescence cannot be confirmed, the gate does
-not run. Caller-selected worktrees skip implicit job control. Retention does
+not run. New caller-selected worktrees skip implicit job control. Retention does
 not shorten this ordering.
 
 Consequences for scheduling:
@@ -173,10 +154,11 @@ git -C /path/to/worktree status --short
 git -C /path/to/worktree diff --stat
 ```
 
-Every extension-created worktree is on a branch. An agent-created run uses
-`pi/<agentId>`; a caller-selected run reports its requested branch. `/agents →
-Worktrees` shows retained paths, dirty state, ahead/behind relative to `baseRef`,
-and upstream state, plus unchecked-out legacy `pi-agent-*` branches.
+Every extension-created worktree is on a branch. New acquisitions use the
+caller's explicit branch; existing automatic `pi/*` worktrees remain listed and
+resumable. `/agents → Worktrees` shows retained paths, dirty state, ahead/behind
+relative to `baseRef`, and upstream state, plus unchecked-out legacy
+`pi-agent-*` branches.
 
 ### Review before you integrate
 
@@ -271,12 +253,12 @@ with an actionable error otherwise, and the extension never edits a tracked
 `.git/info/exclude`). Changes apply to future acquisitions only; existing
 worktrees are never migrated.
 
-For an agent-created worktree, a loaded background-jobs runtime is asked to stop
-jobs in that tree before a workflow gate runs, and reports the stopped ids. If
-termination cannot be confirmed, the failure is reported and the gate does not
-run. The tree is retained regardless: quiescence protects review and manual
-cleanup; it does not authorize automatic deletion. Named worktrees skip
-implicit job control and keep their jobs.
+For a legacy non-named worktree, a loaded background-jobs runtime is asked to
+stop jobs in that tree before a workflow gate runs, and reports the stopped ids.
+If termination cannot be confirmed, the failure is reported and the gate does
+not run. The tree is retained regardless: quiescence protects review and manual
+cleanup; it does not authorize automatic deletion. New caller-selected
+worktrees skip implicit job control and keep their jobs.
 
 At shutdown, `pi-background-jobs` calls the extension's settlement endpoint
 before disposing its responder, preserving that same ordering. When the gate
@@ -292,7 +274,7 @@ initiating project — a named branch's own `.pi` extensions are not loaded.
 | Level | How |
 |---|---|
 | Per call | Omit `isolation` and `branch`, or pass `isolation: "off"` (without `branch`) |
-| Per agent | `isolation: off` in frontmatter — authoritative; an explicit caller `branch` then **errors** |
+| Per agent | `isolation: off` in frontmatter — authoritative; an explicit caller `branch` then **errors**. `isolation: worktree` requires the caller to supply a branch |
 | Per project | `"worktreeIsolation": false` in `subagents.json` — the parameters disappear from the schema next session, and creation is refused on every path including RPC and schedules |
 
 Project-level off is the right call on a repository large enough that a retained
@@ -302,6 +284,7 @@ copy's setup time and disk cost are not justified.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Worktree isolation requires an explicit branch | `isolation: "worktree"` had no `branch` | Pass a branch such as `feat/<slug>` |
 | `Cannot run with isolation: "worktree"` | Not a git repo, no commits, or `git worktree add` failed before a workspace existed | `git init` + one commit, or drop the option |
 | Call fails after add, naming a retained path | Post-add verification failed | Inspect the reported path; it is retained conservatively |
 | Agent reports a clean tree when reviewing "my changes" | Fresh worktree has no uncommitted caller changes | Review in the shared checkout, or commit first |

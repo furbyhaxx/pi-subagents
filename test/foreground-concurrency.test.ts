@@ -381,7 +381,7 @@ describe("maxConcurrentForeground", () => {
     vi.mocked(createWorktree).mockReturnValue(undefined as any);
 
     const first = fg(manager, "holder");
-    const doomed = fg(manager, "doomed", { isolation: "worktree" });
+    const doomed = fg(manager, "doomed", { isolation: "worktree", branch: "feat/manager-test" });
     const after = fg(manager, "after");
     expect(recordFor(manager, "doomed").status).toBe("queued");
 

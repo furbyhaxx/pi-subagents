@@ -244,9 +244,9 @@ An agent definition may provide ordered `models` fallback candidates. Pi exhaust
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId[:thinking]`, or fuzzy like `haiku`. Replaces the agent definition's fallback list; omit normally, and use on resume only when recovering from an unavailable configured selection |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
-| `isolation` | `"worktree"` | Without `branch`, a retained linked worktree on `pi/<agentId>`. Completion reports its branch, path and change state; worktree agents are instructed to commit logical changes unless the task says otherwise |
-| `branch` | string | Exact local branch, e.g. `feat/x`. Implies worktree isolation; creates or reuses a retained linked worktree. The agent is instructed to commit logical changes unless the task says otherwise |
-| `gate` | string | Shell command in the child's effective cwd after it finishes, before worktree settlement and lease release. For agent-created worktrees, jobs are quiesced first; if that cannot be confirmed, the gate does not run. Named worktrees skip implicit job control. A non-zero exit fails the agent and its output becomes the error |
+| `isolation` | `"worktree"` | Requires `branch`; creates or reuses a retained linked worktree on that exact branch. No automatic branch is created |
+| `branch` | string | Exact local branch, e.g. `feat/<slug>`. Implies worktree isolation; creates or reuses a retained linked worktree. The agent is instructed to commit logical changes unless the task says otherwise |
+| `gate` | string | Shell command in the child's effective cwd after it finishes, before worktree settlement and lease release. Legacy non-named worktrees quiesce jobs first; if that cannot be confirmed, the gate does not run. Caller-selected branch worktrees skip implicit job control. A non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
@@ -254,11 +254,11 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` may be combined with `model` to continue the same conversation on a replacement model. It cannot be combined with `agentType`, `effort`, `isolation`, `branch`, `gate` or `schema` — the child keeps its agent type and tree, and its session predates the `StructuredOutput` tool.
 
-Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`. For agent-created worktrees, background jobs are quiesced before a workflow gate runs, and the gate runs before settlement and lease release. If quiescence cannot be confirmed, the gate does not run; the failure is reported in the child's output. The worktree remains retained either way. A caller-selected `branch` worktree skips implicit job control and is never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
+Workflow children use the same runner as every other subagent, so their workspace rules are the same. A child whose agent definition allows `bash` also gets the background-jobs family (`job_list`, `job_output`, `job_stop`) when a background-jobs runtime owns the parent's `bash`. For legacy non-named worktrees, background jobs are quiesced before a workflow gate runs, and the gate runs before settlement and lease release. If quiescence cannot be confirmed, the gate does not run; the failure is reported in the child's output. The worktree remains retained either way. New caller-selected `branch` worktrees skip implicit job control and are never implicitly stopped, and a child finishing never marks its jobs done: `job_list` / `job_output` remain the only source of job status. See the README's [Worktree Isolation](../README.md#worktree-isolation).
 
 ### Retained branch workspaces
 
-Both workflow worktree modes use real branches. `isolation: "worktree"` without `branch` creates a fresh linked worktree on `pi/<agentId>`; `branch` selects a caller-named branch. The injected worktree scope asks the child to commit logical conventional commits unless its task says not to, allows `git rebase <baseRef>` if the base moved, and requires its report to state the branch, HEAD SHA, commit list and dirty state. Do not ask a child to switch branches or create worktrees:
+Workflow worktrees require an explicit local branch. `isolation: "worktree"` without `branch` fails before spawning; pass a conventional-commit-style name such as `branch: "feat/<slug>"`. `branch` alone also implies worktree isolation. No automatic branch is created. The injected worktree scope asks the child to commit logical conventional commits unless its task says not to, allows `git rebase <baseRef>` if the base moved, and requires its report to state the branch, HEAD SHA, commit list and dirty state. Do not ask a child to switch branches or create worktrees:
 
 ```js
 await agent('Implement src/x.ts; run npm test. Do not commit.', {
@@ -417,6 +417,8 @@ The agent failed terminally, or you skipped it with `s` in the inspector. These 
 
 **The run failed complaining about an un-awaited `agent()`.**
 A dropped `await`, usually inside a `pipeline` stage. The run would otherwise finish while children were still working and throw their results away, so it fails instead — immediately rather than draining, since an agent that ignores its abort signal would wedge the run forever.
+
+**`Worktree isolation requires an explicit branch`.** Pass `branch: "feat/<slug>"` with `isolation: "worktree"`.
 
 **`Cannot run with isolation: "worktree"`.**
 Not a git repo, no commits yet, or `git worktree add` failed. Failures before `git worktree add` create no workspace; failures after add during verification retain and report the acquired path conservatively. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.

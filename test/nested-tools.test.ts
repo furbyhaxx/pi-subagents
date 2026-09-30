@@ -352,10 +352,27 @@ describe("child-safe nested Agent tools", () => {
       prompt: "Find them",
       run_in_background: true,
       isolation: "worktree",
+      branch: "feat/nested",
     });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('isolation: "worktree"');
+  });
+
+  it("rejects nested worktree isolation without a branch before spawning", async () => {
+    const [agent] = tools(["scout"]);
+
+    const result = await execute(agent, {
+      subagent_type: "scout",
+      description: "isolated child",
+      prompt: "Work in isolation",
+      isolation: "worktree",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('pass branch: "feat/<slug>"');
+    expect(spawn).not.toHaveBeenCalled();
+    expect(spawnAndWait).not.toHaveBeenCalled();
   });
 
   it("waits for a queued owned child to start and settle", async () => {

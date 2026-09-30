@@ -1,6 +1,6 @@
 ---
 name: executing-work-with-subagents
-description: Turn real work into subagent-executable batches — splitting plan or feature tasks into units that fit one agent's context, deciding what runs sequentially vs in parallel, keeping write scopes disjoint so parallel agents cannot collide, choosing agent-created branch worktrees vs caller-selected branches vs the shared checkout, gating each batch on a command that must pass, and choosing between Agent calls and SubagentWorkflow. Use this whenever a multi-step implementation, migration, refactor, audit, review or research job is about to be delegated, when a plan's tasks are too large for one agent, when agents might write the same files, or when someone says "split this up", "do these in parallel", "use worktrees" or "work through this plan".
+description: Turn real work into subagent-executable batches — splitting plan or feature tasks into units that fit one agent's context, deciding what runs sequentially vs in parallel, keeping write scopes disjoint so parallel agents cannot collide, choosing caller-named branch worktrees vs the shared checkout, gating each batch on a command that must pass, and choosing between Agent calls and SubagentWorkflow. Use this whenever a multi-step implementation, migration, refactor, audit, review or research job is about to be delegated, when a plan's tasks are too large for one agent, when agents might write the same files, or when someone says "split this up", "do these in parallel", "use worktrees" or "work through this plan".
 ---
 
 # Executing work with subagents
@@ -92,7 +92,7 @@ Batch shapes, dependency graphs, fan-out patterns and what a barrier costs:
 | Mode | Use when | Cost |
 |---|---|---|
 | Shared checkout (default) | Read-only work, or a single writer | None; no protection either |
-| `isolation: "worktree"` | Speculative or risky writes you may throw away | Retained worktree on `pi/<agentId>`; agent commits logical changes unless told not to |
+| `isolation: "worktree"` | Speculative or risky writes you may throw away | Requires `branch: "feat/<slug>"`; retained on that exact branch |
 | `branch: "feat/x"` | Multi-step work on one line, reused across calls | Retained caller-selected branch; agent commits logical changes unless told not to |
 
 **Isolation is not free, and whoever asked for it should be told the price.**
@@ -111,19 +111,19 @@ writer is faster and simpler.
 Work in a worktree is not done when the agent finishes — it is done when it has
 been reviewed, deliberately integrated or discarded, re-checked when integrated,
 and removed from disk. Every extension-created worktree stays retained after
-success, turn limit, abort, stop, failure, cancellation and shutdown. Requests
-without an explicit `branch` use `pi/<agentId>`; caller-selected requests use
-the requested branch. The injected scope asks the agent to commit logical
-conventional commits unless the task says not to; `worktreeAutoCommit` can additionally stage
-and commit dirty trees at settlement. The extension never pushes, merges or
-removes worktrees.
+success, turn limit, abort, stop, failure, cancellation and shutdown. New
+worktree requests require an explicit caller-selected `branch`; existing legacy
+`pi/*` worktrees remain available for review and resume. The injected scope asks
+the agent to commit logical conventional commits unless the task says not to;
+`worktreeAutoCommit` can additionally stage and commit dirty trees at settlement.
+The extension never pushes, merges or removes worktrees.
 
 The final agent report names its branch, HEAD SHA, commits and dirty state.
 Review against that evidence, choose integration or discard, then clean up only
 after checking `git -C <worktree> status --short`, comparing HEAD with branches,
 and checking upstream/push state. A missing upstream means there is no configured
 tracking branch; it does not prove that no remote copy exists. Use `git rebase
-<baseRef>` if the base moved. Agent-created worktree background jobs are
+<baseRef>` if the base moved. Background jobs in legacy non-named worktrees are
 quiesced before lease release. `/agents → Worktrees` provides a read-only inventory.
 
 The full procedure — inventory, review, deliberate integration or discard, `git

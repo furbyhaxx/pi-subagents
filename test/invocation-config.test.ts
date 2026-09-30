@@ -23,11 +23,11 @@ describe("isolationParam", () => {
     const shape = isolationParam(true);
     const description = shape.isolation?.description ?? "";
 
-    expect(description).toContain("fresh linked worktree on its own branch");
-    expect(description).toContain("completion reports its path");
-    expect(description).toContain("The agent is told to commit its work on that branch");
+    expect(description).toContain('requires an explicit branch such as "feat/<slug>"');
+    expect(description).toContain("Completion reports its path");
+    expect(description).toContain("The agent is told to commit logical changes unless its task says otherwise");
     expect(description).toContain("either integrate it and then remove the worktree, or discard and remove it");
-    expect(description).toContain("reusable named workspace");
+    expect(description).toContain("retained linked worktree on that exact local branch");
     expect(description).not.toContain("disposable");
     expect(description).not.toContain("reported pi-agent-*");
   });
@@ -53,6 +53,7 @@ describe("resolveAgentInvocationConfig", () => {
         run_in_background: true,
         isolated: true,
         isolation: "worktree",
+        branch: "feat/configured",
       },
     );
 
@@ -76,6 +77,7 @@ describe("resolveAgentInvocationConfig", () => {
       run_in_background: true,
       isolated: true,
       isolation: "worktree",
+      branch: "feat/params",
     });
 
     expect(resolved.modelInput).toBe("provider/param-model");
@@ -137,19 +139,19 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.isolation).toBeUndefined();
   });
 
-  it('still honours a param "worktree" when the config leaves isolation unset', () => {
-    const resolved = resolveAgentInvocationConfig(makeConfig({ isolation: undefined }), { isolation: "worktree" });
-    expect(resolved.isolation).toBe("worktree");
+  it('requires a branch for a param "worktree" when the config leaves isolation unset', () => {
+    expect(() => resolveAgentInvocationConfig(makeConfig({ isolation: undefined }), { isolation: "worktree" }))
+      .toThrow(/pass branch: "feat\/<slug>"/);
   });
 
-  it("drops worktree isolation when the project disallows it", () => {
-    const resolved = resolveAgentInvocationConfig(makeConfig({ isolation: "worktree" }), { isolation: "worktree" }, { worktreeAllowed: false });
-    expect(resolved.isolation).toBeUndefined();
+  it("requires a branch for worktree isolation even when disabled", () => {
+    expect(() => resolveAgentInvocationConfig(makeConfig({ isolation: "worktree" }), {}, { worktreeAllowed: false }))
+      .toThrow(/pass branch: "feat\/<slug>"/);
   });
 
-  it("keeps worktree isolation when the project allows it", () => {
-    const resolved = resolveAgentInvocationConfig(makeConfig({ isolation: "worktree" }), {}, { worktreeAllowed: true });
-    expect(resolved.isolation).toBe("worktree");
+  it("keeps worktree isolation when an allowed project has an explicit branch", () => {
+    const resolved = resolveAgentInvocationConfig(makeConfig({ isolation: "worktree" }), { branch: "feat/x" }, { worktreeAllowed: true });
+    expect(resolved).toMatchObject({ branch: "feat/x", isolation: "worktree" });
   });
 });
 

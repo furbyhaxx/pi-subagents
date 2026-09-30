@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  acquireWorktreeLease, cleanupWorktree, createWorktree, releaseWorktreeLease, resumeWorktree,
+  acquireWorktreeLease, cleanupWorktree, createWorktree, pruneWorktrees, releaseWorktreeLease, resumeWorktree,
   setWorktreeIsolationEnabled, type WorktreeInfo,
 } from "../src/worktree.js";
 
@@ -54,7 +54,7 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-async function create(branch?: string, cwd = repo): Promise<WorktreeInfo> {
+async function create(branch: string, cwd = repo): Promise<WorktreeInfo> {
   const scope = (await createWorktree(pi, cwd, `agent-${scopes.length}`, { branch, sessionRoot }))!;
   scopes.push(scope);
   return scope;
@@ -150,18 +150,21 @@ describe("retained branch worktrees", () => {
     unlock();
   });
 
-  it("reacquires a settled anonymous worktree and releases retained leases even when status fails", async () => {
-    const anonymous = await create();
-    const key = createHash("sha256").update(`path:${anonymous.path}`).digest("hex").slice(0, 16);
-    expect(existsSync(join(anonymous.commonDir, "pi-subagents-leases", `${key}.lock`))).toBe(true);
-    expect(anonymous).toMatchObject({ named: false, branch: expect.stringMatching(/^pi\//), baseRef: "main" });
-    expect(await cleanupWorktree(pi, repo, anonymous, "done", "agent-0")).toEqual({
-      hasChanges: false, branch: anonymous.branch, path: anonymous.path, retained: true,
+  it("reacquires a retained legacy pi branch and releases leases even when status fails", async () => {
+    const legacy = await create("pi/legacy-agent");
+    legacy.named = false;
+    expect(legacy).toMatchObject({ named: false, branch: "pi/legacy-agent", baseRef: "main" });
+    expect(await cleanupWorktree(pi, repo, legacy, "done", "agent-0")).toEqual({
+      hasChanges: false, branch: legacy.branch, path: legacy.path, retained: true,
     });
-    expect(existsSync(anonymous.path)).toBe(true);
-    await resumeWorktree(pi, anonymous, "resume");
-    expect(anonymous.initialDirty).toBe(false);
-    releaseWorktreeLease(anonymous);
+    expect(existsSync(legacy.path)).toBe(true);
+    await pruneWorktrees(pi, repo);
+    expect(git(repo, "worktree", "list", "--porcelain")).toContain(`worktree ${legacy.path}`);
+    await resumeWorktree(pi, legacy, "resume");
+    const key = createHash("sha256").update(`path:${legacy.path}`).digest("hex").slice(0, 16);
+    expect(existsSync(join(legacy.commonDir, "pi-subagents-leases", `${key}.lock`))).toBe(true);
+    expect(legacy.initialDirty).toBe(false);
+    releaseWorktreeLease(legacy);
     const scope = await create("broken");
     writeFileSync(join(scope.path, "keep.txt"), "do not delete");
     writeFileSync(join(scope.path, ".git"), "gitdir: /missing/git-dir");

@@ -56,9 +56,9 @@ criterion, not a request in prose.
   output."*
 - In a workflow: `agent(prompt, { gate: 'npm test' })` — the gate runs in the
   child's effective working directory after it finishes and before worktree
-  settlement or lease release. For agent-created worktrees, background jobs are
-  quiesced first; if quiescence cannot be confirmed, the gate does not run.
-  Named worktrees skip implicit job control. A non-zero exit fails the agent
+  settlement or lease release. For legacy non-named worktrees, background jobs
+  are quiesced first; if quiescence cannot be confirmed, the gate does not run.
+  New caller-selected worktrees skip implicit job control. A non-zero exit fails the agent
   and the command output becomes the error.
 - After the fact: run it yourself. One command beats a paragraph of reasoning
   about whether the change is correct.

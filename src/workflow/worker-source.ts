@@ -516,6 +516,9 @@ async function agentIn(scope, prompt, opts) {
       throw new Error("agent() opts.gate cannot be combined with opts.resume.");
     }
   }
+  if (isolation === "worktree" && branch === undefined) {
+    throw new Error('Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).');
+  }
 
   // An explicit opts.phase files this agent under that phase without moving
   // the ambient one, so a stray verify step does not re-point the phases that

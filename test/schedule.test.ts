@@ -399,7 +399,7 @@ describe("SubagentScheduler — fire path", () => {
     // Under isolation: "worktree" the agent is not running when spawn() returns
     // — the repo copy is awaited. A failure there must be recorded as a failed
     // run, not as the success the missing run promise would otherwise imply.
-    manager.awaitStartup.mockRejectedValueOnce(new Error('Cannot run with isolation: "worktree"'));
+    manager.awaitStartup.mockRejectedValueOnce(new Error('Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).'));
     const job = scheduler.addJob({
       name: "no-worktree", description: "x", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "x", isolation: "worktree",

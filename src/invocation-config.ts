@@ -25,6 +25,8 @@ import type { AgentConfig, IsolationMode, JoinMode, ModelThinkingLevel } from ".
  * restriction: Claude Code's `Agent` tool states the capability and stops, and
  * a second legal value is what lets a model decline one, not being told to.
  */
+export const WORKTREE_BRANCH_REQUIRED_ERROR = 'Worktree isolation requires an explicit branch; pass branch: "feat/<slug>" (a conventional-commit-style name).';
+
 const isolationParamShape = {
   branch: Type.Optional(Type.String({
     minLength: 1,
@@ -33,7 +35,7 @@ const isolationParamShape = {
   isolation: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("worktree")], {
       description:
-        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" without branch creates a fresh linked worktree on its own branch pi/<agentId>, retained after every outcome; completion reports its path and branch. The agent is told to commit its work on that branch. The extension never pushes, merges, resets, stashes, cleans, or removes anything, and commits on its own only when worktreeAutoCommit is enabled. The orchestrating agent must review the branch and explicitly either integrate it and then remove the worktree, or discard and remove it. With branch, the checked-out workspace is a reusable named workspace. New worktrees cannot see uncommitted or staged changes in the caller; reused named worktrees keep their existing changes.',
+        'Isolation mode. Default "off" unless branch is supplied. "off" runs in the current checkout. "worktree" requires an explicit branch such as "feat/<slug>" (a conventional-commit-style name); it creates or reuses a retained linked worktree on that exact local branch. Completion reports its path and change state. The agent is told to commit logical changes unless its task says otherwise. The extension never pushes, merges, resets, stashes, cleans, or removes anything, and commits on its own only when worktreeAutoCommit is enabled. The orchestrating agent must review the branch and explicitly either integrate it and then remove the worktree, or discard and remove it. New worktrees cannot see uncommitted or staged changes in the caller; reused worktrees keep their existing changes.',
     }),
   ),
 };
@@ -42,14 +44,11 @@ const isolationParamShape = {
  * Build the `isolation` parameter for a tool schema, or nothing when the
  * project disabled worktrees (`worktreeIsolation: false`).
  *
- * Dropping the field beats accepting it and quietly downgrading. The setting is
- * for a project whose model passes `"worktree"` on *every* call, so a
- * per-result "isolation was disabled" note would be noise on every result and
- * would keep raising the salience of a capability that isn't there. With no
- * field there is nothing to pass, nothing to drop, and nothing to explain — the
- * same trade `scheduleParam` makes for disabled scheduling, at zero LLM-context
- * cost. The resolver gate and the `agent-manager` check still cover the paths a
- * schema can't reach: agent files, the scheduler, and cross-extension RPC.
+ * Dropping the field beats advertising a capability the project disabled. The
+ * setting is for a project whose model passes `"worktree"` on *every* call, so
+ * a per-result disablement note would be noise. Cached tool requests, agent
+ * files, schedules and RPC calls still reach runtime validation and fail rather
+ * than silently running in the shared checkout.
  *
  * Like `scheduleParam`, this is read once at tool registration — flipping the
  * setting needs a new pi session for the schema to change.
@@ -95,13 +94,7 @@ export function resolveBranch(
 }
 
 interface ResolveOptions {
-  /**
-   * Whether worktree isolation is permitted at all. False when the project set
-   * `worktreeIsolation: false`, which drops a requested worktree rather than
-   * failing the call: the fail-loud precedent covers spawns that *cannot* work,
-   * while this one is the user opting out, and throwing would break exactly the
-   * calls the `"off"` value exists to tolerate. Defaults to allowed.
-   */
+  /** Whether worktree isolation is permitted at all. Defaults to allowed. */
   worktreeAllowed?: boolean;
   /**
    * What an unqualified spawn means — neither the call nor the agent file said.
@@ -149,6 +142,9 @@ export function resolveAgentInvocationConfig(
   // a value. Everything downstream then sees "worktree" or nothing at all.
   const branch = resolveBranch(params.branch, params.isolation, agentConfig?.isolation, opts?.worktreeAllowed !== false);
   const requested = agentConfig?.isolation ?? params.isolation;
+  if (requested === "worktree" && branch === undefined) {
+    throw new Error(WORKTREE_BRANCH_REQUIRED_ERROR);
+  }
   const isolation = branch !== undefined || (requested === "worktree" && opts?.worktreeAllowed !== false)
     ? "worktree" : undefined;
 

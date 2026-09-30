@@ -309,13 +309,8 @@ describe("toolDescriptionMode", () => {
     });
   });
 
-  // The schema half of `worktreeIsolation: false` shipped without the prose
-  // half: `isolationParam` dropped the field while both descriptions kept
-  // telling the model to pass it. Nothing rejects the undeclared key (TypeBox
-  // sets no additionalProperties: false) and, by design, nothing notes the
-  // downgrade on the result — so the model had every reason to report a
-  // `pi-agent-*` branch that was never created. Schema and prose have to move
-  // together, which is why both are asserted here.
+  // Worktree parameter schema and prose are gated together; stale requests are
+  // rejected rather than reporting a workspace that was never created.
   describe("worktreeIsolation gates the isolation parameter and its prose", () => {
     const props = (tools: Map<string, any>) =>
       Object.keys(tools.get("Agent").parameters?.properties ?? {});
@@ -326,11 +321,11 @@ describe("toolDescriptionMode", () => {
       expect(props(tools)).toContain("branch");
       const description: string = tools.get("Agent").description;
       expect(description).toContain('Use isolation: "worktree"');
-      expect(description).toContain("fresh linked worktree on its own branch");
+      expect(description).toContain('explicit branch: branch: "feat/<slug>"');
       expect(description).toContain("completion reports its path");
-      expect(description).toContain("The agent is told to commit its work on that branch");
-      expect(description).toContain("either integrate it (merge, rebase or cherry-pick) and then remove the worktree, or discard and remove it");
-      expect(description).toContain("reusable named workspace");
+      expect(description).toContain("The agent commits logical changes unless the task says otherwise");
+      expect(description).toContain("review the branch and explicitly integrate or discard it");
+      expect(description).toContain("retained named workspace");
       expect(description).not.toContain("disposable");
       expect(description).not.toContain("reported pi-agent-*");
     });
@@ -342,25 +337,22 @@ describe("toolDescriptionMode", () => {
       expect(names).not.toContain("branch");
       expect(tools.get("Agent").description).not.toContain("isolation");
       expect(tools.get("Agent").description).not.toContain("retained workspace");
-      // One field, not the tool — and the neighbouring gate is unaffected.
       expect(names).toEqual(expect.arrayContaining(["prompt", "description", "subagent_type", "schedule"]));
     });
 
-    it("drops the compact description's bullet too", () => {
+    it("documents explicit branches in the compact description too", () => {
       const enabled = setup({ toolDescriptionMode: "compact" });
       const description: string = enabled.get("Agent").description;
-      expect(description).toContain('isolation: "worktree"');
-      expect(description).toContain("fresh linked worktree on its own branch");
+      expect(description).toContain('isolation: "worktree" requires branch: "feat/<slug>"');
       expect(description).toContain("reports its path");
-      expect(description).toContain("review, integrate the branch, then remove the worktree, or discard it");
-      expect(description).toContain("reusable named workspace");
+      expect(description).toContain("review the branch and explicitly integrate or discard it");
+      expect(description).toContain("retained named workspace");
       expect(description).not.toContain("disposable");
     });
 
     it("compact mode says nothing about isolation when disabled", () => {
       const tools = setup({ toolDescriptionMode: "compact", worktreeIsolation: false });
       expect(tools.get("Agent").description).not.toContain("isolation");
-      // The bullet above it survives — the gate trims a suffix, not the list.
       expect(tools.get("Agent").description).toContain("resume continues a previous agent by ID");
     });
   });

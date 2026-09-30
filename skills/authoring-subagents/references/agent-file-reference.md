@@ -54,7 +54,7 @@ All optional.
 | `skills` | `true` | `true` inherits the parent's skills, `false` none, a comma-separated list preloads **only** those into the system prompt. |
 | `memory` | — | `project` \| `local` \| `user`. Read-only automatically for agents without `write`/`edit`. |
 | `disallowed_tools` | — | Denied even if an extension provides them. Also respected when deciding memory write capability. |
-| `isolation` | — | `worktree` for a retained worktree on `pi/<agentId>` when no `branch` is supplied, or `off` to veto worktrees (authoritative — a caller's `branch` against it errors). |
+| `isolation` | — | `worktree` to require a caller-supplied `branch` for each run, or `off` to veto worktrees (authoritative — a caller's `branch` against it errors). |
 | `model` | inherit | Scalar alias for `models: [model]`. Canonical `provider/modelId[:thinking]` only. Cannot combine with `models`. |
 | `models` | inherit | Ordered, non-empty fallback list. Each entry may carry a `:level` suffix. |
 | `thinking` | inherit | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. A candidate's suffix wins for that candidate; pi clamps unsupported levels down. |
@@ -188,11 +188,13 @@ Default-off. `allowed_subagents` injects ownership-scoped `Agent`,
 
 ## Isolation and worktrees
 
-- `isolation: worktree` in frontmatter gives every run a retained worktree on a
-  real branch. Without a caller-supplied `branch`, that branch is `pi/<agentId>`.
-  The injected scope asks the agent to commit logical conventional commits unless
-  its task says not to; `worktreeAutoCommit` can additionally commit dirty trees
-  at settlement. The extension never pushes, merges or removes the worktree.
+- `isolation: worktree` in frontmatter requires the caller to supply a `branch`
+  on each run. The branch is an exact local name, e.g. `feat/<slug>`, and its
+  retained worktree can be reused by later agents. The injected scope asks the
+  agent to commit logical conventional commits unless its task says not to;
+  `worktreeAutoCommit` can additionally commit dirty trees at settlement. The
+  extension never pushes, merges or removes worktrees. Existing retained `pi/*`
+  worktrees remain available for resume and restore.
 - `isolation: off` **vetoes** worktrees for this agent. An explicit caller
   `branch` against that veto is an error, not an unisolated run.
 - A fresh worktree never contains the caller's uncommitted or staged changes — so

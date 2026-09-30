@@ -72,11 +72,13 @@ describe("Agent tool → persisted scheduled job", () => {
       thinking: "high",
       isolated: true,
       isolation: "worktree",
+      branch: "feat/scheduled",
     });
     try {
       expect(job.thinking).toBe("high");
       expect(job.isolated).toBe(true);
       expect(job.isolation).toBe("worktree");
+      expect(job.branch).toBe("feat/scheduled");
       expect(job.prompt).toBe("do the thing");
       expect(job.enabled).toBe(true);
     } finally {

@@ -183,7 +183,7 @@ describe("gate", () => {
 
     await run(
       [
-        'await agent("in a worktree", { gate: "npm test", isolation: "worktree" });',
+        'await agent("in a worktree", { gate: "npm test", isolation: "worktree", branch: "feat/borrowed" });',
         'await agent("in the main tree", { gate: "npm test" });',
         "return null;",
       ].join("\n"),
@@ -208,7 +208,7 @@ describe("gate", () => {
     });
 
     const result = await run(
-      'return await agent("x", { gate: "npm test", isolation: "worktree" });',
+      'return await agent("x", { gate: "npm test", isolation: "worktree", branch: "feat/borrowed" });',
       { host },
     );
 
@@ -224,7 +224,7 @@ describe("gate", () => {
     });
 
     const result = await run(
-      'return await agent("x", { gate: "npm test", isolation: "worktree" });',
+      'return await agent("x", { gate: "npm test", isolation: "worktree", branch: "feat/borrowed" });',
       { host },
     );
 
