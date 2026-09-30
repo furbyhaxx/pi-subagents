@@ -75,6 +75,24 @@ function valueText(value: unknown): string {
   }
 }
 
+/**
+ * Cap on the wrapped lines one blackboard value may contribute, applied before
+ * the wrap rather than after it.
+ *
+ * A value is arbitrary JSON — anything non-string goes through
+ * `JSON.stringify(value, null, 2)` — so its size is not bounded by construction,
+ * and both the detail pane and the value pane are redrawn on every frame and on
+ * every keypress. Wrapping first and slicing afterwards did all of that work and
+ * then discarded nearly all of it: the pane is a few dozen rows tall.
+ */
+const MAX_VALUE_LINES = 200;
+
+function valueBodyLines(value: unknown, width: number): { lines: string[]; truncated: boolean } {
+  const lines = sanitizeTerminalText(valueText(value), true)
+    .flatMap(line => wrapTextWithAnsi(line || " ", width));
+  return { lines: lines.slice(0, MAX_VALUE_LINES), truncated: lines.length > MAX_VALUE_LINES };
+}
+
 function parseValue(text: string): unknown {
   try {
     return JSON.parse(text) as unknown;
@@ -127,7 +145,7 @@ function relative(timestamp: number, now: number): string {
   return `${Math.floor(seconds / 86_400)}d`;
 }
 
-function detailRows(entry: BlackboardEntry, width: number, sessionId: string, now: number, panelWidth: number, full = false): WorkflowCardLine[] {
+function detailRows(entry: BlackboardEntry, width: number, sessionId: string, now: number, panelWidth: number): WorkflowCardLine[] {
   const rows: WorkflowCardLine[] = [];
   const suffix = panelWidth >= 48;
   const session = entry.authorSessionId === null
@@ -151,10 +169,9 @@ function detailRows(entry: BlackboardEntry, width: number, sessionId: string, no
     field("ttl", `${amount} left · expires ${swissDate(entry.expiresAt, now, false)}`, left < 60_000 ? "warning" : "muted");
   }
   rows.push([{ text: "value", color: "dim" }]);
-  const valueLines = sanitizeTerminalText(valueText(entry.value), true).flatMap(line => wrapTextWithAnsi(line || " ", Math.max(1, width - 2)));
-  const capped = full ? valueLines : valueLines.slice(0, 200);
-  for (const line of capped) rows.push([{ text: `  ${line}` }]);
-  if (!full && valueLines.length > 200) rows.push([{ text: "… truncated. Press o for the full value.", color: "dim" }]);
+  const valueLines = valueBodyLines(entry.value, Math.max(1, width - 2));
+  for (const line of valueLines.lines) rows.push([{ text: `  ${line}` }]);
+  if (valueLines.truncated) rows.push([{ text: "… truncated. Press o for the full value.", color: "dim" }]);
   return rows;
 }
 
@@ -304,12 +321,17 @@ export class BlackboardPanel implements Component {
     let hint: string;
     if (this.layer === "value") {
       const entry = this.selectedEntry();
-      const lines: WorkflowCardLine[] = entry ? [
-        [{ text: truncateLeft(`${singleLine(entry.topic)}/${singleLine(entry.key)}`, contentWidth), color: "muted", bold: true }],
-        [{ text: "Value is shown as plain text so the terminal can select and copy it.", color: "dim" }],
-        [],
-        ...sanitizeTerminalText(valueText(entry.value), true).flatMap(line => wrapTextWithAnsi(line || " ", contentWidth).map(text => [{ text }] satisfies WorkflowCardLine)),
-      ] : [];
+      let lines: WorkflowCardLine[] = [];
+      if (entry) {
+        const value = valueBodyLines(entry.value, contentWidth);
+        lines = [
+          [{ text: truncateLeft(`${singleLine(entry.topic)}/${singleLine(entry.key)}`, contentWidth), color: "muted", bold: true }],
+          [{ text: "Value is shown as plain text so the terminal can select and copy it.", color: "dim" }],
+          [],
+          ...value.lines.map(text => [{ text }] satisfies WorkflowCardLine),
+          ...(value.truncated ? [[{ text: `… truncated at ${MAX_VALUE_LINES} lines.`, color: "dim" }] satisfies WorkflowCardLine] : []),
+        ];
+      }
       body = this.scrollRows(lines, geometry.bodyRows);
       hint = "↑↓ scroll · esc back";
     } else if (this.layer === "help") {

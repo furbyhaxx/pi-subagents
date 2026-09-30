@@ -293,12 +293,95 @@ export function clampLine(line: WorkflowCardLine, width: number): WorkflowCardLi
 const lineWidth = (line: WorkflowCardLine) => line.reduce((sum, s) => sum + visibleWidth(s.text), 0);
 
 /**
+ * Everything `buildWorkflowCard` reads besides the progress array, captured so a
+ * later call can prove it would build the identical card.
+ */
+/**
+ * Everything `buildWorkflowCard` reads besides the progress array, captured so a
+ * later call can prove it would build the identical card.
+ */
+interface LayoutKey {
+  progressLength: number;
+  task: WorkflowCardTask;
+  meta: WorkflowMeta | undefined;
+  agentCount: number | undefined;
+  totalTokens: number | undefined;
+  agentCap: number | undefined;
+  tokenCap: number | undefined;
+  width: number;
+  nowBucket: number;
+  ascii: boolean;
+  showToolTitle: boolean;
+}
+
+const layoutCache = new WeakMap<readonly WorkflowEntry[], { key: LayoutKey; lines: WorkflowCardLine[] }>();
+
+/**
+ * Build the card, reusing the last layout when nothing that feeds it has moved.
+ *
+ * A workflow tool result stays in scrollback for the rest of the session and is
+ * re-laid-out on every conversation frame, and each layout is O(progress
+ * entries) — so a session with many runs pays that on every keystroke and on
+ * every other widget's tick, growing without bound. The inputs are exactly
+ * those in `LayoutKey`; the progress array is the WeakMap key, and its length
+ * is a sound version of it because the runtime appends in place rather than
+ * replacing it.
+ *
+ * `nowBucket` is the one deliberately coarse field. It only moves the layout
+ * while a run is live and its elapsed string is still counting; once
+ * `endTime` is set the card is frozen and the clock is dropped from the key
+ * entirely, so a settled card stays cached instead of being rebuilt once a
+ * second for the rest of the session.
+ */
+export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[] {
+  const now = input.now ?? Date.now();
+  const key: LayoutKey = {
+    progressLength: input.progress.length,
+    task: input.task,
+    meta: input.meta,
+    agentCount: input.agentCount,
+    totalTokens: input.totalTokens,
+    agentCap: input.agentCap,
+    tokenCap: input.tokenCap,
+    width: Math.max(1, input.width ?? DEFAULT_WIDTH),
+    nowBucket: input.task.endTime === undefined ? Math.floor(now / WORKFLOW_TICK_MS) : 0,
+    ascii: input.ascii === true,
+    showToolTitle: input.showToolTitle === true,
+  };
+  const cached = layoutCache.get(input.progress);
+  if (cached && sameLayoutKey(cached.key, key)) return cached.lines;
+  const lines = buildWorkflowCard(input);
+  layoutCache.set(input.progress, { key, lines });
+  return lines;
+}
+
+function sameLayoutKey(a: LayoutKey, b: LayoutKey): boolean {
+  return a.progressLength === b.progressLength
+    && a.meta === b.meta
+    && a.agentCount === b.agentCount
+    && a.totalTokens === b.totalTokens
+    && a.agentCap === b.agentCap
+    && a.tokenCap === b.tokenCap
+    && a.width === b.width
+    && a.nowBucket === b.nowBucket
+    && a.ascii === b.ascii
+    && a.showToolTitle === b.showToolTitle
+    && a.task.status === b.task.status
+    && a.task.workflowName === b.task.workflowName
+    && a.task.summary === b.task.summary
+    && a.task.description === b.task.description
+    && a.task.startTime === b.task.startTime
+    && a.task.endTime === b.task.endTime
+    && a.task.totalPausedMs === b.task.totalPausedMs;
+}
+
+/**
  * Build the card.
  *
  * Everything derived — the phase tree, the header counts, the logs, the size
  * warning — comes from `progress.ts`; what happens here is purely arrangement.
  */
-export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[] {
+function buildWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[] {
   const glyphs = input.ascii ? ASCII_GLYPHS : UNICODE_GLYPHS;
   const width = Math.max(1, input.width ?? DEFAULT_WIDTH);
   const now = input.now ?? Date.now();
