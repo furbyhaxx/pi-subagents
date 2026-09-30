@@ -13,7 +13,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { clampThinkingLevel, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type SessionEntry, type SessionInfo, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
@@ -47,12 +47,14 @@ import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, getSessionArtifactDirectory, getWorktreeDirectory, sessionArtifactRoot, sessionTaskDir, setOutputTranscriptDefault, setSessionArtifactDirectory, setWorktreeDirectory, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getSessionModelCandidates, type RetryModelCandidate, replaceSessionModelCandidates } from "./pi-retry-adapter.js";
+import { getPromptEditor, setPromptEditor } from "./prompt-editor.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { resolveSubagentSessionDir } from "./session-dir.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, readScopeSettings, type SettingsScope, type SubagentsSettings, saveAndEmitChanged, settingsPath, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type ViewerViewMode, type WidgetMode } from "./types.js";
+import { type AgentScope, editAgentDefinition, type ModelOption } from "./ui/agent-editor.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -659,7 +661,7 @@ export default function (pi: ExtensionAPI) {
    */
   function chooseViewerMarkdown(mode: ViewerMarkdownMode, ctx?: ExtensionCommandContext): void {
     setViewerMarkdown(mode);
-    persistSettings(ctx, `Viewer markdown set to ${mode}`);
+    persistSettings(ctx, `Viewer markdown set to ${mode}`, { viewerMarkdown: mode });
   }
   /** Which view the conversation viewer opens in. Read through a getter, as above. */
   let viewerMode: ViewerViewMode = "steps";
@@ -668,7 +670,7 @@ export default function (pi: ExtensionAPI) {
   /** The viewer's `Tab` key, from either entry point — see `chooseViewerMarkdown`. */
   function chooseViewerMode(mode: ViewerViewMode, ctx?: ExtensionCommandContext): void {
     setViewerMode(mode);
-    persistSettings(ctx, `Viewer opens in ${mode} view`);
+    persistSettings(ctx, `Viewer opens in ${mode} view`, { viewerMode: mode });
   }
   const pendingUsage = new PendingUsagePool();
 
@@ -1631,7 +1633,7 @@ export default function (pi: ExtensionAPI) {
   // there is no second door into the same machinery.
   //
   // `workflowsPinned` records that the answer came from the user — a boolean in
-  // subagents.json, or the settings toggle — rather than from this default. It
+  // subagents.yaml, or the settings toggle — rather than from this default. It
   // is what `resolveWorkflowCollisions` checks before yielding to another
   // extension's workflow tool: a default may be overridden by what else is
   // loaded, an explicit choice may not.
@@ -1648,7 +1650,7 @@ export default function (pi: ExtensionAPI) {
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
   // Plan) are not registered. User-defined agents from project/global custom
   // agent dirs are completely unaffected — only DEFAULT_AGENTS are suppressed.
-  // Defaults to false; opt-in via `/agents → Settings` or subagents.json.
+  // Defaults to false; opt-in via `/agents → Settings` or subagents.yaml.
   // State lives in agent-types.ts (isDefaultsDisabled) because registerAgents
   // needs it; this wrapper just re-registers after flipping it.
   function setDisableDefaultAgents(b: boolean): void {
@@ -1966,6 +1968,7 @@ export default function (pi: ExtensionAPI) {
       setShowModel,
       setViewerMarkdown,
       setViewerMode,
+      setPromptEditor,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
@@ -3275,7 +3278,7 @@ Terse command-style prompts produce shallow, generic work.
     if (!isWorkflowsEnabled()) {
       report(
         `--${WORKFLOW_FILE_FLAG} ignored: workflows are off. Turn them on in /agents → Settings → Workflows, ` +
-          'or set `"workflowsEnabled": true` in .pi/subagents.json.',
+          'or set `workflowsEnabled: true` in .pi/subagents.yaml.',
         "warning",
       );
       return;
@@ -4042,14 +4045,7 @@ Terse command-style prompts produce shallow, generic work.
     if (!choice || choice === "Back") return;
 
     if (choice === "Edit" && file) {
-      const content = readFileSync(file.path, "utf-8");
-      const edited = await ctx.ui.editor(`Edit ${name}`, content);
-      if (edited !== undefined && edited !== content) {
-        const { writeFileSync } = await import("node:fs");
-        writeFileSync(file.path, edited, "utf-8");
-        reloadCustomAgents();
-        ctx.ui.notify(`Updated ${file.path}`, "info");
-      }
+      await editAgentFile(ctx, name, cfg);
     } else if (choice === "Delete") {
       if (file) {
         const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
@@ -4073,6 +4069,50 @@ Terse command-style prompts produce shallow, generic work.
     } else if (choice === "Enable") {
       await enableAgent(ctx, name);
     }
+  }
+
+  /**
+   * Edit an agent through the field form, and write wherever its save was aimed.
+   *
+   * The starting scope is where the file already lives, so opening the editor
+   * and pressing Ctrl+S writes back where it came from; `Tab` retargets the
+   * save at the other scope, which is how a project agent becomes a personal
+   * one (and the reverse) without hand-editing YAML.
+   */
+  async function editAgentFile(ctx: ExtensionCommandContext, name: string, cfg: AgentConfig) {
+    const file = locateAgentFile(name, cfg.sourcePath);
+    const scopeFor = (path: string | undefined): AgentScope =>
+      path?.startsWith(personalAgentsDir() + sep) ? "user" : "project";
+    const initialScope = scopeFor(file?.path);
+    const original = file ? readFileSync(file.path, "utf-8") : serializeAgentFile(cfg);
+
+    const result = await editAgentDefinition({
+      ctx,
+      type: name,
+      original,
+      originalPath: file?.path,
+      initialScope,
+      pathFor: (scope: AgentScope) => join(scope === "user" ? personalAgentsDir() : projectAgentsDir(), `${name}.md`),
+      models: registryModels(ctx),
+    });
+    if (result.action !== "save") return;
+
+    mkdirSync(dirname(result.path), { recursive: true });
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(result.path, result.content, "utf-8");
+    reloadCustomAgents();
+    ctx.ui.notify(`Updated ${result.path}`, "info");
+  }
+
+  /** Registry models as picker options. Available-only: an unconfigured model cannot be run. */
+  function registryModels(ctx: ExtensionCommandContext): ModelOption[] {
+    const registry = ctx.modelRegistry as unknown as ModelRegistry;
+    const all = (registry.getAvailable?.() ?? registry.getAll()) as { id: string; name?: string; provider: string }[];
+    return all.map(model => ({
+      id: `${model.provider}/${model.id}`,
+      name: model.name ?? model.id,
+      provider: model.provider,
+    }));
   }
 
   /** Eject a default agent: write its embedded config as a .md file. */
@@ -4364,77 +4404,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ctx.ui.notify(`Created ${targetPath}`, "info");
   }
 
-  /**
-   * Every settings mutation writes this WHOLE object back to disk, so a field
-   * missing here is erased from the user's subagents.json the next time they
-   * toggle something unrelated. `SubagentsSettings` has every field optional,
-   * so a `: SubagentsSettings` return annotation would let a newly-added setting
-   * be forgotten here and still type-check. `satisfies` instead: it still checks
-   * each value's type and rejects a mistyped key, but leaves the return type
-   * inferred so `_NoMissingSettingsKeys` below can check completeness.
-   */
-  function snapshotSettings() {
-    return {
-      messaging: messagingSettings,
-      maxConcurrent: manager.getMaxConcurrent(),
-      // 0 = unlimited, and the default — see SubagentsSettings.
-      maxConcurrentForeground: manager.getMaxConcurrentForeground(),
-      stallThresholdMinutes: manager.getStallThresholdMinutes(),
-      // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
-      // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
-      defaultMaxTurns: getDefaultMaxTurns() ?? 0,
-      maxRetries: getMaxRetries(),
-      maxModelWraparounds: getMaxModelWraparounds(),
-      graceTurns: getGraceTurns(),
-      defaultJoinMode: getDefaultJoinMode(),
-      backgroundByDefault: getBackgroundByDefault(),
-      schedulingEnabled: isSchedulingEnabled(),
-      scopeModels: isScopeModelsEnabled(),
-      strictAgentFiles,
-      disableDefaultAgents: isDefaultsDisabled(),
-      toolDescriptionMode: getToolDescriptionMode(),
-      fleetView: isFleetViewEnabled(),
-      agentMentions: getAgentMentionMode(),
-      rememberAgents: getRememberAgents(),
-      widgetMode: getWidgetMode(),
-      outputTranscript: getOutputTranscriptDefault(),
-      sessionArtifactDirectory: getSessionArtifactDirectory(),
-      worktreeDirectory: getWorktreeDirectory(),
-      worktreeIsolation: isWorktreeIsolationEnabled(),
-      worktreeAutoCommit: isWorktreeAutoCommitEnabled(),
-      // The user's answer, not the effective one. A stand-down for another
-      // extension's workflow tool is scoped to the session it was detected in;
-      // writing it here would let an unrelated settings change three menus away
-      // freeze it into the file as an explicit `false`, which then survives
-      // uninstalling the extension it was deferring to. undefined is dropped by
-      // JSON.stringify, so unset stays unset — same reasoning as
-      // `fallbackSubagent` below.
-      workflowsEnabled: isWorkflowsPinned() ? isWorkflowsEnabled() : undefined,
-      maxSubagentDepth: getMaxSubagentDepth(),
-      // Deliberately NOT `?? "general-purpose"`: every settings change writes the
-      // whole snapshot, and materializing the implicit default would turn it into
-      // explicit configuration — which then fails loudly if general-purpose later
-      // goes away. undefined is dropped by JSON.stringify.
-      fallbackSubagent: getFallbackSubagent(),
-      reportUsage: isReportUsageEnabled(),
-      showCost: isShowCostEnabled(),
-      showModel: isShowModelEnabled(),
-      viewerMarkdown: getViewerMarkdown(),
-      viewerMode: getViewerMode(),
-    } satisfies SubagentsSettings;
-  }
-
-  // Compile-time completeness guard for snapshotSettings(). If a field is added
-  // to SubagentsSettings and not mirrored above, this Exclude is non-empty and
-  // fails to satisfy `never` — turning a silent settings-erasure bug into a
-  // typecheck error. `npm run typecheck` runs in CI.
-  type _NoMissingSettingsKeys =
-    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings>> extends never
-      ? true
-      : ["snapshotSettings() is missing a SubagentsSettings key"];
-  const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;
-  void _settingsSnapshotIsComplete;
-
   const NUMERIC_IDS = new Set([
     "maxConcurrent", "maxConcurrentForeground", "stallThresholdMinutes", "defaultMaxTurns", "maxRetries", "maxModelWraparounds", "graceTurns", "maxSubagentDepth",
   ]);
@@ -4454,7 +4423,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         worktreeContainer = join(worktreeContainer, createHash("sha256").update(identity).digest("hex").slice(0, 16));
       } else worktreeContainer += " (repository identity unavailable)";
     }
-    function buildItems(): SettingItem[] {
+    function rawItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
       const mcf = manager.getMaxConcurrentForeground();
       const stm = manager.getStallThresholdMinutes();
@@ -4711,22 +4680,65 @@ Write the file using the write tool. Only write the file, nothing else.`;
           currentValue: getToolDescriptionMode(),
           values: ["full", "compact", "custom"],
         },
+        {
+          id: "promptEditor",
+          label: "Prompt editor",
+          description: "Command that edits an agent's system prompt outside the TUI, e.g. `code --wait`. Empty falls back to $VISUAL then $EDITOR, and to the inline editor when neither is set. The editor only ever sees the prompt body, never the frontmatter.",
+          currentValue: getPromptEditor() ?? "",
+          values: [getPromptEditor() ?? ""],
+        },
       ];
     }
 
-    function applyValue(id: string, value: string) {
+    /** \`rawItems\` with the staged draft laid over it. */
+    function buildItems(): SettingItem[] {
+      return rawItems().map((item) => {
+        const staged = draft.get(item.id);
+        return staged ? { ...item, currentValue: staged.text } : item;
+      });
+    }
+
+    /** Rows whose value is typed or chosen in a dialog rather than cycled in place. */
+    const TYPED_ROW_IDS = new Set([...NUMERIC_IDS, "sessionArtifactDirectory", "worktreeDirectory", "promptEditor"]);
+
+    const NUMERIC_LABELS: Record<string, string> = {
+      maxConcurrent: "Max concurrency (1+)",
+      maxConcurrentForeground: "Max foreground concurrency (0 = unlimited)",
+      stallThresholdMinutes: "Stall threshold (minutes, 0 = disabled)",
+      defaultMaxTurns: "Default max turns (0 = unlimited)",
+      maxRetries: "Model retries (0–100)",
+      maxModelWraparounds: "Model wraparounds (0–100)",
+      graceTurns: "Grace turns (1+)",
+      maxSubagentDepth: "Nested depth (0/1 = nesting off)",
+    };
+
+    /** Prompt for a numeric row, re-asking until the value parses. Esc cancels. */
+    async function promptNumeric(ctx: ExtensionCommandContext, id: string): Promise<string | undefined> {
+      const label = NUMERIC_LABELS[id];
+      let input = await ctx.ui.input(label, displayed(id, rawItems().find(item => item.id === id)?.currentValue ?? ""));
+      while (input != null) {
+        const trimmed = input.trim();
+        if (trimmed !== "" && Number.isInteger(Number(trimmed))) return trimmed;
+        // Invalid — re-prompt with the user's last entry so they can edit it.
+        input = await ctx.ui.input(label, trimmed);
+      }
+      return undefined;
+    }
+
+    /** Apply one setting to this session only, and describe it. Persistence is the caller's job. */
+    function applyValue(id: string, value: string): string | undefined {
       if (id === "maxConcurrent") {
         const n = parseInt(value, 10);
         if (n >= 1) {
           manager.setMaxConcurrent(n);
-          notifyApplied(ctx, `Max concurrency set to ${n}`);
+          return (`Max concurrency set to ${n}`);
         }
       } else if (id === "maxConcurrentForeground") {
         // 0 is meaningful here, unlike maxConcurrent above: it means unlimited.
         const n = parseInt(value, 10);
         if (n >= 0) {
           manager.setMaxConcurrentForeground(n);
-          notifyApplied(ctx, n === 0
+          return (n === 0
             ? "Max foreground concurrency set to unlimited"
             : `Max foreground concurrency set to ${n}`);
         }
@@ -4734,60 +4746,54 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const n = parseInt(value, 10);
         if (n >= 0) {
           manager.setStallThresholdMinutes(n);
-          notifyApplied(ctx, n === 0 ? "Stall visibility disabled" : `Stall threshold set to ${n} minutes`);
           widget.update();
           fleet.update();
+          return (n === 0 ? "Stall visibility disabled" : `Stall threshold set to ${n} minutes`);
         }
       } else if (id === "defaultMaxTurns") {
         const n = parseInt(value, 10);
         if (n === 0) {
           setDefaultMaxTurns(undefined);
-          notifyApplied(ctx, "Default max turns set to unlimited");
+          return ("Default max turns set to unlimited");
         } else if (n >= 1) {
           setDefaultMaxTurns(n);
-          notifyApplied(ctx, `Default max turns set to ${n}`);
+          return (`Default max turns set to ${n}`);
         }
       } else if (id === "maxRetries") {
         const n = parseInt(value, 10);
         if (n >= 0 && n <= 100) {
           setMaxRetries(n);
-          notifyApplied(ctx, `Model retries set to ${n}`);
+          return (`Model retries set to ${n}`);
         }
       } else if (id === "maxModelWraparounds") {
         const n = parseInt(value, 10);
         if (n >= 0 && n <= 100) {
           setMaxModelWraparounds(n);
-          notifyApplied(ctx, `Model wraparounds set to ${n}`);
+          return (`Model wraparounds set to ${n}`);
         }
       } else if (id === "graceTurns") {
         const n = parseInt(value, 10);
         if (n >= 1) {
           setGraceTurns(n);
-          notifyApplied(ctx, `Grace turns set to ${n}`);
+          return (`Grace turns set to ${n}`);
         }
       } else if (id === "maxSubagentDepth") {
         const n = parseInt(value, 10);
         if (n >= 0) {
           setMaxSubagentDepth(n);
-          notifyApplied(
-            ctx,
-            n <= 1
+          return (n <= 1
               ? "Nested delegation disabled"
-              : `Nested depth set to ${n}. Applies to agents started from now on.`,
-          );
+              : `Nested depth set to ${n}. Applies to agents started from now on.`);
         }
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
-        notifyApplied(ctx, `Default join mode set to ${value}`);
+        return (`Default join mode set to ${value}`);
       } else if (id === "backgroundByDefault") {
         const enabled = value === "on";
         setBackgroundByDefault(enabled);
-        notifyApplied(
-          ctx,
-          enabled
+        return (enabled
             ? "Agent calls run in the background unless they pass run_in_background: false"
-            : "Agent calls block and return inline unless they pass run_in_background: true",
-        );
+            : "Agent calls block and return inline unless they pass run_in_background: true");
       } else if (id === "schedulingEnabled") {
         const enabled = value === "on";
         if (enabled === isSchedulingEnabled()) {
@@ -4795,10 +4801,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         } else {
           setSchedulingEnabled(enabled);
           if (!enabled) scheduler.stop();  // immediate kill — outstanding fires stop ticking
-          notifyApplied(
-            ctx,
-            `Scheduling ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
-          );
+          return (`Scheduling ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`);
         }
       } else if (id === "workflowsEnabled") {
         const enabled = value === "on";
@@ -4809,231 +4812,353 @@ Write the file using the write tool. Only write the file, nothing else.`;
           // Runs already in flight keep going: the switch governs whether the
           // tool is offered, and killing live agents on a settings toggle would
           // lose work the user never asked to discard.
-          notifyApplied(
-            ctx,
-            `Workflows ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
-          );
+          return (`Workflows ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`);
         }
       } else if (id === "scopeModels") {
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
-        notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
+        return (`Scope models ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "strictAgentFiles") {
         const enabled = value === "on";
         strictAgentFiles = enabled;
-        notifyApplied(ctx, `Strict agent files ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
+        return (`Strict agent files ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
       } else if (id === "disableDefaultAgents") {
         const enabled = value === "on";
         setDisableDefaultAgents(enabled);
-        notifyApplied(ctx, `Default agents ${enabled ? "disabled" : "enabled"}. Tool spec change takes effect on next pi session.`);
+        return (`Default agents ${enabled ? "disabled" : "enabled"}. Tool spec change takes effect on next pi session.`);
       } else if (id === "fallbackSubagent") {
         setFallbackSubagent(value);
-        notifyApplied(
-          ctx,
-          value === NO_FALLBACK
+        return (value === NO_FALLBACK
             ? "Unknown or disabled agent types will now be rejected"
-            : `Unknown agent types will fall back to ${value}`,
-        );
+            : `Unknown agent types will fall back to ${value}`);
       } else if (id === "outputTranscript") {
         const enabled = value === "on";
         setOutputTranscriptDefault(enabled);
-        notifyApplied(ctx, `Output transcript ${enabled ? "enabled" : "disabled"} by default`);
+        return (`Output transcript ${enabled ? "enabled" : "disabled"} by default`);
       } else if (id === "worktreeIsolation") {
         const enabled = value === "on";
         setWorktreeIsolationEnabled(enabled);
         // The refusal is live, but the tool schema is built at registration, so
         // the isolation parameter only appears/disappears next session.
-        notifyApplied(
-          ctx,
-          `Worktree isolation ${enabled ? "enabled" : "disabled"}. Tool parameter updates on next pi session.`,
-        );
+        return (`Worktree isolation ${enabled ? "enabled" : "disabled"}. Tool parameter updates on next pi session.`);
       } else if (id === "worktreeAutoCommit") {
         const enabled = value === "on";
         setWorktreeAutoCommitEnabled(enabled);
-        notifyApplied(ctx, `Worktree auto-commit ${enabled ? "enabled" : "disabled"}`);
+        return (`Worktree auto-commit ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
-        notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);
+        return (`Tool description set to ${value}. Takes effect on next pi session.`);
       } else if (id === "reportUsage") {
         const enabled = value === "on";
         setReportUsage(enabled);
-        notifyApplied(
-          ctx,
-          enabled
+        return (enabled
             ? "Subagent usage now counted in this session's totals"
-            : "Subagent usage no longer counted in this session's totals",
-        );
+            : "Subagent usage no longer counted in this session's totals");
       } else if (id === "showCost") {
         const enabled = value === "on";
         setShowCost(enabled);
-        notifyApplied(ctx, `Cost display ${enabled ? "enabled" : "disabled"}`);
+        return (`Cost display ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "showModel") {
         const enabled = value === "on";
         setShowModel(enabled);
-        notifyApplied(ctx, `Model display ${enabled ? "enabled" : "disabled"}`);
+        return (`Model display ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "viewerMarkdown") {
         setViewerMarkdown(value as ViewerMarkdownMode);
-        notifyApplied(ctx, `Viewer markdown set to ${value}`);
+        return (`Viewer markdown set to ${value}`);
+      } else if (id === "promptEditor") {
+        // Applies to this session like every other row: the command is read
+        // when the prompt editor is opened, not when the field is typed in.
+        setPromptEditor(value.trim() || undefined);
+        return (`Prompt editor set to ${value.trim() || "$VISUAL, then $EDITOR"}`);
       } else if (id === "viewerMode") {
         setViewerMode(value as ViewerViewMode);
-        notifyApplied(ctx, `Viewer opens in ${value} view`);
+        return (`Viewer opens in ${value} view`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
-        notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
+        return (`Fleet view ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "agentMentions") {
         const mode = value as AgentMentionMode;
         setAgentMentionMode(mode);
-        notifyApplied(
-          ctx,
-          mode === "off"
+        return (mode === "off"
             ? "Agent mentions disabled"
             : mode === "model"
               ? "Agent mentions on — a conversation clone starts a mentioned agent off-screen"
-              : "Agent mentions on — a mentioned agent starts here, with no model call",
-        );
+              : "Agent mentions on — a mentioned agent starts here, with no model call");
       } else if (id === "messagingEnabled") {
         const enabled = value === "on";
         messagingSettings.enabled = enabled;
-        notifyApplied(ctx, `Peer messaging ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
+        return (`Peer messaging ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
       } else if (id === "messagingSurface") {
         messagingSettings.surface = value as MessagingSurface;
-        notifyApplied(ctx, `Message surface set to ${value}. Applies immediately.`);
+        return (`Message surface set to ${value}. Applies immediately.`);
       } else if (id === "rememberAgents") {
         const enabled = value === "on";
         setRememberAgents(enabled);
-        notifyApplied(ctx, `Remember agents ${enabled ? "enabled" : "disabled"}`);
+        return (`Remember agents ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "widgetMode") {
         setWidgetMode(value as WidgetMode);
-        notifyApplied(ctx, `Widget set to ${value}`);
+        return (`Widget set to ${value}`);
       }
     }
 
-    let list: SettingsList;
-    // Track current selection index directly (SettingsList doesn't expose it).
-    // Updated on arrow keys so Enter knows which field is selected immediately.
-    let currentIndex = 0;
+    // ---- Staged edits -------------------------------------------------------
+    // Nothing reaches the session or the file until Ctrl+S. The scope decides
+    // WHICH file a save lands in; the draft is independent of it, so Tab
+    // retargets a save rather than moving the work.
 
-    const result = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
-      const items = buildItems();
+    interface StagedChange {
+      text: string;
+      patch: SubagentsSettings;
+      apply: () => string | undefined;
+    }
 
-      list = new SettingsList(
-        items,
-        items.length + 2,
-        getSettingsListTheme(),
-        (id, newValue) => {
-          if (id === "sessionArtifactDirectory" || id === "worktreeDirectory") done(id);
-          else applyValue(id, newValue);
-        },
-        () => done(undefined as undefined),
+    type SettingsAction =
+      | { kind: "pick"; id: string; value: string }
+      | { kind: "edit"; id: string }
+      | { kind: "scope" }
+      | { kind: "save" }
+      | { kind: "back" };
+
+    let scope: SettingsScope = "user";
+    const draft = new Map<string, StagedChange>();
+
+    const displayed = (id: string, live: string) => draft.get(id)?.text ?? live;
+    const committed = (id: string) => rawItems().find(item => item.id === id)?.currentValue;
+
+    function stage(id: string, change: StagedChange): void {
+      // Staging the value already in effect is not a change: without this,
+      // toggling on → off → on would write a duplicate that shadows the other
+      // scope for no reason, and the footer would claim a pending save.
+      if (change.text === committed(id)) draft.delete(id);
+      else draft.set(id, change);
+    }
+
+    function stageValue(id: string, text: string): void {
+      stage(id, { text, patch: settingsPatchFor(id, text), apply: () => applyValue(id, text) });
+    }
+
+    /**
+     * The typed settings patch for one row.
+     *
+     * Explicit for every row whose key differs from its id, and derived
+     * otherwise. The type of the value matters: sanitize() drops a number
+     * written as a string and a boolean written as "on", silently, so a wrong
+     * guess here loses the setting rather than failing.
+     */
+    function settingsPatchFor(id: string, value: string): SubagentsSettings {
+      switch (id) {
+        case "joinMode":
+          return { defaultJoinMode: value as JoinMode };
+        case "messagingEnabled":
+          return { messaging: { enabled: value === "on" } };
+        case "messagingSurface":
+          return { messaging: { surface: value as MessagingSurface } };
+        case "promptEditor":
+          // Empty means "unset", which deletes the key and restores the
+          // $VISUAL/$EDITOR fallback rather than persisting an empty command.
+          return { promptEditor: value.trim() || undefined };
+        default:
+          break;
+      }
+      if (NUMERIC_IDS.has(id)) return { [id]: Number(value) } as SubagentsSettings;
+      // An on/off row is a boolean setting, derived from its own values so a
+      // newly added one cannot be forgotten here.
+      const item = rawItems().find(candidate => candidate.id === id);
+      if (item?.values?.length === 2 && item.values[0] === "on" && item.values[1] === "off") {
+        return { [id]: value === "on" } as SubagentsSettings;
+      }
+      return { [id]: value } as SubagentsSettings;
+    }
+
+    /** Merge staged patches, one level deep for messaging so two of its keys can be staged at once. */
+    function mergePatch(target: SubagentsSettings, patch: SubagentsSettings): void {
+      for (const [key, value] of Object.entries(patch)) {
+        if (key === "messaging" && typeof value === "object" && value !== null) {
+          target.messaging = { ...target.messaging, ...value };
+        } else {
+          (target as Record<string, unknown>)[key] = value;
+        }
+      }
+    }
+
+    async function saveDraft(): Promise<void> {
+      const entries = [...draft.values()];
+      if (entries.length === 0) return;
+      const patch: SubagentsSettings = {};
+      const messages: string[] = [];
+      for (const entry of entries) {
+        mergePatch(patch, entry.patch);
+        const message = entry.apply();
+        if (message) messages.push(message);
+      }
+      draft.clear();
+      const summary = messages.length === 1 ? messages[0] : `${messages.length} settings updated`;
+      const shadowed = shadowWarning(entries.flatMap(entry => Object.keys(entry.patch)), scope);
+      const { message, level } = saveAndEmitChanged(
+        patch,
+        `${summary} — saved to ${settingsPath(scope)} (${scope} scope)${shadowed}`,
+        (event, payload) => pi.events.emit(event, payload),
+        scope,
       );
+      ctx.ui.notify(message, level);
+    }
 
-      const container = new Container();
-      container.addChild(new Text("⚙  Subagent Settings", 0, 0));
-      container.addChild(new Spacer(1));
-      container.addChild(list);
+    /** Say so when the layer we just wrote is shadowed by the other one. */
+    function shadowWarning(keys: string[], written: SettingsScope): string {
+      const other = written === "user" ? "project" : "user";
+      const layer = readScopeSettings(other);
+      const shadowed = keys.some(key => (layer as Record<string, unknown>)[key] !== undefined);
+      return shadowed ? ` — overridden by the ${other} layer for this project` : "";
+    }
 
-      return {
-        render: (w: number) => container.render(w),
-        invalidate: () => container.invalidate(),
-        handleInput: (data: string) => {
-          // Track navigation so Enter knows the current field
-          if (matchesKey(data, "up")) {
-            currentIndex = Math.max(0, currentIndex - 1);
-          } else if (matchesKey(data, "down")) {
-            currentIndex = Math.min(items.length - 1, currentIndex + 1);
-          }
-
-          // Enter on numeric field → close and prompt for typed input
-          if (matchesKey(data, Key.enter) && NUMERIC_IDS.has(items[currentIndex].id)) {
-            done(items[currentIndex].id);
-            return;
-          }
-          list.handleInput?.(data);
-        },
-      };
-    });
-
-    if (result === "sessionArtifactDirectory" || result === "worktreeDirectory") {
-      if (result === "sessionArtifactDirectory") {
+    async function editDirectoryRow(ctx: ExtensionCommandContext, id: string): Promise<StagedChange | undefined> {
+      if (id === "sessionArtifactDirectory") {
         const choice = await ctx.ui.select("Session artifact directory", ["Default", "Custom path"]);
         if (choice === "Default") {
           // An explicit path also overrides a custom global default; omission
           // would restore that global value on the next load.
-          setSessionArtifactDirectory(defaultArtifactDirectory);
-          notifyApplied(ctx, "Session artifact directory reset. Applies to new sessions only.");
-        } else if (choice === "Custom path") {
-          const input = await ctx.ui.input("Artifact container (absolute or relative to origin project)", getSessionArtifactDirectory());
-          if (input?.trim()) {
-            setSessionArtifactDirectory(input);
-            notifyApplied(ctx, "Session artifact directory updated. Applies to new sessions only.");
-          }
+          const value = defaultArtifactDirectory;
+          return {
+            text: value,
+            patch: { sessionArtifactDirectory: value },
+            apply: () => {
+              setSessionArtifactDirectory(value);
+              return "Session artifact directory reset. Applies to new sessions only.";
+            },
+          };
         }
-      } else {
-        const choice = await ctx.ui.select("Worktree directory", ["Session (default)", "Project (.worktrees)", "Custom path"]);
-        if (choice === "Session (default)" || choice === "Project (.worktrees)") {
-          setWorktreeDirectory({ mode: choice === "Session (default)" ? "session" : "project" });
-          notifyApplied(ctx, "Worktree directory updated. Applies to future acquisitions; existing worktrees are not moved.");
-        } else if (choice === "Custom path") {
-          const input = await ctx.ui.input("Worktree container (absolute or relative to origin repository)", placement.mode === "custom" ? placement.path : undefined);
-          if (input?.trim()) {
-            setWorktreeDirectory({ mode: "custom", path: input });
-            notifyApplied(ctx, "Worktree directory updated. Applies to future acquisitions; existing worktrees are not moved.");
-          }
-        }
+        if (choice !== "Custom path") return undefined;
+        const input = await ctx.ui.input("Artifact container (absolute or relative to origin project)", getSessionArtifactDirectory() ?? defaultArtifactDirectory);
+        const value = input?.trim();
+        if (!value) return undefined;
+        return {
+          text: value,
+          patch: { sessionArtifactDirectory: value },
+          apply: () => {
+            setSessionArtifactDirectory(value);
+            return "Session artifact directory updated. Applies to new sessions only.";
+          },
+        };
       }
-      await showSettings(ctx);
-      return;
+      const choice = await ctx.ui.select("Worktree directory", ["Session (default)", "Project (.worktrees)", "Custom path"]);
+      const moved = "Worktree directory updated. Applies to future acquisitions; existing worktrees are not moved.";
+      if (choice === "Session (default)" || choice === "Project (.worktrees)") {
+        const value = { mode: (choice === "Session (default)" ? "session" : "project") } as const;
+        return { text: value.mode, patch: { worktreeDirectory: value }, apply: () => { setWorktreeDirectory(value); return moved; } };
+      }
+      if (choice !== "Custom path") return undefined;
+      const input = await ctx.ui.input("Worktree container (absolute or relative to origin repository)", placement.mode === "custom" ? placement.path : undefined);
+      const path = input?.trim();
+      if (!path) return undefined;
+      const value = { mode: "custom", path } as const;
+      return { text: path, patch: { worktreeDirectory: value }, apply: () => { setWorktreeDirectory(value); return moved; } };
     }
 
-    // If a numeric field ID was returned, prompt for typed input
-    if (result && NUMERIC_IDS.has(result)) {
-      const current = result === "maxConcurrent"
-        ? String(manager.getMaxConcurrent())
-        : result === "maxConcurrentForeground"
-          ? String(manager.getMaxConcurrentForeground())
-          : result === "stallThresholdMinutes"
-            ? String(manager.getStallThresholdMinutes())
-            : result === "defaultMaxTurns"
-              ? String(getDefaultMaxTurns() ?? 0)
-            : result === "maxRetries"
-              ? String(getMaxRetries())
-              : result === "maxModelWraparounds"
-                ? String(getMaxModelWraparounds())
-                : result === "maxSubagentDepth"
-              ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+    while (true) {
+      let action: SettingsAction | undefined;
+      await ctx.ui.custom<SettingsAction>((_tui, _theme, _kb, done) => {
+        const items = buildItems();
+        let currentIndex = 0;
+        const close = (next: SettingsAction) => {
+          action = next;
+          done(next);
+        };
 
-      const label = result === "maxConcurrent"
-        ? "Max concurrency (1+)"
-        : result === "maxConcurrentForeground"
-          ? "Max foreground concurrency (0 = unlimited)"
-          : result === "stallThresholdMinutes"
-            ? "Stall threshold (minutes, 0 = disabled)"
-            : result === "defaultMaxTurns"
-              ? "Default max turns (0 = unlimited)"
-            : result === "maxRetries"
-              ? "Model retries (0–100)"
-              : result === "maxModelWraparounds"
-                ? "Model wraparounds (0–100)"
-                : result === "maxSubagentDepth"
-              ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+        const list = new SettingsList(
+          items,
+          items.length + 2,
+          getSettingsListTheme(),
+          (id, newValue) => {
+            if (TYPED_ROW_IDS.has(id)) close({ kind: "edit", id });
+            else stageValue(id, newValue);
+          },
+          () => close({ kind: "back" }),
+        );
 
-      // Loop until user enters a valid integer or cancels (Esc / null).
-      // Silently trims whitespace; rejects non-numeric input by re-prompting.
-      let input: string | undefined = await ctx.ui.input(label, current);
-      while (input != null) {
-        const trimmed = input.trim();
-        const n = Number(trimmed);
-        if (trimmed !== "" && Number.isInteger(n)) {
-          applyValue(result, String(n));
-          await showSettings(ctx);
-          return;
-        }
-        // Invalid — re-prompt with the user's last entry so they can edit it
-        input = await ctx.ui.input(label, trimmed);
+        const container = new Container();
+        container.addChild(new Text("⚙  Subagent Settings", 0, 0));
+        container.addChild(new Spacer(1));
+        container.addChild(list);
+
+        return {
+          render: (w: number) => {
+            const theme = getSettingsListTheme();
+            const pending = draft.size;
+            return [
+              ...container.render(w),
+              "",
+              theme.value(`Saving to: ${settingsPath(scope)}`, false),
+              theme.hint(
+                `${pending === 0 ? "no changes" : `${pending} unsaved change${pending === 1 ? "" : "s"}`}`
+                + "   Ctrl+S save · Tab switch scope · Esc back",
+              ),
+            ];
+          },
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            // Scope and save are claimed before the list, which would otherwise
+            // treat Tab and Ctrl+S as navigation.
+            if (matchesKey(data, "ctrl+s")) {
+              close({ kind: "save" });
+              return;
+            }
+            if (matchesKey(data, Key.tab)) {
+              scope = scope === "user" ? "project" : "user";
+              list.invalidate();
+              return;
+            }
+            if (matchesKey(data, "up")) currentIndex = Math.max(0, currentIndex - 1);
+            else if (matchesKey(data, "down")) currentIndex = Math.min(items.length - 1, currentIndex + 1);
+
+            // Enter on a typed row closes the overlay so the dialog can open.
+            if (matchesKey(data, Key.enter) && TYPED_ROW_IDS.has(items[currentIndex].id)) {
+              close({ kind: "edit", id: items[currentIndex].id });
+              return;
+            }
+            list.handleInput?.(data);
+          },
+        };
+      });
+
+      if (action?.kind === "pick") {
+        stageValue(action.id, action.value);
+        continue;
       }
+      if (action?.kind === "scope") continue;
+      if (action?.kind === "save") {
+        await saveDraft();
+        continue;
+      }
+      if (action?.kind === "edit") {
+        const id = action.id;
+        if (id === "sessionArtifactDirectory" || id === "worktreeDirectory") {
+          const change = await editDirectoryRow(ctx, id);
+          if (change) stage(id, change);
+          continue;
+        }
+        if (id === "promptEditor") {
+          const input = await ctx.ui.input("Prompt editor command (empty = $VISUAL then $EDITOR)", getPromptEditor() ?? "");
+          if (input !== undefined) stageValue("promptEditor", input);
+          continue;
+        }
+        const typed = await promptNumeric(ctx, id);
+        if (typed) stageValue(id, typed);
+        continue;
+      }
+      // Back: a pending draft is discarded only on the user's word.
+      if (draft.size === 0) return;
+      const choice = await ctx.ui.select("Unsaved settings", [
+        "Save and close",
+        "Discard and close",
+        "Keep editing",
+      ]);
+      if (choice === "Save and close") {
+        await saveDraft();
+        return;
+      }
+      if (choice === "Keep editing" || choice === undefined) continue;
+      return;
     }
   }
 
@@ -5050,25 +5175,21 @@ Write the file using the write tool. Only write the file, nothing else.`;
    * value is session-only, and swallowing it here would leave a preference
    * looking persisted when the next session will not have it.
    */
-  function persistSettings(ctx: ExtensionCommandContext | undefined, changeMsg: string): void {
+  function persistSettings(
+    ctx: ExtensionCommandContext | undefined,
+    changeMsg: string,
+    patch: SubagentsSettings,
+  ): void {
     const { message, level } = saveAndEmitChanged(
-      snapshotSettings(),
+      patch,
       changeMsg,
       (event, payload) => pi.events.emit(event, payload),
+      "user",
     );
     // `ctx` is absent only on the fleet path between sessions, where
     // `currentCtx` has been cleared and there is no UI to carry the warning to.
     // The write still happens.
     if (level === "warning") ctx?.ui.notify(message, level);
-  }
-
-  function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
-    const { message, level } = saveAndEmitChanged(
-      snapshotSettings(),
-      successMsg,
-      (event, payload) => pi.events.emit(event, payload),
-    );
-    ctx.ui.notify(message, level);
   }
 
   pi.registerCommand("agents", {

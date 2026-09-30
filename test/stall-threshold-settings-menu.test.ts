@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parse } from "yaml";
 import subagentsExtension from "../src/index.js";
 import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
@@ -14,7 +15,7 @@ afterEach(() => {
 });
 
 describe("/agents → Settings stall threshold", () => {
-  it("surfaces the numeric threshold and persists a live change", async () => {
+  it("stages the typed threshold and writes it on save", async () => {
     hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: false } });
     initTheme(undefined, false);
     const booted = makePi();
@@ -42,10 +43,15 @@ describe("/agents → Settings stall threshold", () => {
           (value: unknown) => { result = value; },
         ) as { handleInput?(data: string): void };
         component.handleInput?.("x");
-        if (settingsViews++ === 0) {
+        // Three passes: open the numeric prompt, save what it returned, then
+        // leave — the screen stays open after a save.
+        const pass = settingsViews++;
+        if (pass === 0) {
           component.handleInput?.("\x1b[B");
           component.handleInput?.("\x1b[B");
-          component.handleInput?.("\r");
+          component.handleInput?.("\r"); // Enter on the numeric row → prompt
+        } else if (pass === 1) {
+          component.handleInput?.("\x13"); // Ctrl+S
         } else {
           component.handleInput?.("\x1b");
         }
@@ -60,8 +66,13 @@ describe("/agents → Settings stall threshold", () => {
 
     await command.handler("", context);
 
-    const saved = JSON.parse(readFileSync(`${hermetic.dir}/.pi/subagents.json`, "utf-8")) as Record<string, unknown>;
+    // The menu saves to the user layer by default, and only the staged key.
+    const saved = parse(readFileSync(`${hermetic.agentDir}/subagents.yaml`, "utf-8")) as Record<string, unknown>;
     expect(saved.stallThresholdMinutes).toBe(0);
-    expect(context.ui.notify).toHaveBeenCalledWith("Stall visibility disabled", "info");
+    // One toast for the save, naming the message and the file it landed in.
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Stall visibility disabled"),
+      "info",
+    );
   });
 });

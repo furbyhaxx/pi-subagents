@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { parse } from "yaml";
 import type { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
@@ -1490,14 +1491,18 @@ describe("collisions with another extension", () => {
   /**
    * Drive `/agents → Settings` far enough to write the settings file.
    *
-   * Any change writes the WHOLE snapshot, so which row is toggled does not
-   * matter — row 0 is `Max concurrency`, whose single-value list re-applies the
-   * value it already had. What matters is that the file gets written at all.
+   * A save writes only the rows that changed, so this cycles the requested row
+   * and presses Ctrl+S; the file the menu writes is the user layer, which is
+   * where `/agents → Settings` points by default. The default row is `Show
+   * cost` — a boolean that is off, so cycling it really changes something. A
+   * row that would cycle back to its own value stages nothing and saves
+   * nothing, which is the point of checking the footer before Ctrl+S.
    */
-  async function changeAnUnrelatedSetting(booted: ReturnType<typeof boot>, selectedIndex = 0) {
+  async function changeAnUnrelatedSetting(booted: ReturnType<typeof boot>, selectedIndex = 22) {
     // The settings list asks for a real theme, which only the TUI normally sets up.
     initTheme(undefined, false);
     let built: any;
+    let pass = 0;
     // Take the Settings entry exactly once: the agents menu re-opens after a
     // submenu closes, so answering it every time never terminates.
     let taken = false;
@@ -1511,10 +1516,21 @@ describe("collisions with another extension", () => {
           return options.find(o => o === "Settings");
         }),
         custom: vi.fn(async (factory: any) => {
-          built = factory({ requestRender: () => {} }, {}, {}, () => {});
+          let result: unknown;
+          built = factory({ requestRender: () => {} }, {}, {}, (value: unknown) => { result = value; });
+          if (pass++ > 0) {
+            // The screen stays open after a save, so leave it: nothing is
+            // pending, and Esc closes without asking.
+            built.handleInput("\x1b");
+            return result;
+          }
           for (let i = 0; i < selectedIndex; i++) built.handleInput("\x1b[B");
           built.handleInput(" ");
-          return undefined;
+          if (!built.render(120).join("\n").includes("unsaved change")) {
+            throw new Error(`row ${selectedIndex} staged nothing — the save would be a no-op`);
+          }
+          built.handleInput("\x13"); // Ctrl+S
+          return result;
         }),
         input: vi.fn(async () => undefined),
       },
@@ -1523,8 +1539,13 @@ describe("collisions with another extension", () => {
     return { context, menu: built.render(120).join("\n") };
   }
 
+  /** The file the menu writes: the user layer, its default save target. */
   const savedSettings = () =>
-    JSON.parse(readFileSync(join(hermetic.dir, ".pi", "subagents.json"), "utf-8"));
+    parse(readFileSync(join(hermetic.agentDir, "subagents.yaml"), "utf-8")) as Record<string, unknown>;
+
+  /** The layer these tests seed, and which a user-layer save must leave alone. */
+  const projectSettings = () =>
+    parse(readFileSync(join(hermetic.dir, ".pi", "subagents.yaml"), "utf-8")) as Record<string, unknown>;
 
   it("does not persist a stand-down as an explicit setting", async () => {
     // The stand-down is scoped to the session that detected it. Writing it to
@@ -1545,7 +1566,10 @@ describe("collisions with another extension", () => {
 
     await changeAnUnrelatedSetting(booted);
 
-    expect(savedSettings().workflowsEnabled).toBe(false);
+    // The pin lives in the project layer, and an unrelated save aimed at the
+    // user layer neither overwrites it nor copies it across.
+    expect(projectSettings().workflowsEnabled).toBe(false);
+    expect(savedSettings()).not.toHaveProperty("workflowsEnabled");
   });
 
   it("exposes and preserves worktree auto-commit in the /agents settings menu", async () => {
@@ -1554,7 +1578,7 @@ describe("collisions with another extension", () => {
       const { menu } = await changeAnUnrelatedSetting(booted);
 
       expect(menu).toContain("Worktree auto-commit");
-      expect(savedSettings().worktreeAutoCommit).toBe(true);
+      expect(projectSettings().worktreeAutoCommit).toBe(true);
     } finally {
       setWorktreeAutoCommitEnabled(false);
     }
