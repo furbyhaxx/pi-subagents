@@ -60,9 +60,12 @@ Read the file that covers a surface before changing its behavior; update it in t
 
 ## Git
 
-- **Commits**: Always create granular, conventional commits while you work.
-- **Never push**, tag, or create branches unless the user explicitly asks.
-- Never run history- or worktree-destroying commands: `git reset --hard`, `git checkout .`, `git clean -fd`, `git stash`, `git add -A`, `git add .`, `git commit --no-verify`, or any force push.
+- Commit your own work on the current default branch once the check suite is green. Conventional Commits, imperative subject, no emojis.
+- **Stage explicit paths** (`git add <path>`). Never `git add -A` or `git add .` — several agent sessions share this worktree and their unfinished work must not be swept into your commit.
+- Commit only what you authored in the current session. When a file also carries another session's uncommitted work, stage only your hunks (`git diff -U0` + `git apply --cached --unidiff-zero`) and leave their hunks untouched.
+- Commit bodies are checked by commitlint (`body-max-line-length` 100) — wrap them. Never `git commit --no-verify`; fix the failure instead.
+- Push the current branch after committing and confirm the remote ref matches (`git ls-remote origin <branch>`). Don't create branches or tags, and never force push.
+- Never run history- or worktree-destroying commands: `git reset --hard`, `git checkout .`, `git clean -fd`, `git stash`, or any force push.
 - Leave the working tree as the user left it — don't stage, stash, or revert files you didn't change. 
 
 ## Issues and PRs
