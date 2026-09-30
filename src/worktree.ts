@@ -91,7 +91,7 @@ export interface WorktreeInfo {
 
 /**
  * Project-wide switch for worktree isolation (`worktreeIsolation` in
- * subagents.json). Default `true` — unchanged behaviour.
+ * subagents.yaml). Default `true` — unchanged behaviour.
  *
  * The `"off"` isolation value gives a model a legal way to decline a worktree,
  * but it still depends on the model choosing it. This is the deterministic half

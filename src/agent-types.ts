@@ -40,7 +40,7 @@ export const NO_FALLBACK = "none";
  * Agent type substituted when a caller-supplied `subagent_type` doesn't resolve
  * to exactly one enabled agent. `undefined` keeps the historical behavior
  * (general-purpose); `NO_FALLBACK` makes dispatch fail closed. Set from
- * `subagents.json` (`fallbackSubagent`).
+ * `subagents.yaml` (`fallbackSubagent`).
  *
  * Module state rather than an index.ts closure because every caller-supplied
  * spawn path needs it — the Agent tool, the scheduler, and cross-extension RPC.

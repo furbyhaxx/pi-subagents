@@ -40,7 +40,7 @@ import { isWorktreeIsolationEnabled } from "./worktree.js";
 /**
  * Hard ceiling on nesting for every branch: main session = 0, its subagents = 1,
  * their children = 2. `0`/`1` disables nesting entirely. Set from
- * `subagents.json` (`maxSubagentDepth`). Read when a subagent session is built,
+ * `subagents.yaml` (`maxSubagentDepth`). Read when a subagent session is built,
  * so a change applies to sessions started after it.
  */
 let maxSubagentDepth = 2;
