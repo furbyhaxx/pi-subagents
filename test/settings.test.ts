@@ -2,30 +2,33 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { stringify } from "yaml";
 import {
   applyAndEmitLoaded,
   applySettings,
   loadSettings,
   persistToastFor,
   type SettingsAppliers,
+  type SettingsScope,
   saveAndEmitChanged,
-  saveSettings,
+  saveSettingsPatch,
+  settingsPath,
 } from "../src/settings.js";
 
 /**
  * Tests for persistent settings. Uses two tmp directories:
  * - `globalDir`: redirected via PI_CODING_AGENT_DIR so getAgentDir() returns it.
- *   Simulates `~/.pi/agent/` — the global scope.
+ *   Simulates `~/.pi/agent/` — the user scope.
  * - `projectDir`: passed explicitly as cwd to load/save.
- *   Simulates the user's project root. Settings live at `<projectDir>/.pi/subagents.json`.
+ *   Simulates the user's project root. Settings live at `<projectDir>/.pi/subagents.yaml`.
  */
 describe("settings persistence", () => {
   let globalDir: string;
   let projectDir: string;
   let originalAgentDirEnv: string | undefined;
 
-  const globalFile = () => join(globalDir, "subagents.json");
-  const projectFile = () => join(projectDir, ".pi", "subagents.json");
+  const globalFile = () => settingsPath("user");
+  const projectFile = () => settingsPath("project", projectDir);
 
   beforeEach(() => {
     globalDir = mkdtempSync(join(tmpdir(), "pi-settings-global-"));
@@ -42,22 +45,26 @@ describe("settings persistence", () => {
   });
 
   function writeGlobal(obj: unknown) {
-    writeFileSync(globalFile(), JSON.stringify(obj));
+    writeFileSync(globalFile(), stringify(obj));
   }
 
   function writeProject(obj: unknown) {
     mkdirSync(join(projectDir, ".pi"), { recursive: true });
-    writeFileSync(projectFile(), JSON.stringify(obj));
+    writeFileSync(projectFile(), stringify(obj));
   }
+
+  /** The save-scope half of a write: the default layer is the user one. */
+  const save = (settings: Parameters<typeof saveSettingsPatch>[0], scope: SettingsScope = "project") =>
+    saveSettingsPatch(settings, scope, projectDir);
 
   it("returns {} when both files are missing", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
-  it("returns {} when both files are malformed JSON", () => {
-    writeFileSync(globalFile(), "not json {{");
+  it("returns {} when both files are malformed YAML", () => {
+    writeFileSync(globalFile(), "not: yaml: at: all: {{{");
     mkdirSync(join(projectDir, ".pi"), { recursive: true });
-    writeFileSync(projectFile(), "also not json");
+    writeFileSync(projectFile(), "also: not: yaml: {{{");
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -91,26 +98,32 @@ describe("settings persistence", () => {
       schedulingEnabled: false,
       toolDescriptionMode: "compact" as const,
     };
-    saveSettings(settings, projectDir);
+    save(settings);
     expect(loadSettings(projectDir)).toEqual(settings);
   });
 
-  it("round-trips schedulingEnabled (true and false), and absence stays absent", () => {
-    saveSettings({ schedulingEnabled: false }, projectDir);
+  it("round-trips schedulingEnabled (true and false), and only an explicit undefined unsets it", () => {
+    save({ schedulingEnabled: false });
     expect(loadSettings(projectDir)).toEqual({ schedulingEnabled: false });
 
-    saveSettings({ schedulingEnabled: true }, projectDir);
+    save({ schedulingEnabled: true });
     expect(loadSettings(projectDir)).toEqual({ schedulingEnabled: true });
 
-    // Absence — caller's "use default" signal — must not become a stored false.
-    saveSettings({}, projectDir);
+    // A patch touches only its own keys, so an empty one leaves the last write
+    // standing — it is not a snapshot dump that resets the file.
+    save({});
+    expect(loadSettings(projectDir)).toEqual({ schedulingEnabled: true });
+
+    // Unsetting is an explicit `undefined`, which deletes the key rather than
+    // writing a value the loader would read as "false".
+    save({ schedulingEnabled: undefined });
     expect(loadSettings(projectDir)).toEqual({});
   });
 
   it("round-trips fleetView (true and false); keeps boolean, drops non-boolean", () => {
-    saveSettings({ fleetView: false }, projectDir);
+    save({ fleetView: false });
     expect(loadSettings(projectDir)).toEqual({ fleetView: false });
-    saveSettings({ fleetView: true }, projectDir);
+    save({ fleetView: true });
     expect(loadSettings(projectDir)).toEqual({ fleetView: true });
     writeProject({ fleetView: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
@@ -118,7 +131,7 @@ describe("settings persistence", () => {
 
   it("round-trips agentMentions modes; drops an unknown one", () => {
     for (const mode of ["model", "direct", "off"] as const) {
-      saveSettings({ agentMentions: mode }, projectDir);
+      save({ agentMentions: mode });
       expect(loadSettings(projectDir)).toEqual({ agentMentions: mode });
     }
     writeProject({ agentMentions: "on" } as any);
@@ -136,52 +149,52 @@ describe("settings persistence", () => {
   });
 
   it("round-trips rememberAgents (true and false); keeps boolean, drops non-boolean", () => {
-    saveSettings({ rememberAgents: false }, projectDir);
+    save({ rememberAgents: false });
     expect(loadSettings(projectDir)).toEqual({ rememberAgents: false });
-    saveSettings({ rememberAgents: true }, projectDir);
+    save({ rememberAgents: true });
     expect(loadSettings(projectDir)).toEqual({ rememberAgents: true });
     writeProject({ rememberAgents: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
   it("round-trips widgetMode; keeps valid values, drops invalid", () => {
-    saveSettings({ widgetMode: "off" }, projectDir);
+    save({ widgetMode: "off" });
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "off" });
-    saveSettings({ widgetMode: "background" }, projectDir);
+    save({ widgetMode: "background" });
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "background" });
     writeProject({ widgetMode: "sideways" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
   it("round-trips viewerMarkdown; keeps valid values, drops invalid", () => {
-    saveSettings({ viewerMarkdown: "off" }, projectDir);
+    save({ viewerMarkdown: "off" });
     expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "off" });
-    saveSettings({ viewerMarkdown: "all" }, projectDir);
+    save({ viewerMarkdown: "all" });
     expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "all" });
     writeProject({ viewerMarkdown: "markdown" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
   it("round-trips outputTranscript; drops non-boolean", () => {
-    saveSettings({ outputTranscript: false }, projectDir);
+    save({ outputTranscript: false });
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: false });
-    saveSettings({ outputTranscript: true }, projectDir);
+    save({ outputTranscript: true });
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: true });
     writeProject({ outputTranscript: "no" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
-  it("round-trips backgroundByDefault (true and false), and absence stays absent", () => {
+  it("round-trips backgroundByDefault (true and false), and only an explicit undefined unsets it", () => {
     // `false` is the load-bearing case: it's how a user restores the previous
     // foreground default, so it must survive a save/load rather than being
     // read back as absent and re-defaulting to background.
-    saveSettings({ backgroundByDefault: false }, projectDir);
+    save({ backgroundByDefault: false });
     expect(loadSettings(projectDir)).toEqual({ backgroundByDefault: false });
 
-    saveSettings({ backgroundByDefault: true }, projectDir);
+    save({ backgroundByDefault: true });
     expect(loadSettings(projectDir)).toEqual({ backgroundByDefault: true });
 
-    saveSettings({}, projectDir);
+    save({ backgroundByDefault: undefined });
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -193,27 +206,27 @@ describe("settings persistence", () => {
   });
 
   it("round-trips worktreeIsolation; drops non-boolean", () => {
-    saveSettings({ worktreeIsolation: false }, projectDir);
+    save({ worktreeIsolation: false });
     expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: false });
-    saveSettings({ worktreeIsolation: true }, projectDir);
+    save({ worktreeIsolation: true });
     expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: true });
     writeProject({ worktreeIsolation: "off" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
   it("round-trips worktreeAutoCommit; drops non-boolean", () => {
-    saveSettings({ worktreeAutoCommit: false }, projectDir);
+    save({ worktreeAutoCommit: false });
     expect(loadSettings(projectDir)).toEqual({ worktreeAutoCommit: false });
-    saveSettings({ worktreeAutoCommit: true }, projectDir);
+    save({ worktreeAutoCommit: true });
     expect(loadSettings(projectDir)).toEqual({ worktreeAutoCommit: true });
     writeProject({ worktreeAutoCommit: "on" });
     expect(loadSettings(projectDir)).toEqual({});
   });
 
   it("round-trips reportUsage and showCost; drops non-boolean", () => {
-    saveSettings({ reportUsage: true, showCost: true }, projectDir);
+    save({ reportUsage: true, showCost: true });
     expect(loadSettings(projectDir)).toEqual({ reportUsage: true, showCost: true });
-    saveSettings({ reportUsage: false, showCost: false }, projectDir);
+    save({ reportUsage: false, showCost: false });
     expect(loadSettings(projectDir)).toEqual({ reportUsage: false, showCost: false });
     // The sanitizer is an allowlist: a key it does not name is dropped, and the
     // setting silently never applies.
@@ -222,18 +235,18 @@ describe("settings persistence", () => {
   });
 
   it("round-trips showModel; drops non-boolean", () => {
-    saveSettings({ showModel: true }, projectDir);
+    save({ showModel: true });
     expect(loadSettings(projectDir)).toEqual({ showModel: true });
-    saveSettings({ showModel: false }, projectDir);
+    save({ showModel: false });
     expect(loadSettings(projectDir)).toEqual({ showModel: false });
     writeProject({ showModel: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({});
   });
 
   it("round-trips workflowsEnabled; drops non-boolean", () => {
-    saveSettings({ workflowsEnabled: true }, projectDir);
+    save({ workflowsEnabled: true });
     expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: true });
-    saveSettings({ workflowsEnabled: false }, projectDir);
+    save({ workflowsEnabled: false });
     expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: false });
     writeProject({ workflowsEnabled: "on" } as any);
     // Dropped, not coerced — a truthy string must not switch the feature on.
@@ -247,26 +260,26 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
-  it("saveSettings writes only to the project file; global is untouched", () => {
+  it("saveSettingsPatch writes only to the chosen layer; the other is untouched", () => {
     writeGlobal({ maxConcurrent: 16 });
-    saveSettings({ maxConcurrent: 2 }, projectDir);
+    save({ maxConcurrent: 2 });
 
     // Project file contains the new value
-    expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
+    expect(loadSettings(projectDir).maxConcurrent).toBe(2);
     // Global file unchanged
-    expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 16 });
+    expect(readFileSync(globalFile(), "utf-8")).toContain("maxConcurrent: 16");
   });
 
   it("saveSettings creates <cwd>/.pi/ when missing", () => {
     expect(existsSync(join(projectDir, ".pi"))).toBe(false);
-    saveSettings({ maxConcurrent: 4 }, projectDir);
+    save({ maxConcurrent: 4 });
     expect(existsSync(projectFile())).toBe(true);
   });
 
   it("round-trips stallThresholdMinutes, including zero to disable", () => {
-    saveSettings({ stallThresholdMinutes: 5 }, projectDir);
+    save({ stallThresholdMinutes: 5 });
     expect(loadSettings(projectDir)).toEqual({ stallThresholdMinutes: 5 });
-    saveSettings({ stallThresholdMinutes: 0 }, projectDir);
+    save({ stallThresholdMinutes: 0 });
     expect(loadSettings(projectDir)).toEqual({ stallThresholdMinutes: 0 });
     writeProject({ stallThresholdMinutes: -1 });
     expect(loadSettings(projectDir)).toEqual({});
@@ -275,7 +288,7 @@ describe("settings persistence", () => {
   });
 
   it("round-trips defaultMaxTurns: 0 (unlimited marker)", () => {
-    saveSettings({ defaultMaxTurns: 0 }, projectDir);
+    save({ defaultMaxTurns: 0 });
     expect(loadSettings(projectDir)).toEqual({ defaultMaxTurns: 0 });
   });
 
@@ -461,13 +474,13 @@ describe("settings persistence", () => {
       expect(loadSettings(projectDir).toolDescriptionMode).toBeUndefined();
     });
 
-    it("returns {} when the JSON root is not an object (array, string, null)", () => {
+    it("returns {} when the YAML root is not a map", () => {
       mkdirSync(join(projectDir, ".pi"), { recursive: true });
-      writeFileSync(projectFile(), '["not", "an", "object"]');
+      writeFileSync(projectFile(), "- not\n- a\n- map\n");
       expect(loadSettings(projectDir)).toEqual({});
-      writeFileSync(projectFile(), '"just a string"');
+      writeFileSync(projectFile(), "just a string\n");
       expect(loadSettings(projectDir)).toEqual({});
-      writeFileSync(projectFile(), "null");
+      writeFileSync(projectFile(), "null\n");
       expect(loadSettings(projectDir)).toEqual({});
     });
 
@@ -514,18 +527,18 @@ describe("settings persistence", () => {
   });
 
   describe("save result + corrupt-file warning", () => {
-    it("saveSettings returns true on success", () => {
-      expect(saveSettings({ maxConcurrent: 2 }, projectDir)).toBe(true);
-      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
+    it("saveSettingsPatch returns true on success", () => {
+      expect(save({ maxConcurrent: 2 })).toBe(true);
+      expect(loadSettings(projectDir).maxConcurrent).toBe(2);
     });
 
-    it("saveSettings returns false when the target dir cannot be created", () => {
+    it("saveSettingsPatch returns false when the target dir cannot be created", () => {
       // Place a regular file where the parent of the settings file would go —
       // mkdirSync + writeFileSync both fail with ENOTDIR / EEXIST.
       const filePosingAsCwd = join(tmpdir(), `pi-settings-notdir-${Date.now()}`);
       writeFileSync(filePosingAsCwd, "");
       try {
-        expect(saveSettings({ maxConcurrent: 1 }, filePosingAsCwd)).toBe(false);
+        expect(saveSettingsPatch({ maxConcurrent: 1 }, "project", filePosingAsCwd)).toBe(false);
       } finally {
         rmSync(filePosingAsCwd, { force: true });
       }
@@ -534,7 +547,7 @@ describe("settings persistence", () => {
     it("warns to console.warn when an existing file is malformed", () => {
       const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
       mkdirSync(join(projectDir, ".pi"), { recursive: true });
-      writeFileSync(projectFile(), "not valid json {{{");
+      writeFileSync(projectFile(), "not: valid: yaml: {{{");
       try {
         expect(loadSettings(projectDir)).toEqual({});
         expect(spy).toHaveBeenCalledTimes(1);
@@ -909,16 +922,18 @@ describe("settings persistence", () => {
       const emit = vi.fn();
       const snapshot = { maxConcurrent: 5, graceTurns: 2 };
 
-      const toast = saveAndEmitChanged(snapshot, "Max concurrency set to 5", emit, projectDir);
+      const toast = saveAndEmitChanged(snapshot, "Max concurrency set to 5", emit, "user", projectDir);
 
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit).toHaveBeenCalledWith("subagents:settings_changed", {
         settings: snapshot,
         persisted: true,
+        scope: "user",
       });
       expect(toast).toEqual({ message: "Max concurrency set to 5", level: "info" });
-      // File actually written
-      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual(snapshot);
+      // File actually written, into the scope asked for
+      expect(readFileSync(globalFile(), "utf-8")).toContain("maxConcurrent: 5");
+      expect(existsSync(projectFile())).toBe(false);
     });
 
     it("emits with persisted=false and returns warning toast on save failure", () => {
@@ -930,11 +945,13 @@ describe("settings persistence", () => {
           { maxConcurrent: 5 },
           "Max concurrency set to 5",
           emit,
+          "project",
           filePosingAsCwd,
         );
         expect(emit).toHaveBeenCalledWith("subagents:settings_changed", {
-          settings: { maxConcurrent: 5 },
+          settings: {},
           persisted: false,
+          scope: "project",
         });
         expect(toast).toEqual({
           message: "Max concurrency set to 5 (session only; failed to persist)",

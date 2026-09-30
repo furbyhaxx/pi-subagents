@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "../src/index.js";
 import { createOutputFilePath, getWorktreeDirectory, sessionArtifactRoot, sessionTaskDir, setSessionArtifactDirectory, setWorktreeDirectory } from "../src/output-file.js";
-import { applySettings, loadSettings, type SettingsAppliers, saveSettings } from "../src/settings.js";
+import { applySettings, loadSettings, type SettingsAppliers, saveSettingsPatch } from "../src/settings.js";
 
 describe("persistent session artifacts", () => {
   let dir: string;
@@ -84,14 +84,14 @@ describe("persistent session artifacts", () => {
   });
 
   it("round-trips atomic placement settings and applies both storage hooks", () => {
-    saveSettings({ sessionArtifactDirectory: "artifacts", worktreeDirectory: { mode: "custom", path: "trees" } }, dir);
+    saveSettingsPatch({ sessionArtifactDirectory: "artifacts", worktreeDirectory: { mode: "custom", path: "trees" } }, "project", dir);
     const loaded = loadSettings(dir);
     expect(loaded).toMatchObject({ sessionArtifactDirectory: "artifacts", worktreeDirectory: { mode: "custom", path: "trees" } });
     const appliers = { setSessionArtifactDirectory, setWorktreeDirectory } as SettingsAppliers;
     applySettings(loaded, appliers);
     expect(getWorktreeDirectory()).toEqual({ mode: "custom", path: "trees" });
     for (const mode of ["session", "project"] as const) {
-      saveSettings({ ...loaded, worktreeDirectory: { mode }, showCost: true }, dir);
+      saveSettingsPatch({ ...loaded, worktreeDirectory: { mode }, showCost: true }, "project", dir);
       expect(loadSettings(dir).worktreeDirectory).toEqual({ mode });
     }
   });
@@ -102,7 +102,7 @@ describe("persistent session artifacts", () => {
       execFileSync("git", ["init", "--quiet", "--separate-git-dir", join(dir, "git-metadata"), dir]);
       mkdirSync(launchCwd, { recursive: true });
     }
-    saveSettings({ schedulingEnabled: false, workflowsEnabled: false, sessionArtifactDirectory: "first" }, launchCwd);
+    saveSettingsPatch({ schedulingEnabled: false, workflowsEnabled: false, sessionArtifactDirectory: "first" }, "project", launchCwd);
     const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
     const ctx = {
       cwd: launchCwd, hasUI: false, mode: "print", ui: {},
@@ -135,7 +135,7 @@ describe("persistent session artifacts", () => {
     const output = createOutputFilePath(dir, "child", "session", binding.artifactRoot);
     writeFileSync(output, "keep");
     await shutdown();
-    saveSettings({ schedulingEnabled: false, workflowsEnabled: false, sessionArtifactDirectory: join(dir, "second") }, launchCwd);
+    saveSettingsPatch({ schedulingEnabled: false, workflowsEnabled: false, sessionArtifactDirectory: join(dir, "second") }, "project", launchCwd);
     shutdown = await start();
     expect(entries.filter(e => e.customType === "subagents:artifacts")).toHaveLength(1);
     expect(readFileSync(output, "utf8")).toBe("keep");

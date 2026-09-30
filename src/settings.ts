@@ -1,10 +1,21 @@
 // Persistence for pi-subagents operational settings.
-// - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, never written here
-// - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
+// - User:    ~/.pi/agent/subagents.yaml (via getAgentDir()) — the default save target
+// - Project: <cwd>/.pi/subagents.yaml — overrides user on load
+//
+// YAML, not JSON, and written through a document round-trip so a hand-authored
+// file keeps its comments, key order and formatting. Writes are a PATCH of the
+// keys that actually changed, never a whole-snapshot dump: with two layers, a
+// snapshot written into one layer would freeze the other layer's value into it
+// and drag along every setting the user never opened.
+//
+// A pre-YAML `subagents.json` is still read when no `subagents.yaml` sits
+// beside it, and the first save migrates it in full. Migration is deliberately
+// not done on load — see `readSettingsLayer`.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Document, isMap, parse, parseDocument, type YAMLMap } from "yaml";
 import { NO_FALLBACK } from "./agent-types.js";
 import type { MessagingScopeMode } from "./messaging/scope.js";
 import type { MessagingSurface } from "./messaging/types.js";
@@ -329,6 +340,16 @@ export interface SubagentsSettings {
    * live — `Tab` in the viewer cycles this same setting.
    */
   viewerMode?: ViewerViewMode;
+  /**
+   * Command used to edit an agent's system prompt outside the TUI, e.g.
+   * `code --wait` or `nvim`. Unset falls back to `$VISUAL` then `$EDITOR`, and
+   * to the built-in inline editor when neither is set or the launch fails.
+   *
+   * Only ever applied to the prompt BODY — the external editor is handed the
+   * body with the frontmatter stripped, so hand-editing YAML in a throwaway
+   * buffer is not a way to break the file.
+   */
+  promptEditor?: string;
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -366,6 +387,7 @@ export interface SettingsAppliers {
   setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
   setViewerMode: (mode: ViewerViewMode) => void;
+  setPromptEditor: (command: string | undefined) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -549,6 +571,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.viewerMode === "string" && VALID_VIEWER_VIEW_MODES.has(r.viewerMode)) {
     out.viewerMode = r.viewerMode as ViewerViewMode;
   }
+  if (typeof r.promptEditor === "string" && r.promptEditor.trim()) {
+    out.promptEditor = r.promptEditor.trim();
+  }
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
@@ -565,12 +590,15 @@ function sanitize(raw: unknown): SubagentsSettings {
   return out;
 }
 
-function globalPath(): string {
-  return join(getAgentDir(), "subagents.json");
-}
+const SETTINGS_FILE = "subagents.yaml";
+const LEGACY_SETTINGS_FILE = "subagents.json";
 
-function projectPath(cwd: string): string {
-  return join(cwd, ".pi", "subagents.json");
+/** Which layer of the settings file stack an operation reads or writes. */
+export type SettingsScope = "user" | "project";
+
+/** Absolute path of one layer's settings file. */
+export function settingsPath(scope: SettingsScope, cwd: string = process.cwd()): string {
+  return scope === "user" ? join(getAgentDir(), SETTINGS_FILE) : join(cwd, ".pi", SETTINGS_FILE);
 }
 
 /**
@@ -581,6 +609,51 @@ function projectPath(cwd: string): string {
 function readSettingsFile(path: string): SubagentsSettings {
   if (!existsSync(path)) return {};
   try {
+    // `parse`, not `parseDocument(...).toJS()`: the document form collects
+    // syntax errors instead of throwing, which would turn a typo in the file
+    // into silently-default settings.
+    const parsed: unknown = parse(readFileSync(path, "utf-8"));
+    return sanitize(parsed);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
+    return {};
+  }
+}
+
+/** A deprecated `subagents.json` already reported, so a reload does not repeat it. */
+const warnedAboutJson = new Set<string>();
+
+/**
+ * Read one layer, falling back to a pre-YAML `subagents.json` beside it.
+ *
+ * The migration is deliberately NOT done here. Writing a file from a settings
+ * *read* means every process that boots the extension — including one that only
+ * wanted to look at a value — mutates the user's config directory, and a test
+ * that boots without redirecting the agent dir would write to the developer's
+ * real settings. So the JSON is read as-is and the file the user ends up with
+ * is written on the first save: see `renderPatched`, which seeds the new YAML
+ * from the JSON so nothing is lost in the crossing.
+ */
+function readSettingsLayer(scope: SettingsScope, cwd: string): SubagentsSettings {
+  const path = settingsPath(scope, cwd);
+  if (existsSync(path)) return readSettingsFile(path);
+
+  const legacy = join(dirname(path), LEGACY_SETTINGS_FILE);
+  if (!existsSync(legacy)) return {};
+  const settings = readLegacyJson(legacy);
+  if (Object.keys(settings).length > 0 && !warnedAboutJson.has(legacy)) {
+    warnedAboutJson.add(legacy);
+    console.warn(
+      `[pi-subagents] ${legacy} is deprecated. It is still read, and the first settings save writes `
+      + `${path} instead — delete the JSON once you have saved.`,
+    );
+  }
+  return settings;
+}
+
+function readLegacyJson(path: string): SubagentsSettings {
+  try {
     return sanitize(JSON.parse(readFileSync(path, "utf-8")));
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
@@ -589,25 +662,93 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
-/** Load merged settings: global provides defaults, project overrides. */
+/** Load merged settings: the user layer provides defaults, project overrides. */
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+  return { ...readSettingsLayer("user", cwd), ...readSettingsLayer("project", cwd) };
+}
+
+/** Read a single layer, without the other one merged over it. */
+export function readScopeSettings(scope: SettingsScope, cwd: string = process.cwd()): SubagentsSettings {
+  return readSettingsLayer(scope, cwd);
 }
 
 /**
- * Write project-local settings. Global is never touched from code.
- * Returns `true` on success, `false` if the write (or mkdir) failed so the
- * caller can surface a warning — persistence isn't fatal but isn't silent.
+ * Merge `patch` into one layer's settings file and return whether the write
+ * succeeded, so the caller can warn — persistence isn't fatal but isn't silent.
+ *
+ * A patch, not a snapshot, for the reason in the file header. `messaging` is
+ * merged per key for the same reason: setting `messaging.enabled` must not
+ * delete a `surface` the user set in that block, comments included.
  */
-export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()): boolean {
-  const path = projectPath(cwd);
+export function saveSettingsPatch(
+  patch: SubagentsSettings,
+  scope: SettingsScope,
+  cwd: string = process.cwd(),
+): boolean {
+  const path = settingsPath(scope, cwd);
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(s, null, 2), "utf-8");
+    writeFileSync(path, renderPatched(path, patch), "utf-8");
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Apply a patch to the file at `path`, preserving everything it does not touch.
+ * A missing or unparseable file starts from an empty document — the latter
+ * matches what the next load would see, so a typo in the file can't silently
+ * swallow a save on top of itself.
+ *
+ * A missing YAML file next to a deprecated JSON one starts from THAT instead:
+ * the one-time migration, done on the first save rather than on a read. Seeding
+ * from the whole legacy layer is what keeps the crossing lossless — writing
+ * only the patched key would drop every setting the user had not touched.
+ */
+function renderPatched(path: string, patch: SubagentsSettings): string {
+  let doc: Document;
+  if (existsSync(path)) {
+    try {
+      doc = parseDocument(readFileSync(path, "utf-8"));
+      // `parseDocument` reports syntax errors on the document instead of
+      // throwing. Writing a patch onto those would produce another broken file,
+      // and the next load would drop every setting in it.
+      if (doc.errors.length > 0) doc = new Document({});
+    } catch {
+      doc = new Document({});
+    }
+    if (doc.contents === null) doc.contents = doc.createNode({}) as Document["contents"];
+  } else {
+    const legacy = join(dirname(path), LEGACY_SETTINGS_FILE);
+    const migrated = existsSync(legacy) ? readLegacyJson(legacy) : {};
+    doc = new Document(migrated as Record<string, unknown>);
+    warnedAboutJson.delete(legacy);
+  }
+
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === "messaging" && isRecord(value)) {
+      const existing = doc.get(key, true);
+      const block: YAMLMap = isMap(existing) ? existing : doc.createNode({}) as YAMLMap;
+      for (const [subKey, subValue] of Object.entries(value)) {
+        setOrDelete(block, subKey, subValue);
+      }
+      if (!doc.has(key)) doc.set(key, block);
+    } else {
+      setOrDelete(doc, key, value);
+    }
+  }
+  return doc.toString({ lineWidth: 0 });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** An `undefined` value is a delete, not a write — it is how a key is unset. */
+function setOrDelete(target: { set(key: string, value: unknown): unknown; delete(key: string): unknown }, key: string, value: unknown): void {
+  if (value === undefined) target.delete(key);
+  else target.set(key, value);
 }
 
 /** Apply persisted settings to the in-memory state via caller-supplied setters. */
@@ -646,13 +787,14 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (s.viewerMode) appliers.setViewerMode(s.viewerMode);
+  if (s.promptEditor !== undefined) appliers.setPromptEditor(s.promptEditor);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
 }
 
 /**
  * Format the user-facing toast for a settings mutation. Pure function —
- * routes the success/failure of `saveSettings` into the right message + level
- * so the UI layer (index.ts) stays a thin wire between input and notification.
+ * routes the success/failure of the write into the right message + level so
+ * the UI layer (index.ts) stays a thin wire between input and notification.
  */
 export function persistToastFor(
   successMsg: string,
@@ -680,18 +822,23 @@ export function applyAndEmitLoaded(
 }
 
 /**
- * Persist a settings snapshot, emit the `subagents:settings_changed` event
+ * Persist a settings patch, emit the `subagents:settings_changed` event
  * (regardless of persist outcome so listeners see the in-memory change), and
  * return the toast the UI should display. Event payload carries the `persisted`
- * flag so listeners can react to write failures.
+ * and `scope` fields so listeners can react to a write failure, or to which
+ * layer the change landed in.
+ *
+ * The payload's `settings` is the whole file after the patch, not the patch:
+ * a listener that only ever sees a diff cannot answer "what is effective now".
  */
 export function saveAndEmitChanged(
-  snapshot: SubagentsSettings,
+  patch: SubagentsSettings,
   successMsg: string,
   emit: SettingsEmit,
+  scope: SettingsScope,
   cwd: string = process.cwd(),
 ): { message: string; level: "info" | "warning" } {
-  const persisted = saveSettings(snapshot, cwd);
-  emit("subagents:settings_changed", { settings: snapshot, persisted });
+  const persisted = saveSettingsPatch(patch, scope, cwd);
+  emit("subagents:settings_changed", { settings: loadSettings(cwd), persisted, scope });
   return persistToastFor(successMsg, persisted);
 }

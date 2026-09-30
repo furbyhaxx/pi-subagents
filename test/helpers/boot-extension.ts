@@ -12,6 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vi } from "vitest";
+import { stringify } from "yaml";
 
 export interface BootedPi {
   pi: any;
@@ -113,6 +114,8 @@ export const flush = async () => {
 
 export interface Hermetic {
   dir: string;
+  /** The redirected agent dir — where the user settings layer lives. */
+  agentDir: string;
   restore: () => void;
 }
 
@@ -133,7 +136,7 @@ export function hermeticDir(opts: {
 
   mkdirSync(join(dir, ".pi"), { recursive: true });
   if (opts.settings) {
-    writeFileSync(join(dir, ".pi", "subagents.json"), JSON.stringify(opts.settings));
+    writeFileSync(join(dir, ".pi", "subagents.yaml"), stringify(opts.settings));
   }
   if (opts.agentFiles) {
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
@@ -148,6 +151,7 @@ export function hermeticDir(opts: {
 
   return {
     dir,
+    agentDir,
     restore() {
       process.chdir(prevCwd);
       if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
