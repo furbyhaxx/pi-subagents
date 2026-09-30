@@ -1,4 +1,5 @@
 ---
+enabled: false
 description: Security Code Reviewer
 tools: read, grep, find, bash
 model: anthropic/claude-haiku-4-5-20251001
