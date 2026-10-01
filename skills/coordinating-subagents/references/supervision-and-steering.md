@@ -60,9 +60,11 @@ Background agents notify you when they finish. Sleeping, re-calling
 and changes nothing.
 
 `get_subagent_result` is for when you actually need the full text — the
-completion notification carries only a preview. `wait: true` blocks; cancelling
-that wait (Esc) stops only the wait, not the agent, and the notification still
-arrives.
+completion notification carries only a preview. `wait: true` blocks until
+completion or until the parent has queued messages, including steering and
+follow-ups. Queued input returns an interrupted-wait result; respond to it
+before waiting again. Cancelling the wait (Esc) stops only the wait, not the
+agent, and the notification still arrives.
 
 The corollary: between launching an agent and its notification, **you know
 nothing about its results**. Do not write them, predict them, or plan around
