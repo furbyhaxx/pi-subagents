@@ -199,6 +199,34 @@ describe("persisted subagent session restore", () => {
     }
   });
 
+  it("refuses to resume a restored record in place, whose session cannot be prompted", async () => {
+    const manager = new AgentManager();
+    try {
+      const restored = manager.restoreCompleted({
+        id: "restored-uncallable",
+        type: "explorer",
+        description: "transcript only",
+        status: "completed",
+        toolUses: 0,
+        startedAt: 1,
+        completedAt: 2,
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        compactionCount: 0,
+        sessionFile: "/tmp/uncallable.jsonl",
+        restoredSession: true,
+        // The stand-in the restore scan publishes: readable, not promptable.
+        session: { messages: [] } as never,
+      });
+
+      // Every resume surface gates on this, so the refusal is what keeps a
+      // mention, a nested child or the delivery bridge from calling a `prompt()`
+      // that is not there.
+      expect(await manager.resume(restored.id, "continue")).toBeUndefined();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it("keeps interrupted restored records in the manager without exposing handles", async () => {
     const manager = new AgentManager();
     try {

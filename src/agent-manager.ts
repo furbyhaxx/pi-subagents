@@ -1485,6 +1485,12 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    // A restored record's session is a transcript stand-in built from the
+    // persisted file: it renders the conversation but has no `prompt()` to
+    // continue it. Refuse here so every resume surface — the Agent tool, a
+    // mention, a nested child, the delivery bridge — fails closed; the callers
+    // that hold the session file reopen the conversation instead.
+    if (record.restoredSession) return undefined;
     if (this.activeRuns.has(id) || record.status === "running" || record.status === "queued") return undefined;
     // A runtime may have been installed since the original run. Never turn a
     // prior true into false; this flag is the record's settlement safety memory.
@@ -1898,6 +1904,16 @@ export class AgentManager {
     };
     this.agents.set(restored.id, restored);
     return restored;
+  }
+
+  /**
+   * Forget a restored transcript record once a live record continues its
+   * conversation. The reopened run carries the original ID, so keeping the
+   * placeholder would leave a second, stale answer for it — and a resume
+   * addressed to it would open a second run on one session file.
+   */
+  dropRestoredRecord(id: string): void {
+    if (this.agents.get(id)?.restoredSession) this.agents.delete(id);
   }
 
   /** Handles already in use, so a fresh spawn can pick an unclaimed one. */
