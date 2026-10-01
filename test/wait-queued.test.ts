@@ -9,8 +9,13 @@
  * Wiring test through the REAL extension: spawn background agents until one
  * queues, call the real tool with wait:true, drain the queue, and assert the
  * call returns the final result.
+ *
+ * Also covers the other half of the wait's contract: pi holds anything the
+ * operator types until the tool returns, so a wait that ignores queued input
+ * strands a prompt for the length of the run. `hasPendingMessages` releases the
+ * wait — and only the wait.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -19,6 +24,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { waitForResult } from "../src/result-wait.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -41,7 +47,7 @@ function makePi() {
   return { pi, tools, lifecycle };
 }
 
-function ctx() {
+function ctx(hasPendingMessages: () => boolean = () => false) {
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
@@ -49,6 +55,7 @@ function ctx() {
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+    hasPendingMessages: vi.fn(hasPendingMessages),
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
 }
@@ -58,6 +65,10 @@ const flush = async () => {
   await new Promise((r) => setImmediate(r));
   await new Promise((r) => setImmediate(r));
 };
+
+// A fake-timer test that hangs never reaches its own finally, and leaked fake
+// timers would time out every later test in this file instead of just this one.
+afterEach(() => { vi.useRealTimers(); });
 
 /** runAgent mock where each call blocks until we resolve it manually. */
 function deferredRuns() {
@@ -76,6 +87,24 @@ function deferredRuns() {
       }) as any,
   );
   return resolvers;
+}
+
+/** Single blocking run; `resolveRun` settles it, `childSignal` is its abort signal. */
+function onePendingRun() {
+  const run: { resolveRun?: () => void; childSignal?: AbortSignal } = {};
+  vi.mocked(runAgent).mockImplementation(
+    (_ctx, _type, _prompt, options) =>
+      new Promise((resolve) => {
+        run.childSignal = options.signal;
+        run.resolveRun = () => resolve({
+          responseText: "THE-RESULT-PAYLOAD",
+          session: { dispose: vi.fn() } as any,
+          aborted: false,
+          steered: false,
+        });
+      }),
+  );
+  return run;
 }
 
 async function spawnBackground(tools: Map<string, any>): Promise<{ id: string; queued: boolean }> {
@@ -227,5 +256,182 @@ describe("get_subagent_result wait:true on a queued agent", () => {
 
     expect(outcome).toBe("AbortError");
     expect(textOf(completedResult)).toContain("THE-RESULT-PAYLOAD");
+  });
+});
+
+describe("get_subagent_result wait:true releases on queued user input", () => {
+  it("returns normally when input is already waiting, and leaves the run untouched", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    const run = onePendingRun();
+    const { id } = await spawnBackground(tools);
+
+    const result = await tools
+      .get("get_subagent_result")
+      .execute("tc-typed-first", { agent_id: id, wait: true }, undefined, undefined, ctx(() => true));
+    const childAbortedAfterReturn = run.childSignal?.aborted;
+
+    // The agent runs on: not stopped, not consumed, so its notification still fires.
+    run.resolveRun?.();
+    await flush();
+    await new Promise((r) => setTimeout(r, 350));
+    const notified = JSON.stringify(pi.sendMessage.mock.calls);
+
+    const collected = await tools
+      .get("get_subagent_result")
+      .execute("tc-collect", { agent_id: id }, undefined, undefined, ctx(() => true));
+
+    await lifecycle.get("session_shutdown")?.();
+
+    expect(textOf(result)).toContain("Wait interrupted by queued user input");
+    expect(textOf(result)).toContain(id);
+    expect(textOf(result)).toContain("still running");
+    expect(textOf(result)).not.toContain("Agent is still running. Use wait: true");
+    expect(childAbortedAfterReturn).toBe(false);
+    expect(notified).toContain(id);
+    expect(textOf(collected)).toContain("THE-RESULT-PAYLOAD");
+  });
+
+  it("releases a wait that is already running when input arrives", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    const run = onePendingRun();
+    const { id } = await spawnBackground(tools);
+    const typed = { value: false };
+
+    const waitPromise = tools
+      .get("get_subagent_result")
+      .execute("tc-typed-mid", { agent_id: id, wait: true }, undefined, undefined, ctx(() => typed.value));
+    setTimeout(() => { typed.value = true; }, 120);
+
+    const result = await Promise.race([
+      waitPromise,
+      new Promise((resolve) => setTimeout(() => resolve(undefined), 2000)),
+    ]);
+    const childAbortedAfterReturn = run.childSignal?.aborted;
+    await lifecycle.get("session_shutdown")?.();
+
+    expect(result).toBeDefined();
+    expect(textOf(result as any)).toContain("Wait interrupted by queued user input");
+    expect(childAbortedAfterReturn).toBe(false);
+  });
+
+  it("releases a queued agent's wait without starting it", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    const resolvers = deferredRuns();
+    let queuedId: string | undefined;
+    for (let i = 0; i < 20 && !queuedId; i++) {
+      const { id, queued } = await spawnBackground(tools);
+      if (queued) queuedId = id;
+    }
+    expect(queuedId, "expected to hit the concurrency limit within 20 spawns").toBeDefined();
+
+    const typed = { value: false };
+    const startedBeforeWait = resolvers.length;
+    const waitPromise = tools
+      .get("get_subagent_result")
+      .execute("tc-queued-typed", { agent_id: queuedId, wait: true }, undefined, undefined, ctx(() => typed.value));
+    setTimeout(() => { typed.value = true; }, 120);
+
+    const result = await Promise.race([
+      waitPromise,
+      new Promise((resolve) => setTimeout(() => resolve(undefined), 2000)),
+    ]);
+    const startedAfterWait = resolvers.length;
+
+    while (resolvers.length > 0) resolvers.shift()!();
+    await flush();
+    await new Promise((r) => setTimeout(r, 350));
+    await lifecycle.get("session_shutdown")?.();
+
+    expect(textOf(result as any)).toContain("Wait interrupted by queued user input");
+    expect(textOf(result as any)).toContain(queuedId!);
+    expect(textOf(result as any)).toContain("still queued");
+    // Releasing the wait did not pull the agent out of the queue.
+    expect(startedAfterWait).toBe(startedBeforeWait);
+  });
+
+  it("wakes every active wait on the same input, independently", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    deferredRuns();
+    const first = await spawnBackground(tools);
+    const second = await spawnBackground(tools);
+    const typed = { value: false };
+    const reader = () => typed.value;
+
+    const waits = Promise.all([
+      tools.get("get_subagent_result").execute("tc-w1", { agent_id: first.id, wait: true }, undefined, undefined, ctx(reader)),
+      tools.get("get_subagent_result").execute("tc-w2", { agent_id: second.id, wait: true }, undefined, undefined, ctx(reader)),
+    ]);
+    setTimeout(() => { typed.value = true; }, 120);
+
+    const results = await Promise.race([
+      waits,
+      new Promise((resolve) => setTimeout(() => resolve(undefined), 2000)),
+    ]);
+    await lifecycle.get("session_shutdown")?.();
+
+    expect(results).toBeDefined();
+    for (const result of results as any[]) {
+      expect(textOf(result)).toContain("Wait interrupted by queued user input");
+      expect(textOf(result)).toContain("keeps running in the background");
+    }
+  });
+
+  it("leaves wait:false alone even with input waiting", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    onePendingRun();
+    const { id } = await spawnBackground(tools);
+
+    const result = await tools
+      .get("get_subagent_result")
+      .execute("tc-nowait", { agent_id: id }, undefined, undefined, ctx(() => true));
+    await lifecycle.get("session_shutdown")?.();
+
+    expect(textOf(result)).not.toContain("Wait interrupted by queued user input");
+    expect(textOf(result)).toContain("Agent is still running. Use wait: true or check back later.");
+  });
+
+  it("reads pending input before arming the poll, so an already-waiting queue releases at once", async () => {
+    // Under fake timers the 50ms tick never fires, so only an up-front read can
+    // release this wait — a poll-only implementation hangs instead.
+    vi.useFakeTimers();
+    let outcome: string | undefined;
+    try {
+      outcome = await waitForResult({ status: "running", promise: new Promise(() => {}) }, () => true);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(outcome).toBe("pending-input");
+  });
+
+  it("absorbs a child rejection that lands after the wait released", async () => {
+    const record = { status: "running", promise: undefined as Promise<unknown> | undefined };
+    let rejectRun!: (error: Error) => void;
+    record.promise = new Promise((_resolve, reject) => { rejectRun = reject; });
+    const unhandled: unknown[] = [];
+    const collect = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", collect);
+
+    let outcome: string | undefined;
+    try {
+      outcome = await waitForResult(record, () => true);
+      rejectRun(new Error("child blew up"));
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      process.off("unhandledRejection", collect);
+    }
+
+    expect(outcome).toBe("pending-input");
+    expect(unhandled).toEqual([]);
   });
 });

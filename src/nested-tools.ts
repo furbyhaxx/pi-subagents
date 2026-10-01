@@ -7,7 +7,6 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { abortable } from "./abortable.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -26,6 +25,7 @@ import {
   writeInitialEntry,
 } from "./output-file.js";
 import type { RetryModelCandidate } from "./pi-retry-adapter.js";
+import { pendingInputNote, waitForResult } from "./result-wait.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
@@ -436,27 +436,34 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   const resultTool = defineTool({
     name: NESTED_TOOL_NAMES[1],
     label: "Get Nested Agent Result",
-    description: "Check or wait for a background nested agent owned by this parent.",
+    description: "Check or wait for a background nested agent owned by this parent. A wait returns early if the user types, so the agent is never blocked behind input it cannot see.",
     parameters: Type.Object({
       agent_id: Type.String(),
       wait: Type.Optional(Type.Boolean()),
     }),
-    execute: async (_toolCallId, params, signal) => {
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId)) {
         return textResult(`Nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
-      // Wait for completion if requested. Cancellation (e.g. the parent's tool
-      // call is aborted) stops only this wait; the nested child keeps running and
-      // stays unconsumed. Queued records have no promise until the manager starts
-      // them, so poll — abortably — until they leave the queue, then await.
+      // Cancellation (e.g. the parent's tool call is aborted) stops only this
+      // wait; the nested child keeps running and stays unconsumed. Queued user
+      // input releases the wait the same way — the child is never touched, it
+      // just stops being waited on. `ctx` is this call's own context, so the
+      // pending-message check reads the parent session's queue, not the root's.
+      let interrupted = false;
       if (params.wait && (record.status === "queued" || record.status === "running")) {
-        while (record.status === "queued") {
-          await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
-        }
-        if (record.promise) await abortable(record.promise, signal);
+        const outcome = await waitForResult(record, () => ctx.hasPendingMessages(), signal);
+        interrupted = outcome === "pending-input";
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error", record);
+      const text = formatRecord(record, "fetched");
+      return textResult(
+        interrupted && (record.status === "queued" || record.status === "running")
+          ? `${text}\n\n${pendingInputNote(record)}`
+          : text,
+        record.status === "error",
+        record,
+      );
     },
   });
 
