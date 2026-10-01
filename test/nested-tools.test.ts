@@ -25,10 +25,11 @@ const MODELS = [
   { id: "blocked", name: "Blocked", provider: "anthropic" },
 ];
 
-function ctx(executionCwd = cwd) {
+function ctx(executionCwd = cwd, hasPendingMessages: () => boolean = () => false) {
   return {
     cwd: executionCwd,
     model: undefined,
+    hasPendingMessages: vi.fn(hasPendingMessages),
     modelRegistry: {
       find: (provider: string, id: string) =>
         MODELS.find(model => model.provider === provider && model.id === id),
@@ -55,8 +56,13 @@ function tools(
   });
 }
 
-async function execute(tool: any, params: Record<string, unknown>, executionCwd = cwd) {
-  return tool.execute("call-1", params, undefined, undefined, ctx(executionCwd));
+async function execute(
+  tool: any,
+  params: Record<string, unknown>,
+  executionCwd = cwd,
+  hasPendingMessages?: () => boolean,
+) {
+  return tool.execute("call-1", params, undefined, undefined, ctx(executionCwd, hasPendingMessages));
 }
 
 beforeEach(() => {
@@ -424,6 +430,79 @@ describe("child-safe nested Agent tools", () => {
     // The wait was cancelled but the child was never aborted or consumed.
     expect(record.status).toBe("running");
     settleChild?.();
+  });
+
+  it("releases a nested result wait on queued user input, leaving the child running", async () => {
+    const [, getResult] = tools();
+    const record = {
+      id: "running-child",
+      status: "running",
+      parentAgentId: "parent-1",
+      promise: new Promise<void>(() => {}),
+    };
+    records.set(record.id, record);
+    const executionCtx = ctx(cwd, () => true);
+
+    const result = await getResult.execute(
+      "call-typed",
+      { agent_id: record.id, wait: true },
+      undefined,
+      undefined,
+      executionCtx,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).toContain("Wait interrupted by queued user input");
+    expect(result.content[0].text).toContain(record.id);
+    expect(result.content[0].text).toContain("still running");
+    expect(result.content[0].text).toContain("keeps running in the background");
+    // The child session's own context is the one consulted, never the root's.
+    expect(executionCtx.hasPendingMessages).toHaveBeenCalled();
+    expect(record.status).toBe("running");
+  });
+
+  it("releases a nested queued child's wait without starting it", async () => {
+    const [, getResult] = tools();
+    const record = {
+      id: "queued-child",
+      status: "queued",
+      parentAgentId: "parent-1",
+      promise: undefined as Promise<unknown> | undefined,
+    };
+    records.set(record.id, record);
+    const typed = { value: false };
+
+    const waitPromise = getResult.execute(
+      "call-queued-typed",
+      { agent_id: record.id, wait: true },
+      undefined,
+      undefined,
+      ctx(cwd, () => typed.value),
+    );
+    setTimeout(() => { typed.value = true; }, 120);
+
+    const result = await Promise.race([
+      waitPromise,
+      new Promise((resolve) => setTimeout(() => resolve(undefined), 2000)),
+    ]);
+
+    expect((result as any)?.content[0].text).toContain("Wait interrupted by queued user input");
+    expect((result as any)?.content[0].text).toContain("still queued");
+    expect(record.status).toBe("queued");
+    expect(record.promise).toBeUndefined();
+  });
+
+  it("leaves a nested wait:false fetch alone even with input waiting", async () => {
+    const [, getResult] = tools();
+    records.set("child-1", {
+      id: "child-1", status: "running", parentAgentId: "parent-1",
+      promise: new Promise<void>(() => {}),
+    });
+
+    const result = await execute(getResult, { agent_id: "child-1" }, cwd, () => true);
+
+    expect(result.content[0].text).toBe("Agent child-1 is running.");
+    expect(result.content[0].text).not.toContain("Wait interrupted");
   });
 
   it("still rejects unknown types when the project configures a fallback", async () => {

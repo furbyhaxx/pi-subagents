@@ -18,7 +18,6 @@ import { clampThinkingLevel, type ModelThinkingLevel } from "@earendil-works/pi-
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type SessionEntry, type SessionInfo, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, getAgentStallStatus, isTopLevelAgent } from "./agent-manager.js";
@@ -48,6 +47,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, getSessionArtifactDirectory, getWorktreeDirectory, sessionArtifactRoot, sessionTaskDir, setOutputTranscriptDefault, setSessionArtifactDirectory, setWorktreeDirectory, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getSessionModelCandidates, type RetryModelCandidate, replaceSessionModelCandidates } from "./pi-retry-adapter.js";
 import { getPromptEditor, setPromptEditor } from "./prompt-editor.js";
+import { pendingInputNote, waitForResult } from "./result-wait.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { resolveSubagentSessionDir } from "./session-dir.js";
@@ -679,9 +679,6 @@ export default function (pi: ExtensionAPI) {
   // before they reach pi.sendMessage (fire-and-forget).
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
-  const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     cancelNudge(key);
@@ -3348,7 +3345,7 @@ Terse command-style prompts produce shallow, generic work.
       }),
       wait: Type.Optional(
         Type.Boolean({
-          description: "If true, wait for the agent to complete before returning. Default: false.",
+          description: "If true, wait for the agent to complete before returning. Returns early if the user types — pi queues that input until this call ends, so holding the wait would strand it; the agent keeps running. Default: false.",
         }),
       ),
       verbose: Type.Optional(
@@ -3357,25 +3354,18 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
-      // Wait for completion if requested. Cancellation stops only this tool
-      // call; the background agent keeps running and remains unconsumed so its
-      // completion notification can still be delivered.
-      // Queued agents have no promise yet (it's created when the queue starts
-      // them), so poll until they leave the queue, then await like a running one.
+      // Cancellation or queued input ends only this wait: the agent keeps running
+      // and unconsumed, so its completion notification still fires.
+      let interrupted = false;
       if (params.wait && (record.status === "running" || record.status === "queued")) {
-        while (record.status === "queued") {
-          await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
-            signal,
-          );
-        }
-        if (record.promise) await abortable(record.promise, signal);
+        const outcome = await waitForResult(record, () => ctx.hasPendingMessages(), signal);
+        interrupted = outcome === "pending-input";
       }
 
       const displayName = getDisplayName(record.type);
@@ -3401,7 +3391,10 @@ Terse command-style prompts produce shallow, generic work.
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n` + formatWorkspace(record) + "\n";
 
-      if (record.status === "running") {
+      const unfinished = record.status === "running" || record.status === "queued";
+      if (interrupted && unfinished) {
+        output += pendingInputNote(record);
+      } else if (record.status === "running") {
         output += stall?.stalled
           ? "Agent is stalled. Use steer_subagent, update_subagent {interrupt: true}, or stop_subagent."
           : "Agent is still running. Use wait: true or check back later.";
