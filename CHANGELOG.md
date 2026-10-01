@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-01
+
 > **⚠️ Breaking: worktree isolation now requires an explicit branch.** Pass `branch: "feat/<slug>"` with `isolation: "worktree"`, agent frontmatter, or `SubagentWorkflow.agent()` options; missing branches fail before the child starts. Existing retained `pi/*` worktrees remain available for listing, resume/restore and pruning.
 
 ### Added
 
 - **Trusted lifecycle extensions bind under any capability policy.** `pi-blackhole` owns session compaction and the observational-memory ledger, so it now loads for every subagent — including `isolated: true` and `extensions: false` children and children whose `extensions:` allowlist never names it. The binding resolves the parent's own entry path from its tool registry (absolute, non-builtin), which `additionalExtensionPaths` accepts even with discovery off, mirroring the background-jobs exception. A host that has not loaded it binds nothing and warns about nothing: absence is not distinguishable from a host that has no use for it, and the existing "requested but was not loaded" warning still fires for an agent that names it explicitly under `extensions:`. Binding grants session handlers and no tools — `lifecycleOnlyPaths` keeps these extensions out of the child's active tool set in every loader mode. `exclude_extensions: pi-blackhole` is the opt-out, and stays effective under `isolated: true`, where other excludes remain silent as before.
+
+### Changed
+
+- **Result waits yield to queued parent messages.** Top-level and nested `get_subagent_result(wait: true)` calls return normally when steering or follow-up messages are queued, without stopping the child or consuming its unfinished result. Esc still cancels only the wait, and completion notifications remain available.
 
 ## [0.20.1] - 2026-09-30
 
