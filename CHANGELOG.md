@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resuming a restored agent no longer fails with `session.prompt is not a function`.** An agent the session-start scan rebuilt from a persisted child session held a transcript stand-in where its session should be — readable, but with no `prompt()` — and every resume entry point gated only on that field being present. `Agent({resume})` and `@id` handed the stand-in to the resume runner and died on its first statement: 0 tokens, an empty output file, and the transcript record flipped to `error`. Both surfaces now reopen the conversation from its session file instead, the way an evicted agent's is reopened, and the ID that was resumed keeps resolving to the reopened run. `AgentManager.resume` refuses these records, so a mention, a nested child, the delivery bridge and a workflow can no longer reach the missing method.
+
 ## [0.21.0] - 2026-10-01
 
 > **⚠️ Breaking: worktree isolation now requires an explicit branch.** Pass `branch: "feat/<slug>"` with `isolation: "worktree"`, agent frontmatter, or `SubagentWorkflow.agent()` options; missing branches fail before the child starts. Existing retained `pi/*` worktrees remain available for listing, resume/restore and pruning.
