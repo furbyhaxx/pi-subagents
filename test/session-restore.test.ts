@@ -6,11 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
-  return { ...actual, resumeAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
 
 import { AgentManager } from "../src/agent-manager.js";
-import { resumeAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import subagentsExtension, { restoredRecordFromSession } from "../src/index.js";
 import { createOutputFilePath } from "../src/output-file.js";
 import { resolveSubagentSessionDir } from "../src/session-dir.js";
@@ -265,10 +265,11 @@ describe("persisted subagent restore under the session-root override", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function persistedChild(opts: { dir: string; cwd: string; parentSession: string; agentId: string; task: string }) {
+  /** The type is the session name's prefix, and a resume has to be able to resolve it. */
+  function persistedChild(opts: { dir: string; cwd: string; parentSession: string; agentId: string; task: string; type?: string }) {
     const child = SessionManager.create(opts.cwd, opts.dir, { parentSession: opts.parentSession });
     child.appendModelChange("openai", "gpt-test");
-    child.appendSessionInfo(`explorer#${opts.agentId.slice(0, 8)}`);
+    child.appendSessionInfo(`${opts.type ?? "explorer"}#${opts.agentId.slice(0, 8)}`);
     child.appendCustomEntry("subagents:task", { prompt: opts.task });
     child.appendCustomEntry("subagents:invocation", { agentId: opts.agentId, startedAt: 1 });
     child.appendMessage({ role: "user", content: [{ type: "text", text: opts.task }], timestamp: 1 } as never);
@@ -379,10 +380,18 @@ describe("persisted subagent restore under the session-root override", () => {
       error: "stopped by caller",
       startedAt: 1,
     });
-    const child = persistedChild({ dir: container, cwd: worktreeCwd, parentSession, agentId: originalId, task: "continue this task" });
+    const child = persistedChild({ dir: container, cwd: worktreeCwd, parentSession, agentId: originalId, task: "continue this task", type: "general-purpose" });
     const childFile = child.getSessionFile()!;
     const { tools, lifecycle, ctx } = boot(parent);
+    // Reset here, not once per file: the refusal test above shares these
+    // module-level mocks, and its `resumeAgent` calls would otherwise count.
+    vi.mocked(resumeAgent).mockReset();
+    vi.mocked(runAgent).mockReset();
     vi.mocked(resumeAgent).mockResolvedValue({ text: "continued" } as never);
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options: any) => {
+      options.onSessionCreated?.({ messages: [], subscribe: vi.fn(() => vi.fn()), sessionManager: SessionManager.open(childFile) });
+      return { responseText: "continued" };
+    });
 
     await lifecycle.get("session_start")?.({}, ctx);
 
@@ -407,6 +416,9 @@ describe("persisted subagent restore under the session-root override", () => {
     );
     expect(stoppedByOriginalId.content[0].text).toContain(`Agent ${currentId}: stopped`);
 
+    // Resume reaches the conversation through a reopen: the restored record's
+    // session is a transcript stand-in with no `prompt()`, so the run is a
+    // fresh agent over the same session file, not a prompt into the stand-in.
     const resumed = await tools.get("Agent").execute("tc-resume", {
       prompt: "continue",
       description: "Resume task",
@@ -414,8 +426,12 @@ describe("persisted subagent restore under the session-root override", () => {
       resume: originalId,
       run_in_background: true,
     }, undefined, undefined, ctx);
-    expect(resumed.content[0].text).toContain("resumed in background");
-    expect(resumeAgent).toHaveBeenCalledWith(expect.anything(), "continue", expect.anything());
+    expect(resumed.content[0].text).toContain("resumed in background from its stored session");
+    expect(runAgent).toHaveBeenCalledWith(
+      expect.anything(), "general-purpose", "continue",
+      expect.objectContaining({ resumeSessionFile: childFile }),
+    );
+    expect(resumeAgent).not.toHaveBeenCalled();
 
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });

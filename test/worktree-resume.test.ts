@@ -1,3 +1,13 @@
+/**
+ * Continuing a restored worktree agent's conversation.
+ *
+ * A record the session-start scan rebuilt is transcript-only, so continuing it
+ * is a reopen: a fresh agent over the same session file, with the recorded
+ * worktree reacquired — the call `reopenTombstone` makes in index.ts, driven
+ * here against the manager so the git worktree contract stays under test
+ * without a model. Resuming the restored record in place is refused
+ * (session-restore.test.ts), which is why nothing below prompts its stand-in.
+ */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,12 +17,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
-  return { ...actual, resumeAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn() };
 });
 
 import { AgentManager } from "../src/agent-manager.js";
-import { resumeAgent } from "../src/agent-runner.js";
+import { runAgent } from "../src/agent-runner.js";
 import { restoredRecordFromSession } from "../src/index.js";
+import type { AgentRecord } from "../src/types.js";
 import { cleanupWorktree, createWorktree, type WorktreeInfo } from "../src/worktree.js";
 
 function git(cwd: string, ...args: string[]): string {
@@ -51,6 +62,7 @@ let sessions: string;
 let scope: WorktreeInfo;
 let api: ExtensionAPI;
 let manager: AgentManager;
+let ctx: ExtensionContext;
 let leaseObserved = false;
 let watchLease = false;
 
@@ -103,8 +115,25 @@ beforeEach(async () => {
   manager = new AgentManager();
   manager.setDefaultApi(api);
   leaseObserved = false;
-  vi.mocked(resumeAgent).mockReset();
+  ctx = { cwd: repo, modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) }, getSystemPrompt: vi.fn(() => "parent") } as unknown as ExtensionContext;
+  vi.mocked(runAgent).mockReset();
+  vi.mocked(runAgent).mockResolvedValue({ responseText: "continued" } as never);
 });
+
+/** The reopen `reopenTombstone` performs for a restored record, plus the rebind. */
+async function reopen(record: AgentRecord, prompt: string, pi: ExtensionAPI = api) {
+  const id = manager.spawn(pi, ctx, record.type, prompt, {
+    description: record.description,
+    resumeSessionFile: record.sessionFile,
+    resumeWorktree: record.worktree,
+    cwd: record.effectiveCwd,
+    configCwd: record.configCwd,
+    isBackground: true,
+  });
+  await manager.awaitStartup(id);
+  manager.getRecord(id)!.originalId = record.originalId ?? record.id;
+  return id;
+}
 
 afterEach(async () => {
   watchLease = false;
@@ -152,13 +181,14 @@ describe("resuming restored worktree agents", () => {
     }));
     const jobsApi = { ...api, getAllTools: () => jobsTools, events } as unknown as ExtensionAPI;
     manager.setDefaultApi(jobsApi);
-    vi.mocked(resumeAgent).mockResolvedValue({ text: "continued" } as never);
     watchLease = true;
 
-    const result = await manager.resume(record.id, "continue");
+    const id = await reopen(record, "continue", jobsApi);
+    const reopened = manager.getRecord(id)!;
+    await reopened.promise;
 
-    expect(result?.status).toBe("completed");
-    expect(result?.worktreeResult).toMatchObject({ hasChanges: false, branch: scope.branch, path: scope.path, retained: true });
+    expect(reopened.status).toBe("completed");
+    expect(reopened.worktreeResult).toMatchObject({ hasChanges: false, branch: scope.branch, path: scope.path, retained: true });
     expect(events.stoppedPaths).toEqual([scope.path]);
     expect(leaseObserved).toBe(true);
     expect(readdirSync(join(scope.commonDir, "pi-subagents-leases")).some(name => name.endsWith(".lock"))).toBe(false);
@@ -167,17 +197,19 @@ describe("resuming restored worktree agents", () => {
   it.each(["missing", "changed"] as const)("still gives an actionable error for a %s worktree", async condition => {
     let worktree = scope;
     if (condition === "missing") {
-      const path = join(root, "missing-worktree");
-      worktree = { ...scope, path, workPath: path };
+      // The recorded cwd still exists, so the reopen reaches the worktree check
+      // rather than stopping at the spawn's cwd validation.
+      worktree = { ...scope, path: join(root, "missing-worktree") };
     } else {
       git(scope.path, "switch", "-c", "changed-outside-pi");
     }
     const record = manager.restoreCompleted(await restoredRecord(worktree));
 
-    const result = await manager.resume(record.id, "continue");
-
-    expect(result?.status).toBe("error");
-    expect(result?.error).toContain(condition === "missing" ? "Worktree is missing:" : "Worktree branch changed at");
-    expect(resumeAgent).not.toHaveBeenCalled();
+    // A startup failure is what the reopen reports back, rather than a run that
+    // never began being announced as one.
+    await expect(reopen(record, "continue")).rejects.toThrow(
+      condition === "missing" ? /Worktree is missing:/ : /Worktree branch changed at/,
+    );
+    expect(runAgent).not.toHaveBeenCalled();
   });
 });

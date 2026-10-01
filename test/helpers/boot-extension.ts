@@ -98,6 +98,10 @@ export function ctx(overrides: Record<string, unknown> = {}) {
       }]),
     },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+    // Read by `get_subagent_result`/`get_subagent_result` waits: a wait ends
+    // early when the host has queued input, so a test that never queues any
+    // needs it to answer, not to be absent.
+    hasPendingMessages: vi.fn(() => false),
     getSystemPrompt: vi.fn(() => "parent"),
     ...overrides,
   } as any;

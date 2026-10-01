@@ -107,6 +107,15 @@ type RecordEntryData = { id?: unknown; status?: unknown; result?: unknown; error
 const RESTORED_TERMINAL_STATUSES = new Set<AgentRecord["status"]>(["completed", "steered", "aborted", "stopped", "error"]);
 type WorkspaceEntryData = { worktree?: AgentRecord["worktree"] };
 type ArtifactEntryData = { artifactRoot?: unknown; originCwd?: unknown; rootSessionId?: unknown };
+/**
+ * What a reopen needs: where the conversation is on disk, plus the names the
+ * previous record was holding. The names are absent for a record the
+ * session-start restore scan built — it strips handles, since nothing can be
+ * reopened by a name that was never allocated to a live run.
+ */
+type ReopenTarget = Pick<AgentTombstone,
+  "type" | "description" | "sessionFile" | "worktree" | "effectiveCwd" | "configCwd" | "originCwd" | "artifactRoot" | "rootSessionId"
+> & { handle?: string; alias?: string };
 
 function textResult(msg: string, details?: ScopedAgentDetails) {
   return { content: [{ type: "text" as const, text: msg }], details };
@@ -1370,6 +1379,18 @@ export default function (pi: ExtensionAPI) {
         return { action: "handled" };
       }
 
+      // A record the session-start scan rebuilt: its session shows the
+      // transcript but cannot be prompted, so the conversation is reopened
+      // from its file rather than resumed in place.
+      if (record.restoredSession) {
+        const reopened = await reopenRestoredRecord(ctx, record, mention.message);
+        ctx.ui.notify(
+          reopened.ok ? `Resuming ${target}` : `Could not resume ${target} — ${reopened.reason}.`,
+          reopened.ok ? "info" : "warning",
+        );
+        return { action: "handled" };
+      }
+
       if (record.session) {
         // Both derived from the record's OWN type: a mention names an existing
         // agent, so its frontmatter is what governs — `output_transcript: false`
@@ -1707,19 +1728,21 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Reopen an evicted agent's conversation from the session file its tombstone
-   * points at, as an ordinary detached spawn: the new record picks up the
-   * widget, fleet row, transcript and completion notification unchanged, and
-   * `reclaim` hands it back the names the tombstone was holding.
+   * Reopen a conversation from the session file a record points at, as an
+   * ordinary detached spawn: the new record picks up the widget, fleet row,
+   * transcript and completion notification unchanged, and `reclaim` hands it
+   * back the names the previous record was holding.
    *
-   * Shared by the `@handle message` mention and the Agent tool's `resume`,
-   * which differ only in how they report the outcome — a notification versus a
-   * tool result. Failures are returned rather than thrown so each caller can
-   * phrase them for its own audience.
+   * Two records point at such a file: an evicted agent's tombstone, and one the
+   * session-start restore scan rebuilt from a persisted child session. Shared
+   * by the `@handle message` mention and the Agent tool's `resume`, which differ
+   * only in how they report the outcome — a notification versus a tool result.
+   * Failures are returned rather than thrown so each caller can phrase them for
+   * its own audience.
    */
   async function reopenTombstone(
     ctx: ExtensionContext,
-    entry: AgentTombstone,
+    entry: ReopenTarget,
     prompt: string,
   ): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
     // Checked here rather than left to SessionManager.open: that runs inside
@@ -1729,7 +1752,7 @@ export default function (pi: ExtensionAPI) {
     // entry — a row that can only ever fail is worse than none — and say so
     // rather than quietly sending this message to an unrelated agent.
     if (!existsSync(entry.sessionFile)) {
-      manager.dropTombstone(entry.handle);
+      if (entry.handle) manager.dropTombstone(entry.handle);
       return { ok: false, reason: "its session is gone" };
     }
 
@@ -1753,7 +1776,10 @@ export default function (pi: ExtensionAPI) {
       // a tombstone this extension wrote.
       const id = spawnResolved(pi, ctx, dispatch.type, prompt, {
         description: entry.description,
-        reclaim: { handle: entry.handle, alias: entry.alias },
+        // Undefined for a restored record: the scan never gave it a handle, so
+        // the spawn derives one from the type and `@general-purpose` reaches
+        // the reopened run.
+        ...(entry.handle ? { reclaim: { handle: entry.handle, alias: entry.alias } } : {}),
         resumeSessionFile: entry.sessionFile,
         resumeWorktree: entry.worktree,
         cwd: entry.effectiveCwd,
@@ -1778,6 +1804,46 @@ export default function (pi: ExtensionAPI) {
       // failure: a strict worktree-isolation error, an unusable cwd.
       return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  /**
+   * Reopen a session-restored record's conversation and leave the ID the caller
+   * used pointing at the run that continues it.
+   *
+   * A restored record is transcript-only: the stand-in session on it renders
+   * the conversation and cannot be prompted, which is why `AgentManager.resume`
+   * refuses these records. Its session file is the real conversation, so this
+   * reopens it the way an evicted agent's is reopened and then hands the old ID
+   * over — a caller that resumes by the ID it has been quoting must keep
+   * reaching the live run, and must not be able to open a second one.
+   */
+  async function reopenRestoredRecord(
+    ctx: ExtensionContext,
+    record: AgentRecord,
+    prompt: string,
+  ): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
+    if (!record.sessionFile) return { ok: false, reason: "its stored session is missing" };
+    const reopened = await reopenTombstone(ctx, {
+      type: record.type,
+      description: record.description,
+      sessionFile: record.sessionFile,
+      worktree: record.worktree,
+      effectiveCwd: record.effectiveCwd,
+      configCwd: record.configCwd,
+      originCwd: record.originCwd,
+      artifactRoot: record.artifactRoot,
+      rootSessionId: record.rootSessionId,
+      handle: record.handle,
+      alias: record.alias,
+    }, prompt);
+    if (!reopened.ok) return reopened;
+    // Every tool resolves an agent by its current or original ID, so the ID the
+    // caller used has to follow the conversation — and the next invocation entry
+    // this record writes into the reopened session file carries it too.
+    const live = manager.getRecord(reopened.id);
+    if (live) live.originalId = record.originalId ?? record.id;
+    manager.dropRestoredRecord(record.id);
+    return reopened;
   }
 
   /**
@@ -2489,6 +2555,28 @@ Terse command-style prompts produce shallow, generic work.
         };
       };
 
+      /**
+       * Tool result for a resume that continued a conversation from its
+       * session file. `because` says which of the two ways that happened, since
+       * the caller has to know whether the record it named is still the one
+       * running.
+       */
+      const reopenedSessionResult = (reopened: { id: string }, type: SubagentType, because: string) => {
+        const record = manager.getRecord(reopened.id);
+        return textResult(
+          `Agent resumed in background from its stored session.\n` +
+          `Agent ID: ${reopened.id}\n` +
+          `Type: ${type}\n` +
+          (record ? formatWorkspace(record) : "") +
+          (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+          `\n${because}\n` +
+          `You will be notified when it completes.`,
+          record
+            ? { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: reopened.id }
+            : undefined,
+        );
+      };
+
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
         if (!isSchedulingEnabled()) {
@@ -2548,21 +2636,29 @@ Terse command-style prompts produce shallow, generic work.
             if (!reopened.ok) {
               return textResult(`Could not resume "${params.resume}" — ${reopened.reason}.`);
             }
-            const record = manager.getRecord(reopened.id);
-            return textResult(
-              `Agent resumed in background from its stored session.\n` +
-              `Agent ID: ${reopened.id}\n` +
-              `Type: ${evicted.entry.type}\n` +
-              (record ? formatWorkspace(record) : "") +
-              (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-              `\nIts in-memory record had been evicted, so this run reopens the conversation from disk and takes back the handle.\n` +
-              `You will be notified when it completes.`,
-              record
-                ? { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: reopened.id }
-                : undefined,
+            return reopenedSessionResult(
+              reopened,
+              evicted.entry.type,
+              "Its in-memory record had been evicted, so this run reopens the conversation from disk and takes back the handle.",
             );
           }
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+        }
+        // A record the session-start scan rebuilt from a persisted child
+        // session. Its `session` renders the transcript and has no `prompt()`,
+        // so resuming it in place died with `session.prompt is not a function`.
+        // The conversation on disk is continued by a live run instead, and the
+        // ID you asked for is handed to that run.
+        if (existing.restoredSession) {
+          const reopened = await reopenRestoredRecord(ctx, existing, params.prompt);
+          if (!reopened.ok) {
+            return textResult(`Could not resume "${params.resume}" — ${reopened.reason}.`);
+          }
+          return reopenedSessionResult(
+            reopened,
+            existing.type,
+            "Only its transcript was restored at session start, so this run reopens the conversation from disk. The ID you resumed now points at it.",
+          );
         }
         if (existing.status === "running" || existing.status === "queued" || manager.isRunActive(existing.id)) {
           const runState = existing.status === "queued" ? "queued" : "running";
