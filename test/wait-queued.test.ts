@@ -10,10 +10,8 @@
  * queues, call the real tool with wait:true, drain the queue, and assert the
  * call returns the final result.
  *
- * Also covers the other half of the wait's contract: pi holds anything the
- * operator types until the tool returns, so a wait that ignores queued input
- * strands a prompt for the length of the run. `hasPendingMessages` releases the
- * wait — and only the wait.
+ * Also covers the wait's other release path: pi holds anything the operator types
+ * until the tool returns, so a wait that ignores queued input strands a prompt.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -66,8 +64,8 @@ const flush = async () => {
   await new Promise((r) => setImmediate(r));
 };
 
-// A fake-timer test that hangs never reaches its own finally, and leaked fake
-// timers would time out every later test in this file instead of just this one.
+// A hanging fake-timer test never reaches its own finally, and leaked fake
+// timers would time out every later test in this file.
 afterEach(() => { vi.useRealTimers(); });
 
 /** runAgent mock where each call blocks until we resolve it manually. */
@@ -412,6 +410,35 @@ describe("get_subagent_result wait:true releases on queued user input", () => {
     }
 
     expect(outcome).toBe("pending-input");
+  });
+
+  it("releases on input without leaving an abort listener or a poll behind", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, "addEventListener");
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    const typed = { value: false };
+    let outcome: string | undefined;
+    let timersAfterRelease: number | undefined;
+    try {
+      const wait = waitForResult(
+        { status: "running", promise: new Promise(() => {}) },
+        () => typed.value,
+        controller.signal,
+      );
+      typed.value = true;
+      vi.advanceTimersByTime(60);
+      outcome = await wait;
+      timersAfterRelease = vi.getTimerCount();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(outcome).toBe("pending-input");
+    expect(timersAfterRelease).toBe(0);
+    expect(addListener.mock.calls.map(([type]) => type)).toEqual(["abort"]);
+    expect(removeListener).toHaveBeenCalledTimes(1);
+    expect(removeListener.mock.calls[0]?.[0]).toBe("abort");
   });
 
   it("absorbs a child rejection that lands after the wait released", async () => {

@@ -446,11 +446,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       if (!ownsRecord(record, context.parentAgentId)) {
         return textResult(`Nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
-      // Cancellation (e.g. the parent's tool call is aborted) stops only this
-      // wait; the nested child keeps running and stays unconsumed. Queued user
-      // input releases the wait the same way — the child is never touched, it
-      // just stops being waited on. `ctx` is this call's own context, so the
-      // pending-message check reads the parent session's queue, not the root's.
+      // Cancellation (e.g. the parent's tool call is aborted) or queued input ends
+      // only this wait; the nested child keeps running and stays unconsumed.
       let interrupted = false;
       if (params.wait && (record.status === "queued" || record.status === "running")) {
         const outcome = await waitForResult(record, () => ctx.hasPendingMessages(), signal);

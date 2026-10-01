@@ -3360,11 +3360,8 @@ Terse command-style prompts produce shallow, generic work.
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
-      // Wait for completion if requested. Cancellation stops only this tool
-      // call; the background agent keeps running and remains unconsumed so its
-      // completion notification can still be delivered. Queued user input
-      // releases the wait the same way — the agent is never touched, it just
-      // stops being waited on.
+      // Cancellation or queued input ends only this wait: the agent keeps running
+      // and unconsumed, so its completion notification still fires.
       let interrupted = false;
       if (params.wait && (record.status === "running" || record.status === "queued")) {
         const outcome = await waitForResult(record, () => ctx.hasPendingMessages(), signal);
