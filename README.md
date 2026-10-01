@@ -496,8 +496,10 @@ Check status and retrieve results from a background agent.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to check |
-| `wait` | boolean | no | Wait for completion |
+| `wait` | boolean | no | Wait for completion unless the parent has queued messages |
 | `verbose` | boolean | no | Include full conversation log |
+
+A `wait: true` call returns early when the parent has queued messages, including steering and follow-ups. Only the wait is interrupted: the background agent keeps running, its result remains available, and its completion notification is not consumed. This applies to top-level and nested result waits.
 
 Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally. Running results include idle time; when the configured threshold is exceeded, the response marks the agent stalled and suggests steering, interrupting with `update_subagent`, or stopping it. Stalls never trigger automatic action.
 

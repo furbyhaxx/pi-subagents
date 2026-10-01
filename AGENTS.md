@@ -60,11 +60,11 @@ Read the file that covers a surface before changing its behavior; update it in t
 
 ## Git
 
-- Commit your own work on the current default branch once the check suite is green. Conventional Commits, imperative subject, no emojis.
+- For every change request, use this workflow: create a descriptive Conventional Commit-style branch and worktree; implement and commit focused changes; review; merge back locally into the default branch; update the changelog; bump the version; commit the release metadata; tag the release; push the default branch and release tag. Use Conventional Commits, imperative subjects, and no emojis.
 - **Stage explicit paths** (`git add <path>`). Never `git add -A` or `git add .` — several agent sessions share this worktree and their unfinished work must not be swept into your commit.
 - Commit only what you authored in the current session. When a file also carries another session's uncommitted work, stage only your hunks (`git diff -U0` + `git apply --cached --unidiff-zero`) and leave their hunks untouched.
 - Commit bodies are checked by commitlint (`body-max-line-length` 100) — wrap them. Never `git commit --no-verify`; fix the failure instead.
-- Push the current branch after committing and confirm the remote ref matches (`git ls-remote origin <branch>`). Don't create branches or tags, and never force push.
+- Push the default branch and the release tag after verification. Confirm both remote refs match the local refs with `git ls-remote`. Never force push.
 - Never run history- or worktree-destroying commands: `git reset --hard`, `git checkout .`, `git clean -fd`, `git stash`, or any force push.
 - Leave the working tree as the user left it — don't stage, stash, or revert files you didn't change. 
 
@@ -152,7 +152,7 @@ Before a release:
   `PI_E2E_LIVE=1` swaps the scripted faux suite for the live one (the faux suite is `skipIf(LIVE)`).
   (`prepublishOnly` runs lint + typecheck + test + build; the live e2e is the smoke test to run by hand before publishing.)
 
-**Never publish.** The user runs `npm version` / `npm publish` and any tagging manually. Do not run those commands unless the user explicitly asks.
+**Never publish without explicit approval.** Version bumps and release tags are part of the change workflow above; npm publication requires separate, explicit authorization.
 
 ## User Override
 
