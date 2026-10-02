@@ -24,6 +24,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import subagentsExtension from "../src/index.js";
+import { sessionArtifactRoot } from "../src/output-file.js";
 import { resolveSubagentSessionDir } from "../src/session-dir.js";
 import { ctx, type Hermetic, hermeticDir, makePi, textOf } from "./helpers/boot-extension.js";
 import { fauxModelBackend } from "./helpers/faux-model-backend.js";
@@ -43,6 +44,9 @@ beforeEach(() => {
   childCwd = join(hermetic.dir, "child-cwd");
   mkdirSync(childCwd, { recursive: true });
   sessionRoot = process.env.PI_CODING_AGENT_SESSION_DIR!;
+  // This file asserts on records through the manager registry, which the first
+  // activation of a process claims once and never hands over.
+  delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
   // Every model call answers with the same line, so the child settles on its
   // first turn whatever the run does.
   faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
@@ -84,7 +88,7 @@ function persistedChild(opts: { parentSession: string; agentId: string }) {
 }
 
 /** Boot the real extension over a parent session, with a model the child can run. */
-function boot(parent: SessionManager) {
+function boot(parent: SessionManager, cwd = hermetic.dir) {
   const model = faux.getModel();
   const backend = fauxModelBackend(model);
   const { pi, tools, lifecycle } = makePi();
@@ -93,7 +97,7 @@ function boot(parent: SessionManager) {
   pi.appendEntry = vi.fn((customType: string, data: unknown) => { parent.appendCustomEntry(customType, data); });
   subagentsExtension(pi);
   const context = ctx({
-    cwd: hermetic.dir,
+    cwd,
     model,
     // runAgent hands the runtime facade down to the child session, which pi
     // >=0.80.8 reads instead of the registry option.
@@ -367,6 +371,44 @@ describe("resuming a session-restored agent", () => {
       "tc-settled-result", { agent_id: liveId, wait: true }, undefined, undefined, context,
     );
     expect(childPrompts(childFile)).toEqual(["ship the panel", "continue", "keep going"]);
+
+    await lifecycle.get("session_shutdown")?.({}, context);
+  });
+
+  it("binds the reopened run to the parent session's own artifact root", async () => {
+    const agentId = "restored-resume-agent-07";
+    const parent = parentSession(agentId);
+    // The parent session is a package inside a repository: the session's origin
+    // is the repository, the tool context is the package below it. A reopen that
+    // roots its artifacts from the tool cwd files them under a project the
+    // session never ran in.
+    const repoRoot = join(hermetic.dir, "repo");
+    const pkgCwd = join(repoRoot, "packages", "app");
+    mkdirSync(pkgCwd, { recursive: true });
+    const binding = {
+      rootSessionId: parent.getSessionId(),
+      originCwd: repoRoot,
+      artifactRoot: sessionArtifactRoot(repoRoot, parent.getSessionId()),
+    };
+    parent.appendCustomEntry("subagents:artifacts", binding);
+    // Otherwise the assertion below would also hold for a root computed from
+    // the tool cwd, which is the failure it exists to catch.
+    expect(binding.artifactRoot).not.toBe(sessionArtifactRoot(pkgCwd, parent.getSessionId()));
+
+    persistedChild({ parentSession: parent.getSessionFile()!, agentId });
+    const { tools, lifecycle, context } = boot(parent, pkgCwd);
+
+    await lifecycle.get("session_start")?.({}, context);
+    const liveId = reopenedId(textOf(await tools.get("Agent").execute("tc-artifacts", {
+      prompt: "continue",
+      description: "Resume the panel",
+      subagent_type: "general-purpose",
+      resume: agentId,
+      run_in_background: true,
+    }, undefined, undefined, context)));
+
+    const record = (globalThis as any)[Symbol.for("pi-subagents:manager")].getRecord(liveId);
+    expect(record).toMatchObject(binding);
 
     await lifecycle.get("session_shutdown")?.({}, context);
   });

@@ -106,12 +106,13 @@ type InvocationEntryData = { agentId?: unknown; startedAt?: unknown };
 type RecordEntryData = { id?: unknown; status?: unknown; result?: unknown; error?: unknown; startedAt?: unknown };
 const RESTORED_TERMINAL_STATUSES = new Set<AgentRecord["status"]>(["completed", "steered", "aborted", "stopped", "error"]);
 type WorkspaceEntryData = { worktree?: AgentRecord["worktree"]; effectiveCwd?: unknown; configCwd?: unknown };
-type ArtifactEntryData = { artifactRoot?: unknown; originCwd?: unknown; rootSessionId?: unknown };
 /**
  * What a reopen needs: where the conversation is on disk, plus the names the
  * previous record was holding. The names are absent for a record the
  * session-start restore scan built — it strips handles, since nothing can be
- * reopened by a name that was never allocated to a live run.
+ * reopened by a name that was never allocated to a live run. So are the
+ * artifact paths: no writer records them in a child session file, and a
+ * restored reopen takes the binding of the session doing the reopening.
  */
 type ReopenTarget = Pick<AgentTombstone,
   "type" | "description" | "sessionFile" | "worktree" | "effectiveCwd" | "configCwd" | "originCwd" | "artifactRoot" | "rootSessionId"
@@ -145,21 +146,6 @@ function restoredType(info: SessionInfo): SubagentType {
 /** A path read back out of a session file, accepted only when it is absolute. */
 function absolutePath(value: unknown): string | undefined {
   return typeof value === "string" && isAbsolute(value) ? value : undefined;
-}
-
-/**
- * The artifact root a child session recorded, accepted only when it is the one
- * this extension would have written for this root session: both paths absolute
- * and the root id matching. A session file is ordinary on-disk data, and these
- * fields decide where a resumed run writes its artifacts, so the restore scan —
- * the one reader without the check `sessionArtifacts` applies — is where it
- * belongs. A rejected root falls back to the current session's own binding.
- */
-function restoredArtifactBinding(data: ArtifactEntryData | undefined, rootSessionId: string) {
-  const originCwd = absolutePath(data?.originCwd);
-  const artifactRoot = absolutePath(data?.artifactRoot);
-  if (!originCwd || !artifactRoot || data?.rootSessionId !== rootSessionId) return undefined;
-  return { originCwd, artifactRoot };
 }
 
 function makeRestoredSession(sessionManager: SessionManager): AgentSession {
@@ -253,9 +239,6 @@ export function restoredRecordFromSession(
     : entryText(entries.find(entry => entry.type === "message" && entry.message.role === "user"));
   const workspaceEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:workspace");
   const workspaceData = workspaceEntry?.type === "custom" ? workspaceEntry.data as WorkspaceEntryData | undefined : undefined;
-  const artifactEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:artifacts");
-  const artifactData = artifactEntry?.type === "custom" ? artifactEntry.data as ArtifactEntryData | undefined : undefined;
-  const artifacts = restoredArtifactBinding(artifactData, parentSessionId);
   // What the run actually used, for a child whose workspace entry recorded it.
   // The session's own cwd is the fallback: a child with no worktree never wrote
   // one, and that is the run's cwd too.
@@ -292,7 +275,6 @@ export function restoredRecordFromSession(
     worktree: workspaceData?.worktree,
     effectiveCwd: workspaceCwd ?? (sessionManager.getCwd() || info.cwd),
     ...(configCwd ? { configCwd } : {}),
-    ...(artifacts ?? {}),
     rootSessionId: parentSessionId,
     sessionFile: info.path,
     lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
@@ -1818,8 +1800,10 @@ export default function (pi: ExtensionAPI) {
         resumeWorktree: entry.worktree,
         cwd: entry.effectiveCwd,
         configCwd: entry.configCwd,
-        originCwd: entry.originCwd,
-        artifactRoot: entry.artifactRoot,
+        // Only a tombstone that recorded them: a key present with an undefined
+        // value would override the binding `spawnResolved` just computed for
+        // this session, and the run would fall back to the tool's cwd.
+        ...(entry.originCwd && entry.artifactRoot ? { originCwd: entry.originCwd, artifactRoot: entry.artifactRoot } : {}),
         rootSessionId: entry.rootSessionId,
         isBackground: true,
       });
@@ -1872,9 +1856,6 @@ export default function (pi: ExtensionAPI) {
         worktree: record.worktree,
         effectiveCwd: record.effectiveCwd,
         configCwd: record.configCwd,
-        originCwd: record.originCwd,
-        artifactRoot: record.artifactRoot,
-        rootSessionId: record.rootSessionId,
         handle: record.handle,
         alias: record.alias,
       }, prompt);

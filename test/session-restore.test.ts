@@ -175,33 +175,6 @@ describe("persisted subagent session restore", () => {
     expect(record?.result).toBeUndefined();
   });
 
-  it("carries a child session's artifact root when it is this session's", async () => {
-    const binding = {
-      originCwd: "/work",
-      artifactRoot: "/work/tasks/parent-session",
-      rootSessionId: "parent-session",
-    };
-    const info = await persistedChild({ name: "explorer#goodroot", metadata: { "subagents:artifacts": binding } });
-
-    expect(restoredRecordFromSession(info, "parent-session")).toMatchObject(binding);
-  });
-
-  it.each([
-    ["a relative origin", { originCwd: "work", artifactRoot: "/work/tasks", rootSessionId: "parent-session" }],
-    ["another session's root", { originCwd: "/work", artifactRoot: "/work/tasks", rootSessionId: "other-session" }],
-  ])("refuses %s in a child session's recorded artifact root", async (_case, tampered) => {
-    // These two fields choose where a resumed run writes its artifacts, and the
-    // runtime path validates both before using them. The restore scan is the one
-    // reader that took them on trust.
-    const info = await persistedChild({ name: "explorer#badroot", metadata: { "subagents:artifacts": tampered } });
-    const record = restoredRecordFromSession(info, "parent-session");
-
-    expect(record?.originCwd).toBeUndefined();
-    expect(record?.artifactRoot).toBeUndefined();
-    // Never the root the file asked for: the current session's own.
-    expect(record?.rootSessionId).toBe("parent-session");
-  });
-
   it("reads the workspace cwd a run recorded over the session's own", async () => {
     // A worktree run records where its tools ran and which project configured
     // it; a reopen that loses the second re-discovers skills, memory and
