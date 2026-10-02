@@ -1862,10 +1862,15 @@ export default function (pi: ExtensionAPI) {
       if (!reopened.ok) return reopened;
       // Every tool resolves an agent by its current or original ID, so the ID the
       // caller used has to follow the conversation — and the next invocation entry
-      // this record writes into the reopened session file carries it too.
+      // this record writes into the reopened session file carries it too. Both
+      // steps or neither: retiring the placeholder without a run carrying its
+      // name leaves the ID the caller has been quoting, the one that resolves
+      // again after a restart, pointing at nothing.
       const live = manager.getRecord(reopened.id);
-      if (live) live.originalId = record.originalId ?? record.id;
-      manager.dropRestoredRecord(record.id);
+      if (live) {
+        live.originalId = record.originalId ?? record.id;
+        manager.dropRestoredRecord(record.id);
+      }
       return reopened;
     } finally {
       manager.releaseRestoredRecord(record.id);
