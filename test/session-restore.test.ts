@@ -32,6 +32,8 @@ async function persistedChild(opts: {
   prompt?: string;
   invocation?: { agentId: string; startedAt: number };
   stopReason?: "stop" | "error";
+  /** Extra `subagents:*` custom entries, by customType. */
+  metadata?: Record<string, unknown>;
 }) {
   const dir = mkdtempSync(join(tmpdir(), "pi-subagents-restore-"));
   dirs.push(dir);
@@ -54,6 +56,7 @@ async function persistedChild(opts: {
     stopReason: opts.stopReason ?? "stop",
     timestamp: 2,
   } as never);
+  for (const [customType, data] of Object.entries(opts.metadata ?? {})) child.appendCustomEntry(customType, data);
   const info = (await SessionManager.list("/work", dir)).find(session => session.parentSessionPath === parent);
   expect(info).toBeDefined();
   return info!;
@@ -172,6 +175,58 @@ describe("persisted subagent session restore", () => {
     expect(record?.result).toBeUndefined();
   });
 
+  it("carries a child session's artifact root when it is this session's", async () => {
+    const binding = {
+      originCwd: "/work",
+      artifactRoot: "/work/tasks/parent-session",
+      rootSessionId: "parent-session",
+    };
+    const info = await persistedChild({ name: "explorer#goodroot", metadata: { "subagents:artifacts": binding } });
+
+    expect(restoredRecordFromSession(info, "parent-session")).toMatchObject(binding);
+  });
+
+  it.each([
+    ["a relative origin", { originCwd: "work", artifactRoot: "/work/tasks", rootSessionId: "parent-session" }],
+    ["another session's root", { originCwd: "/work", artifactRoot: "/work/tasks", rootSessionId: "other-session" }],
+  ])("refuses %s in a child session's recorded artifact root", async (_case, tampered) => {
+    // These two fields choose where a resumed run writes its artifacts, and the
+    // runtime path validates both before using them. The restore scan is the one
+    // reader that took them on trust.
+    const info = await persistedChild({ name: "explorer#badroot", metadata: { "subagents:artifacts": tampered } });
+    const record = restoredRecordFromSession(info, "parent-session");
+
+    expect(record?.originCwd).toBeUndefined();
+    expect(record?.artifactRoot).toBeUndefined();
+    // Never the root the file asked for: the current session's own.
+    expect(record?.rootSessionId).toBe("parent-session");
+  });
+
+  it("reads the workspace cwd a run recorded over the session's own", async () => {
+    // A worktree run records where its tools ran and which project configured
+    // it; a reopen that loses the second re-discovers skills, memory and
+    // extensions from the worktree instead of from that project.
+    const info = await persistedChild({
+      name: "explorer#workdir",
+      metadata: { "subagents:workspace": { effectiveCwd: "/work/tree", configCwd: "/work/project" } },
+    });
+    const record = restoredRecordFromSession(info, "parent-session");
+
+    // The child's own cwd is /work, so both overrides are the recorded ones.
+    expect(record).toMatchObject({ effectiveCwd: "/work/tree", configCwd: "/work/project" });
+  });
+
+  it("ignores a relative workspace cwd in a child session file", async () => {
+    const info = await persistedChild({
+      name: "explorer#relcwd",
+      metadata: { "subagents:workspace": { effectiveCwd: "tree", configCwd: "project" } },
+    });
+    const record = restoredRecordFromSession(info, "parent-session");
+
+    expect(record?.effectiveCwd).toBe("/work");
+    expect(record?.configCwd).toBeUndefined();
+  });
+
   it("restores transcript records without handles and keeps them through cleanup", async () => {
     const manager = new AgentManager();
     try {
@@ -194,6 +249,44 @@ describe("persisted subagent session restore", () => {
       expect(restored.handle).toBeUndefined();
       expect(restored.alias).toBeUndefined();
       expect(manager.listAgents().map(agent => agent.id)).toContain("restored-old");
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("claims a restored record's reopen once, and only the claimant may retire it", async () => {
+    const manager = new AgentManager();
+    try {
+      const id = "restored-claimed";
+      manager.restoreCompleted({
+        id,
+        type: "explorer",
+        description: "transcript only",
+        status: "completed",
+        toolUses: 0,
+        startedAt: 1,
+        completedAt: 2,
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        compactionCount: 0,
+        sessionFile: "/tmp/claimed.jsonl",
+        restoredSession: true,
+      });
+
+      // A second resume in the same turn is turned away rather than queued:
+      // both would spawn a run over the same session file.
+      expect(manager.claimRestoredRecord(id)).toBe(true);
+      expect(manager.claimRestoredRecord(id)).toBe(false);
+      // The gate is for restored records only.
+      expect(manager.claimRestoredRecord("no-such-record")).toBe(false);
+
+      manager.releaseRestoredRecord(id);
+      // Released, so a claim-less caller cannot retire the placeholder from
+      // under a reopen that is in progress.
+      manager.dropRestoredRecord(id);
+      expect(manager.getRecord(id)).toBeDefined();
+      expect(manager.claimRestoredRecord(id)).toBe(true);
+      manager.dropRestoredRecord(id);
+      expect(manager.getRecord(id)).toBeUndefined();
     } finally {
       await manager.dispose();
     }

@@ -191,6 +191,113 @@ describe("resuming a session-restored agent", () => {
     await lifecycle.get("session_shutdown")?.({}, context);
   });
 
+  it("runs one continuation when two resumes of the same restored record race", async () => {
+    const agentId = "restored-resume-agent-04";
+    const parent = parentSession(agentId);
+    const childFile = persistedChild({ parentSession: parent.getSessionFile()!, agentId });
+    const { tools, lifecycle, context } = boot(parent);
+    // Two answers queued: the pre-fix race is two live runs, and the second one
+    // must not fail on an empty queue before the assertions get to look at it.
+    faux.setResponses([
+      () => fauxAssistantMessage("continued in the reopened session"),
+      () => fauxAssistantMessage("continued in the reopened session"),
+    ]);
+
+    await lifecycle.get("session_start")?.({}, context);
+
+    // Two `Agent({resume})` calls in one assistant turn, which a model can
+    // issue. A reopen awaits the new run's startup before it settles, and the
+    // restored record is still in the manager throughout, so both calls reach
+    // the restored branch unless one of them is turned away up front.
+    const [a, b] = await Promise.all([
+      tools.get("Agent").execute("tc-race-a", {
+        prompt: "continue",
+        description: "Resume the panel",
+        subagent_type: "general-purpose",
+        resume: agentId,
+        run_in_background: true,
+      }, undefined, undefined, context),
+      tools.get("Agent").execute("tc-race-b", {
+        prompt: "continue",
+        description: "Resume the panel",
+        subagent_type: "general-purpose",
+        resume: agentId,
+        run_in_background: true,
+      }, undefined, undefined, context),
+    ]);
+
+    const texts = [textOf(a), textOf(b)];
+    const continued = texts.filter(text => text.includes("resumed in background from its stored session"));
+    const refused = texts.filter(text => text.includes("it is already being resumed"));
+    expect(continued, `no reopen reported:\n${texts.join("\n---\n")}`).toHaveLength(1);
+    // Deterministic, not a race-dependent message: the loser is told the run is
+    // already under way rather than getting a second live agent.
+    expect(refused, `no refusal reported:\n${texts.join("\n---\n")}`).toHaveLength(1);
+
+    // One continuation, not two: a second live run would have appended its own
+    // prompt — and its own answer — to the same session file.
+    const newId = reopenedId(continued[0]);
+    await tools.get("get_subagent_result").execute(
+      "tc-race-result", { agent_id: newId, wait: true }, undefined, undefined, context,
+    );
+    const entries = SessionManager.open(childFile).getEntries();
+    const prompts = entries
+      .filter(entry => entry.type === "message" && entry.message.role === "user")
+      .map(entry => (entry as { message: { content: Array<{ text: string }> } }).message.content.map(part => part.text).join(""));
+    expect(prompts).toEqual(["ship the panel", "continue"]);
+    const invocations = entries.filter(entry => entry.type === "custom" && entry.customType === "subagents:invocation");
+    expect(invocations).toHaveLength(2);
+
+    await lifecycle.get("session_shutdown")?.({}, context);
+  });
+
+  it("does not rebuild a transcript for a session file a live run still holds", async () => {
+    const agentId = "restored-resume-agent-05";
+    const parent = parentSession(agentId);
+    const childFile = persistedChild({ parentSession: parent.getSessionFile()!, agentId });
+    const { tools, lifecycle, context } = boot(parent);
+    // A turn that never arrives: the run has to still be in flight when the
+    // scan runs a second time.
+    faux.setResponses([() => new Promise<never>(() => {})]);
+
+    await lifecycle.get("session_start")?.({}, context);
+    const first = textOf(await tools.get("Agent").execute("tc-live", {
+      prompt: "continue",
+      description: "Resume the panel",
+      subagent_type: "general-purpose",
+      resume: agentId,
+      run_in_background: true,
+    }, undefined, undefined, context));
+    const liveId = reopenedId(first);
+
+    // A repeated session_start — what `/reload` emits — runs the scan again with
+    // that run still going.
+    await lifecycle.get("session_start")?.({ reason: "reload" }, context);
+
+    // The ID the caller has been quoting reaches the live run, and says so.
+    const byOldId = textOf(await tools.get("get_subagent_result").execute(
+      "tc-old", { agent_id: agentId }, undefined, undefined, context,
+    ));
+    expect(byOldId).toContain(`Agent: ${liveId}`);
+    expect(byOldId).toContain("still running");
+
+    // The scan's own id for the file is the fork: a stand-in record for a
+    // conversation that is live right now would let a resume on that address
+    // open a second run over the same file.
+    const restoredId = `restored-${(await SessionManager.listAll(resolveSubagentSessionDir()!))
+      .find(info => info.path === childFile)!.id}`;
+    const viaPlaceholder = textOf(await tools.get("Agent").execute("tc-placeholder", {
+      prompt: "continue again",
+      description: "Resume via the scan's id",
+      subagent_type: "general-purpose",
+      resume: restoredId,
+      run_in_background: true,
+    }, undefined, undefined, context));
+    expect(viaPlaceholder).toContain("Agent not found");
+
+    await lifecycle.get("session_shutdown")?.({}, context);
+  });
+
   it("reopens the same conversation from a `@id` mention", async () => {
     const agentId = "restored-resume-agent-03";
     const parent = parentSession(agentId);

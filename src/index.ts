@@ -105,7 +105,7 @@ type TaskEntryData = { prompt?: unknown };
 type InvocationEntryData = { agentId?: unknown; startedAt?: unknown };
 type RecordEntryData = { id?: unknown; status?: unknown; result?: unknown; error?: unknown; startedAt?: unknown };
 const RESTORED_TERMINAL_STATUSES = new Set<AgentRecord["status"]>(["completed", "steered", "aborted", "stopped", "error"]);
-type WorkspaceEntryData = { worktree?: AgentRecord["worktree"] };
+type WorkspaceEntryData = { worktree?: AgentRecord["worktree"]; effectiveCwd?: unknown; configCwd?: unknown };
 type ArtifactEntryData = { artifactRoot?: unknown; originCwd?: unknown; rootSessionId?: unknown };
 /**
  * What a reopen needs: where the conversation is on disk, plus the names the
@@ -140,6 +140,26 @@ function entryText(entry: SessionEntry | undefined): string | undefined {
 function restoredType(info: SessionInfo): SubagentType {
   const prefix = info.name?.split("#", 1)[0]?.trim();
   return (prefix || "general-purpose") as SubagentType;
+}
+
+/** A path read back out of a session file, accepted only when it is absolute. */
+function absolutePath(value: unknown): string | undefined {
+  return typeof value === "string" && isAbsolute(value) ? value : undefined;
+}
+
+/**
+ * The artifact root a child session recorded, accepted only when it is the one
+ * this extension would have written for this root session: both paths absolute
+ * and the root id matching. A session file is ordinary on-disk data, and these
+ * fields decide where a resumed run writes its artifacts, so the restore scan —
+ * the one reader without the check `sessionArtifacts` applies — is where it
+ * belongs. A rejected root falls back to the current session's own binding.
+ */
+function restoredArtifactBinding(data: ArtifactEntryData | undefined, rootSessionId: string) {
+  const originCwd = absolutePath(data?.originCwd);
+  const artifactRoot = absolutePath(data?.artifactRoot);
+  if (!originCwd || !artifactRoot || data?.rootSessionId !== rootSessionId) return undefined;
+  return { originCwd, artifactRoot };
 }
 
 function makeRestoredSession(sessionManager: SessionManager): AgentSession {
@@ -235,6 +255,12 @@ export function restoredRecordFromSession(
   const workspaceData = workspaceEntry?.type === "custom" ? workspaceEntry.data as WorkspaceEntryData | undefined : undefined;
   const artifactEntry = entries.find(entry => entry.type === "custom" && entry.customType === "subagents:artifacts");
   const artifactData = artifactEntry?.type === "custom" ? artifactEntry.data as ArtifactEntryData | undefined : undefined;
+  const artifacts = restoredArtifactBinding(artifactData, parentSessionId);
+  // What the run actually used, for a child whose workspace entry recorded it.
+  // The session's own cwd is the fallback: a child with no worktree never wrote
+  // one, and that is the run's cwd too.
+  const workspaceCwd = absolutePath(workspaceData?.effectiveCwd);
+  const configCwd = absolutePath(workspaceData?.configCwd);
   const model = findLastEntry(entries, entry => entry.type === "model_change");
   const thinking = findLastEntry(entries, entry => entry.type === "thinking_level_change");
   const last = entries.at(-1);
@@ -264,10 +290,10 @@ export function restoredRecordFromSession(
     completedAt: entryTimestamp(last, info.modified.getTime()),
     session: makeRestoredSession(sessionManager),
     worktree: workspaceData?.worktree,
-    effectiveCwd: sessionManager.getCwd() || info.cwd,
-    originCwd: typeof artifactData?.originCwd === "string" ? artifactData.originCwd : undefined,
-    artifactRoot: typeof artifactData?.artifactRoot === "string" ? artifactData.artifactRoot : undefined,
-    rootSessionId: typeof artifactData?.rootSessionId === "string" ? artifactData.rootSessionId : parentSessionId,
+    effectiveCwd: workspaceCwd ?? (sessionManager.getCwd() || info.cwd),
+    ...(configCwd ? { configCwd } : {}),
+    ...(artifacts ?? {}),
+    rootSessionId: parentSessionId,
     sessionFile: info.path,
     lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
     compactionCount: entries.filter(entry => entry.type === "compaction").length,
@@ -1233,6 +1259,12 @@ export default function (pi: ExtensionAPI) {
           if (seenFiles.has(info.path)) continue;
           seenFiles.add(info.path);
           if (info.parentSessionPath !== parentSessionFile) continue;
+          // A repeated session_start — `/reload` — runs this scan again, and a
+          // run started before it can still be going. Its file is that run's
+          // conversation, not a transcript to rebuild: a stand-in record for it
+          // would be a second address for one live run, and a resume on that
+          // address would open a second run over the same file.
+          if (manager.hasLiveRunOn(info.path)) continue;
           const record = restoredRecordFromSession(info, ctx.sessionManager?.getSessionId?.() ?? "standalone", parentEntries);
           if (!record) continue;
           const restored = manager.restoreCompleted(record);
@@ -1823,27 +1855,38 @@ export default function (pi: ExtensionAPI) {
     prompt: string,
   ): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
     if (!record.sessionFile) return { ok: false, reason: "its stored session is missing" };
-    const reopened = await reopenTombstone(ctx, {
-      type: record.type,
-      description: record.description,
-      sessionFile: record.sessionFile,
-      worktree: record.worktree,
-      effectiveCwd: record.effectiveCwd,
-      configCwd: record.configCwd,
-      originCwd: record.originCwd,
-      artifactRoot: record.artifactRoot,
-      rootSessionId: record.rootSessionId,
-      handle: record.handle,
-      alias: record.alias,
-    }, prompt);
-    if (!reopened.ok) return reopened;
-    // Every tool resolves an agent by its current or original ID, so the ID the
-    // caller used has to follow the conversation — and the next invocation entry
-    // this record writes into the reopened session file carries it too.
-    const live = manager.getRecord(reopened.id);
-    if (live) live.originalId = record.originalId ?? record.id;
-    manager.dropRestoredRecord(record.id);
-    return reopened;
+    // Claimed before the first await and released after the last. The reopen
+    // spawns and then waits for that run's startup, and the restored record
+    // answers to every name it holds for the whole of it, so two resumes in
+    // one turn would both pass the branch above and open two live runs over one
+    // session file. The refusal is deliberate rather than a wait: the caller
+    // gets one continuation and a straight answer about the other.
+    if (!manager.claimRestoredRecord(record.id)) return { ok: false, reason: "it is already being resumed" };
+    try {
+      const reopened = await reopenTombstone(ctx, {
+        type: record.type,
+        description: record.description,
+        sessionFile: record.sessionFile,
+        worktree: record.worktree,
+        effectiveCwd: record.effectiveCwd,
+        configCwd: record.configCwd,
+        originCwd: record.originCwd,
+        artifactRoot: record.artifactRoot,
+        rootSessionId: record.rootSessionId,
+        handle: record.handle,
+        alias: record.alias,
+      }, prompt);
+      if (!reopened.ok) return reopened;
+      // Every tool resolves an agent by its current or original ID, so the ID the
+      // caller used has to follow the conversation — and the next invocation entry
+      // this record writes into the reopened session file carries it too.
+      const live = manager.getRecord(reopened.id);
+      if (live) live.originalId = record.originalId ?? record.id;
+      manager.dropRestoredRecord(record.id);
+      return reopened;
+    } finally {
+      manager.releaseRestoredRecord(record.id);
+    }
   }
 
   /**
@@ -2559,13 +2602,15 @@ Terse command-style prompts produce shallow, generic work.
        * Tool result for a resume that continued a conversation from its
        * session file. `because` says which of the two ways that happened, since
        * the caller has to know whether the record it named is still the one
-       * running.
+       * running. `durableId` is the ID that survives a restart — the reopened
+       * run's own ID is written nowhere, so only the restored record's is.
        */
-      const reopenedSessionResult = (reopened: { id: string }, type: SubagentType, because: string) => {
+      const reopenedSessionResult = (reopened: { id: string }, type: SubagentType, because: string, durableId?: string) => {
         const record = manager.getRecord(reopened.id);
         return textResult(
           `Agent resumed in background from its stored session.\n` +
           `Agent ID: ${reopened.id}\n` +
+          (durableId ? `Durable agent ID: ${durableId} — this is the one that resolves again after a Pi restart; the ID above does not.\n` : "") +
           `Type: ${type}\n` +
           (record ? formatWorkspace(record) : "") +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
@@ -2658,6 +2703,7 @@ Terse command-style prompts produce shallow, generic work.
             reopened,
             existing.type,
             "Only its transcript was restored at session start, so this run reopens the conversation from disk. The ID you resumed now points at it.",
+            existing.originalId ?? existing.id,
           );
         }
         if (existing.status === "running" || existing.status === "queued" || manager.isRunActive(existing.id)) {

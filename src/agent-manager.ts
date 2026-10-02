@@ -493,6 +493,8 @@ export class AgentManager {
    * completed records on session start/switch.
    */
   private tombstones = new Map<string, AgentTombstone>();
+  /** Restored records a reopen is already under way on. */
+  private reopeningRestored = new Set<string>();
 
   /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
@@ -1887,6 +1889,19 @@ export class AgentManager {
     return this.agents.get(id);
   }
 
+  /**
+   * Whether a live run is still using a session file. A restored transcript
+   * stand-in for one would be a second record for a conversation that is being
+   * continued right now, and resuming it would open a second run on the file.
+   */
+  hasLiveRunOn(sessionFile: string): boolean {
+    for (const record of this.agents.values()) {
+      if (record.restoredSession || record.sessionFile !== sessionFile) continue;
+      if (this.activeRuns.has(record.id) || record.status === "running" || record.status === "queued") return true;
+    }
+    return false;
+  }
+
   restoreCompleted(record: AgentRecord): AgentRecord {
     const existing = this.agents.get(record.id);
     if (existing) return existing;
@@ -1907,12 +1922,37 @@ export class AgentManager {
   }
 
   /**
+   * Take exclusive ownership of a restored record's reopen, synchronously.
+   *
+   * A reopen spawns and then awaits the new run's startup, and the restored
+   * record stays in the map — and answerable by every name it holds — for the
+   * whole of it. Two resumes in one turn would both pass the restored-record
+   * branch and open two live runs on one session file, which is worse than the
+   * crash this path replaced: two answers in one transcript. The gate is
+   * synchronous for the same reason `resume()` flips `status` before it awaits.
+   */
+  claimRestoredRecord(id: string): boolean {
+    const record = this.agents.get(id);
+    if (!record?.restoredSession || this.reopeningRestored.has(id)) return false;
+    this.reopeningRestored.add(id);
+    return true;
+  }
+
+  releaseRestoredRecord(id: string): void {
+    this.reopeningRestored.delete(id);
+  }
+
+  /**
    * Forget a restored transcript record once a live record continues its
    * conversation. The reopened run carries the original ID, so keeping the
    * placeholder would leave a second, stale answer for it — and a resume
    * addressed to it would open a second run on one session file.
+   *
+   * Claim-gated: only the reopen holding the record may retire it, so a
+   * duplicate record can never be removed from under a reopen in progress.
    */
   dropRestoredRecord(id: string): void {
+    if (!this.reopeningRestored.has(id)) return;
     if (this.agents.get(id)?.restoredSession) this.agents.delete(id);
   }
 
