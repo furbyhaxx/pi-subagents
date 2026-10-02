@@ -120,7 +120,13 @@ beforeEach(async () => {
   vi.mocked(runAgent).mockResolvedValue({ responseText: "continued" } as never);
 });
 
-/** The reopen `reopenTombstone` performs for a restored record, plus the rebind. */
+/**
+ * The reopen `reopenTombstone` performs for a restored record, plus the rebind.
+ *
+ * Deliberately not the production `reopenRestoredRecord`: the claim/release and
+ * the placeholder's removal are index.ts wiring with nothing to do with git, and
+ * keeping the placeholder here is a state production never enters.
+ */
 async function reopen(record: AgentRecord, prompt: string, pi: ExtensionAPI = api) {
   const id = manager.spawn(pi, ctx, record.type, prompt, {
     description: record.description,
