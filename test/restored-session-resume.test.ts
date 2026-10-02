@@ -110,6 +110,37 @@ function reopenedId(text: string): string {
   return match![1];
 }
 
+/** The id the restore scan publishes for a persisted child session file. */
+async function scanIdFor(childFile: string): Promise<string> {
+  const info = (await SessionManager.listAll(resolveSubagentSessionDir()!)).find(session => session.path === childFile);
+  expect(info, `no session listed for ${childFile}`).toBeDefined();
+  return `restored-${info!.id}`;
+}
+
+/** User prompts written to a child session file, oldest first. */
+function childPrompts(childFile: string): string[] {
+  return SessionManager.open(childFile).getEntries()
+    .filter(entry => entry.type === "message" && entry.message.role === "user")
+    .map(entry => (entry as { message: { content: Array<{ text: string }> } }).message.content.map(part => part.text).join(""));
+}
+
+/**
+ * Wait for a run to reach a terminal state without reading its result: the
+ * parent session's terminal record is written by the same completion handler
+ * that flips the status, and `get_subagent_result` would mark the result
+ * consumed, which is the state the sweep on a session boundary acts on.
+ */
+async function waitForTerminalRecord(parent: SessionManager, id: string): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const terminal = parent.getEntries().some(entry =>
+      entry.type === "custom" && entry.customType === "subagents:record"
+      && (entry.data as { id?: unknown } | undefined)?.id === id);
+    if (terminal) return;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`agent ${id} never reached a terminal state`);
+}
+
 describe("resuming a session-restored agent", () => {
   it("continues the conversation on its own session file instead of prompting a transcript stand-in", async () => {
     const agentId = "restored-resume-agent-01";
@@ -139,11 +170,7 @@ describe("resuming a session-restored agent", () => {
     );
     expect(textOf(settled)).toContain("continued in the reopened session");
 
-    const entries = SessionManager.open(childFile).getEntries();
-    const prompts = entries
-      .filter(entry => entry.type === "message" && entry.message.role === "user")
-      .map(entry => (entry as { message: { content: Array<{ text: string }> } }).message.content.map(part => part.text).join(""));
-    expect(prompts).toEqual(["ship the panel", "continue"]);
+    expect(childPrompts(childFile)).toEqual(["ship the panel", "continue"]);
 
     await lifecycle.get("session_shutdown")?.({}, context);
   });
@@ -155,8 +182,7 @@ describe("resuming a session-restored agent", () => {
     const { tools, lifecycle, context } = boot(parent);
 
     await lifecycle.get("session_start")?.({}, context);
-    const restoredId = `restored-${(await SessionManager.listAll(resolveSubagentSessionDir()!))
-      .find(info => info.path === childFile)!.id}`;
+    const restoredId = await scanIdFor(childFile);
 
     const text = textOf(await tools.get("Agent").execute("tc-resume", {
       prompt: "continue",
@@ -241,10 +267,7 @@ describe("resuming a session-restored agent", () => {
       "tc-race-result", { agent_id: newId, wait: true }, undefined, undefined, context,
     );
     const entries = SessionManager.open(childFile).getEntries();
-    const prompts = entries
-      .filter(entry => entry.type === "message" && entry.message.role === "user")
-      .map(entry => (entry as { message: { content: Array<{ text: string }> } }).message.content.map(part => part.text).join(""));
-    expect(prompts).toEqual(["ship the panel", "continue"]);
+    expect(childPrompts(childFile)).toEqual(["ship the panel", "continue"]);
     const invocations = entries.filter(entry => entry.type === "custom" && entry.customType === "subagents:invocation");
     expect(invocations).toHaveLength(2);
 
@@ -284,8 +307,7 @@ describe("resuming a session-restored agent", () => {
     // The scan's own id for the file is the fork: a stand-in record for a
     // conversation that is live right now would let a resume on that address
     // open a second run over the same file.
-    const restoredId = `restored-${(await SessionManager.listAll(resolveSubagentSessionDir()!))
-      .find(info => info.path === childFile)!.id}`;
+    const restoredId = await scanIdFor(childFile);
     const viaPlaceholder = textOf(await tools.get("Agent").execute("tc-placeholder", {
       prompt: "continue again",
       description: "Resume via the scan's id",
@@ -298,6 +320,57 @@ describe("resuming a session-restored agent", () => {
     await lifecycle.get("session_shutdown")?.({}, context);
   });
 
+  it("does not rebuild a transcript for a session file a settled run still holds", async () => {
+    const agentId = "restored-resume-agent-06";
+    const parent = parentSession(agentId);
+    const childFile = persistedChild({ parentSession: parent.getSessionFile()!, agentId });
+    const { tools, lifecycle, context } = boot(parent);
+
+    await lifecycle.get("session_start")?.({}, context);
+    const liveId = reopenedId(textOf(await tools.get("Agent").execute("tc-settled", {
+      prompt: "continue",
+      description: "Resume the panel",
+      subagent_type: "general-purpose",
+      resume: agentId,
+      run_in_background: true,
+    }, undefined, undefined, context)));
+    // Terminal, with its result still unread: the sweep on a session boundary
+    // spares exactly this record, so it is in the manager when the scan runs.
+    await waitForTerminalRecord(parent, liveId);
+
+    // `/reload`. Liveness is not the question — the file is that run's
+    // conversation for as long as the record holds it.
+    await lifecycle.get("session_start")?.({ reason: "reload" }, context);
+
+    // One identity for the file. A second record for it would be a second
+    // addressable handle on one conversation, and whichever record answered
+    // would depend on map insertion order.
+    expect(textOf(await tools.get("get_subagent_result").execute(
+      "tc-settled-placeholder", { agent_id: await scanIdFor(childFile) }, undefined, undefined, context,
+    ))).toContain("Agent not found");
+    const byOldId = textOf(await tools.get("get_subagent_result").execute(
+      "tc-settled-old-id", { agent_id: agentId }, undefined, undefined, context,
+    ));
+    expect(byOldId).toContain(`Agent: ${liveId}`);
+
+    // Continuing is still allowed — it is the record itself that continues, not
+    // a second run opened over the same file.
+    const continued = textOf(await tools.get("Agent").execute("tc-settled-again", {
+      prompt: "keep going",
+      description: "Resume again",
+      subagent_type: "general-purpose",
+      resume: agentId,
+      run_in_background: true,
+    }, undefined, undefined, context));
+    expect(reopenedId(continued)).toBe(liveId);
+    await tools.get("get_subagent_result").execute(
+      "tc-settled-result", { agent_id: liveId, wait: true }, undefined, undefined, context,
+    );
+    expect(childPrompts(childFile)).toEqual(["ship the panel", "continue", "keep going"]);
+
+    await lifecycle.get("session_shutdown")?.({}, context);
+  });
+
   it("reopens the same conversation from a `@id` mention", async () => {
     const agentId = "restored-resume-agent-03";
     const parent = parentSession(agentId);
@@ -305,8 +378,7 @@ describe("resuming a session-restored agent", () => {
     const { tools, lifecycle, context } = boot(parent);
 
     await lifecycle.get("session_start")?.({}, context);
-    const restoredId = `restored-${(await SessionManager.listAll(resolveSubagentSessionDir()!))
-      .find(info => info.path === childFile)!.id}`;
+    const restoredId = await scanIdFor(childFile);
 
     const handled = await lifecycle.get("input")?.({ text: `@${agentId} continue` }, context);
 

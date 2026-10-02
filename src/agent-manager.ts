@@ -1890,14 +1890,17 @@ export class AgentManager {
   }
 
   /**
-   * Whether a live run is still using a session file. A restored transcript
-   * stand-in for one would be a second record for a conversation that is being
-   * continued right now, and resuming it would open a second run on the file.
+   * Whether a real record still holds a session file. A restored transcript
+   * stand-in for one would be a second, equally addressable record for a
+   * conversation one record is already continuing, and which of the two a
+   * resume answered would come down to map insertion order. Liveness is not
+   * the question: a record that settled still owns the file, and is swept
+   * before the next scan runs if nothing is waiting on its result.
    */
-  hasLiveRunOn(sessionFile: string): boolean {
+  hasRecordOn(sessionFile: string): boolean {
     for (const record of this.agents.values()) {
       if (record.restoredSession || record.sessionFile !== sessionFile) continue;
-      if (this.activeRuns.has(record.id) || record.status === "running" || record.status === "queued") return true;
+      return true;
     }
     return false;
   }

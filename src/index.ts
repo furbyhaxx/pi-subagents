@@ -1259,12 +1259,14 @@ export default function (pi: ExtensionAPI) {
           if (seenFiles.has(info.path)) continue;
           seenFiles.add(info.path);
           if (info.parentSessionPath !== parentSessionFile) continue;
-          // A repeated session_start — `/reload` — runs this scan again, and a
-          // run started before it can still be going. Its file is that run's
-          // conversation, not a transcript to rebuild: a stand-in record for it
-          // would be a second address for one live run, and a resume on that
-          // address would open a second run over the same file.
-          if (manager.hasLiveRunOn(info.path)) continue;
+          // A repeated session_start — `/reload` — runs this scan again, and the
+          // record that owns a child session file still owns it after its run
+          // settled. Its file is that conversation, not a transcript to rebuild:
+          // a stand-in record for it would be a second address for one
+          // conversation, and a resume on that address would open a second run
+          // over the same file. A genuine restart has an empty map, so
+          // placeholders are built exactly as they are meant to be.
+          if (manager.hasRecordOn(info.path)) continue;
           const record = restoredRecordFromSession(info, ctx.sessionManager?.getSessionId?.() ?? "standalone", parentEntries);
           if (!record) continue;
           const restored = manager.restoreCompleted(record);
