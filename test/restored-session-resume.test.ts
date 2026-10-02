@@ -329,6 +329,11 @@ describe("resuming a session-restored agent", () => {
     const parent = parentSession(agentId);
     const childFile = persistedChild({ parentSession: parent.getSessionFile()!, agentId });
     const { tools, lifecycle, context } = boot(parent);
+    // Two answers queued: the reopen, and the continuation below.
+    faux.setResponses([
+      () => fauxAssistantMessage("continued in the reopened session"),
+      () => fauxAssistantMessage("continued again"),
+    ]);
 
     await lifecycle.get("session_start")?.({}, context);
     const liveId = reopenedId(textOf(await tools.get("Agent").execute("tc-settled", {
@@ -347,8 +352,8 @@ describe("resuming a session-restored agent", () => {
     await lifecycle.get("session_start")?.({ reason: "reload" }, context);
 
     // One identity for the file. A second record for it would be a second
-    // addressable handle on one conversation, and whichever record answered
-    // would depend on map insertion order.
+    // address for one conversation, and which of the two a resume answered
+    // would come down to map insertion order.
     expect(textOf(await tools.get("get_subagent_result").execute(
       "tc-settled-placeholder", { agent_id: await scanIdFor(childFile) }, undefined, undefined, context,
     ))).toContain("Agent not found");
@@ -367,9 +372,9 @@ describe("resuming a session-restored agent", () => {
       run_in_background: true,
     }, undefined, undefined, context));
     expect(reopenedId(continued)).toBe(liveId);
-    await tools.get("get_subagent_result").execute(
+    expect(textOf(await tools.get("get_subagent_result").execute(
       "tc-settled-result", { agent_id: liveId, wait: true }, undefined, undefined, context,
-    );
+    ))).toContain("continued again");
     expect(childPrompts(childFile)).toEqual(["ship the panel", "continue", "keep going"]);
 
     await lifecycle.get("session_shutdown")?.({}, context);
